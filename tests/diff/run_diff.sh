@@ -2,21 +2,26 @@
 #
 # run_diff.sh — differential harness: the x86-64 oracle runs every kernel and records
 # outputs; every other backend runs the same kernel and its output is diffed against the
-# oracle (integers bit-exact, floats within a stated ULP tolerance). For now the oracle is
-# the only backend that exists, so this harness's job is: run the oracle on every registered
-# kernel via the real `basalt --cpu` path, link the result against its host driver, execute
-# it, and compare the outcome against a stored golden. A future backend adds its own compare
-# lane per kernel here rather than replacing this one.
+# oracle (integers bit-exact, floats within a stated ULP tolerance). This harness's job per
+# kernel is two-fold: run the oracle via the real `basalt --cpu` path, link the result
+# against its host driver, execute it, and compare the outcome against a stored golden; then
+# run the same kernel through every other registered backend and compare its live output
+# directly against the oracle's own live output from the same run, not just against the
+# golden. Right now the x86-64 regalloc backend (`basalt --cpu-regalloc`) is the only other
+# backend that exists, so it gets its own compare lane below; a future backend adds its own
+# lane here rather than replacing this one.
 #
 # Kernel/driver pairs are listed in KERNELS below as "kernel.cu:driver.c" — add a line there
 # to bring a new kernel into the harness. A kernel with no entry here (e.g.
 # deliberate_errors.cu, which is a sema-error fixture and was never meant to run) is simply
 # not exercised; nothing needs to special-case it.
 #
-# Golden files live in tests/diff/golden/<name>.txt, one per kernel, holding the driver's
-# exit code and stdout from the last known-good run. A kernel with no golden yet gets one
-# written from its current (just-verified) run; a kernel with an existing golden is compared
-# against it and this script fails loudly on any mismatch.
+# Golden files live in tests/diff/golden/<name>.txt, one per kernel, holding the oracle
+# driver's exit code and stdout from the last known-good run. A kernel with no golden yet
+# gets one written from its current (just-verified) oracle run; a kernel with an existing
+# golden is compared against it and this script fails loudly on any mismatch. The
+# regalloc-vs-oracle comparison is separate from the golden and runs every time, golden or
+# not.
 
 set -euo pipefail
 
@@ -27,6 +32,7 @@ kernel_dir="$root/tests/kernels"
 # "kernel.cu:driver.c" — driver.c is relative to the repo root.
 KERNELS=(
   "vector_add.cu:examples/cpu_launch_vadd.c"
+  "stress.cu:examples/cpu_launch_stress.c"
 )
 
 if [ "${#KERNELS[@]}" -eq 0 ]; then
@@ -92,18 +98,54 @@ $stdout"
   if [ ! -f "$golden" ]; then
     printf '%s\n' "$actual" >"$golden"
     echo "  stored golden: $golden"
-    continue
+  else
+    expected="$(cat "$golden")"
+    if [ "$expected" != "$actual" ]; then
+      echo "  FAIL: $name does not match its golden" >&2
+      diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+      fail=1
+      continue
+    fi
+    echo "  matched golden: $golden"
   fi
 
-  expected="$(cat "$golden")"
-  if [ "$expected" != "$actual" ]; then
-    echo "  FAIL: $name does not match its golden" >&2
-    diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+  # Cross-backend diff: the regalloc backend must reproduce the oracle's own live output for
+  # this exact run, not just the golden — this is the real cross-backend correctness check.
+  obj_ra="$tmpdir/$name-ra.o"
+  exe_ra="$tmpdir/$name-ra-exe"
+
+  if ! "$basalt" --cpu-regalloc "$kernel_path" -o "$obj_ra" 2>"$tmpdir/$name.ra.stderr"; then
+    echo "  FAIL: basalt --cpu-regalloc $kernel did not exit 0:" >&2
+    sed 's/^/    /' "$tmpdir/$name.ra.stderr" >&2
     fail=1
     continue
   fi
 
-  echo "  matched golden: $golden"
+  if ! cc "$shim_o" "$obj_ra" -o "$exe_ra" 2>"$tmpdir/$name.cc3.log"; then
+    echo "  FAIL: linking $name (regalloc) failed:" >&2
+    sed 's/^/    /' "$tmpdir/$name.cc3.log" >&2
+    fail=1
+    continue
+  fi
+
+  set +e
+  stdout_ra="$("$exe_ra")"
+  code_ra=$?
+  set -e
+  actual_ra="exit=$code_ra
+$stdout_ra"
+
+  if [ "$actual" != "$actual_ra" ]; then
+    echo "  FAIL: $name diverges between the oracle and regalloc backends" >&2
+    echo "    oracle (live):" >&2
+    sed 's/^/      /' <<<"$actual" >&2
+    echo "    regalloc (live):" >&2
+    sed 's/^/      /' <<<"$actual_ra" >&2
+    fail=1
+    continue
+  fi
+
+  echo "  oracle and regalloc agree: $name"
 done
 
 if [ "$fail" -ne 0 ]; then

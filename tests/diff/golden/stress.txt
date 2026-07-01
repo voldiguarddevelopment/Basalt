@@ -1,0 +1,2 @@
+exit=0
+PASS: stress matched the hand-computed fold: 191.000000
