@@ -31,6 +31,7 @@ dependencies = [
  "basalt-llvm",
  "basalt-mlir",
  "basalt-sema",
+ "basalt-x86",
 ]
 
 [[package]]

@@ -3,9 +3,10 @@
 // `--ast`, `--sema`, and `--ir` are wired to the real frontend/sema pipeline: `--ast` dumps
 // the parsed AST, `--sema` runs the type checker, and `--ir` lowers all the way to BIR and
 // prints it (or, given a `.bir` file directly, parses and re-prints it, exercising the
-// printer/parser round-trip as before). Every other mode flag parses into `Config` cleanly
-// and fails with a diagnostic at dispatch time rather than guessing at output (no
-// silently-wrong behavior).
+// printer/parser round-trip as before). `--cpu` runs that same pipeline and hands the result
+// to the x86-64 oracle backend, writing an object file to `-o`. Every other mode flag parses
+// into `Config` cleanly and fails with a diagnostic at dispatch time rather than guessing at
+// output (no silently-wrong behavior).
 //
 // Adding a real backend later is meant to be a small change: one new arm in `run`'s match
 // over `Mode`.
@@ -14,9 +15,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use basalt_backend::{Backend, EmitOpts, Support};
 use basalt_diag::{Diag, ECode, LangTable};
 use basalt_frontend_c::ast::TranslationUnit;
 use basalt_frontend_c::PpOpts;
+use basalt_x86::X86Oracle;
 
 /// A mode-selecting flag. Exactly one must be given; a second conflicts with the first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +303,59 @@ fn run_sema(input: &Path, cfg: &Config, table: &LangTable) -> Result<ExitCode, D
     })
 }
 
+/// `--cpu <file>`: runs the same pipeline as `--ir` (lex/preprocess/parse, check, lower for
+/// C/CUDA source; parse directly for a `.bir` file), then hands the resulting module to the
+/// x86-64 oracle backend and writes the emitted object bytes to `-o`. Unlike `--ir`, this mode
+/// never emits a best-effort artifact: an object file is either right or not written at all, so
+/// any frontend/sema/lowering problem exits non-zero without touching `-o`. `-o` itself is
+/// mandatory here (`E101`) — a raw object is not something to dump to a terminal — and a module
+/// this backend cannot lower is refused with its own `Diag`, rendered the same way every other
+/// error in this file is.
+fn run_cpu(
+    input: &Path,
+    output: Option<&Path>,
+    cfg: &Config,
+    table: &LangTable,
+) -> Result<ExitCode, Diag> {
+    let output = output.ok_or_else(|| Diag::new(ECode::CliMissingArgument).with_arg("-o"))?;
+
+    let module = if is_bir_input(input) {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        basalt_bir::parse(&src)
+            .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        let fe = run_frontend(&src, input, cfg);
+        let sema_diags = basalt_sema::check(&fe.tu);
+        let (module, lower_diags) = basalt_sema::lower(&fe.tu);
+
+        for p in &fe.problems {
+            eprintln!("{p}");
+        }
+        for d in sema_diags.iter().chain(lower_diags.iter()) {
+            eprintln!("{}", d.render(table));
+        }
+
+        if fe.has_problems() || !sema_diags.is_empty() || !lower_diags.is_empty() {
+            return Ok(ExitCode::FAILURE);
+        }
+        module
+    };
+
+    let backend = X86Oracle;
+    match backend.supports(&module) {
+        Support::Supported => {}
+        Support::Unsupported(code) => return Err(Diag::new(code).with_arg(backend.name())),
+    }
+
+    let artifact = backend.emit(&module, &EmitOpts::default())?;
+    let bytes = artifact
+        .as_bytes()
+        .expect("X86Oracle::emit always produces a Payload::Bytes artifact");
+    fs::write(output, bytes).map_err(|e| io_diag(output, e))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Writes `text` to `output` if given, else stdout — the common tail of every mode that
 /// produces a single text artifact.
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
@@ -328,6 +384,7 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
         Mode::Ir => run_ir(input()?, cfg.output.as_deref(), cfg, table),
         Mode::Ast => run_ast(input()?, cfg.output.as_deref(), cfg),
         Mode::Sema => run_sema(input()?, cfg, table),
+        Mode::Cpu => run_cpu(input()?, cfg.output.as_deref(), cfg, table),
         other => Err(Diag::new(ECode::UnsupportedFeature).with_arg(other.flag())),
     }
 }

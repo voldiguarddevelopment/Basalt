@@ -1,0 +1,2 @@
+exit=0
+PASS: vector_add matched a[i]+b[i] for all 1024 elements
