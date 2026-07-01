@@ -57,6 +57,11 @@ pub enum ECode {
     /// Sema encountered an invalid combination of CUDA execution-space qualifiers (e.g.
     /// `__global__` combined with `__device__`), or one on a declaration it cannot apply to.
     InvalidCudaQualifier,
+    /// AST-to-BIR lowering hit a construct it does not yet lower (calls, GPU intrinsics,
+    /// templates, global variable storage, ...). The lowering pass still produces a
+    /// best-effort placeholder so the rest of the function can be inspected, but the result
+    /// must not be handed to a backend while this code was reported.
+    LoweringUnsupported,
 
     /// BIR textual parser rejected the input.
     BirParseError,
@@ -95,6 +100,7 @@ impl ECode {
         ECode::UndefinedSymbol,
         ECode::Redefinition,
         ECode::InvalidCudaQualifier,
+        ECode::LoweringUnsupported,
         ECode::BirParseError,
         ECode::BirRoundTripMismatch,
         ECode::IoError,
@@ -123,6 +129,7 @@ impl ECode {
             ECode::UndefinedSymbol => "E301",
             ECode::Redefinition => "E302",
             ECode::InvalidCudaQualifier => "E303",
+            ECode::LoweringUnsupported => "E304",
             ECode::BirParseError => "E400",
             ECode::BirRoundTripMismatch => "E401",
             ECode::IoError => "E500",

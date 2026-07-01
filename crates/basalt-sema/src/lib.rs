@@ -7,12 +7,18 @@
 //
 // Public API: `check(&TranslationUnit) -> Vec<Diag>`. See `checker.rs` for the E-codes used,
 // the scoping/redefinition rules, and the documented simplifications this pass makes.
+//
+// `lower(&TranslationUnit) -> (basalt_bir::Module, Vec<Diag>)` lowers a checked translation
+// unit to BIR; see `lower.rs`'s module header for the lowering design (stack-slot locals,
+// address-space rules, and the BIR gaps this pass had to work around).
 
 mod checker;
+mod lower;
 mod scope;
 mod ty;
 
 pub use checker::check;
+pub use lower::lower;
 
 #[cfg(test)]
 mod tests;

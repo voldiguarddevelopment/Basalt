@@ -65,19 +65,22 @@ use crate::ty::{assignable, promote, Ty};
 /// registered under, in the scope `check_function_body` pushes for a device/kernel body.
 /// Distinct from `dim3` (the name CUDA's own headers use) since this pass never parses those
 /// headers and a user's own same-named struct, if any, lives in an outer scope regardless.
-const CUDA_DIM3_STRUCT: &str = "__basalt_cuda_dim3";
+///
+/// `pub(crate)`: the BIR lowering pass (`lower.rs`) reuses this name and the builtin list below
+/// rather than re-deriving them, so the two passes agree on what counts as a CUDA builtin.
+pub(crate) const CUDA_DIM3_STRUCT: &str = "__basalt_cuda_dim3";
 
 /// The four `dim3`-typed builtin values available inside a device/kernel body.
-const CUDA_DIM3_BUILTINS: [&str; 4] = ["threadIdx", "blockIdx", "blockDim", "gridDim"];
+pub(crate) const CUDA_DIM3_BUILTINS: [&str; 4] = ["threadIdx", "blockIdx", "blockDim", "gridDim"];
 
-fn conv_span(s: FSpan) -> DSpan {
+pub(crate) fn conv_span(s: FSpan) -> DSpan {
     DSpan::new(
         DLoc::new(s.start.line, s.start.col),
         DLoc::new(s.end.line, s.end.col),
     )
 }
 
-fn int_lit_ty(lit: &IntLit) -> Ty {
+pub(crate) fn int_lit_ty(lit: &IntLit) -> Ty {
     use ScalarKind::*;
     Ty::Scalar(match (lit.unsigned, lit.long_len) {
         (false, 0) => Int,
@@ -89,7 +92,7 @@ fn int_lit_ty(lit: &IntLit) -> Ty {
     })
 }
 
-fn float_lit_ty(lit: &FloatLit) -> Ty {
+pub(crate) fn float_lit_ty(lit: &FloatLit) -> Ty {
     Ty::Scalar(match lit.suffix {
         FloatSuffix::F => ScalarKind::Float,
         FloatSuffix::L => ScalarKind::LongDouble,
@@ -97,7 +100,7 @@ fn float_lit_ty(lit: &FloatLit) -> Ty {
     })
 }
 
-fn compound_binop(op: AssignOp) -> BinOp {
+pub(crate) fn compound_binop(op: AssignOp) -> BinOp {
     match op {
         AssignOp::AddAssign => BinOp::Add,
         AssignOp::SubAssign => BinOp::Sub,
@@ -116,13 +119,16 @@ fn compound_binop(op: AssignOp) -> BinOp {
 /// Recursively collects every label name reachable in a function body, for a two-pass
 /// `goto`/label check: a label may be declared after the `goto` that targets it, or in a
 /// sibling block, so this walks the whole body up front rather than tracking declare-order.
-fn collect_labels_many(stmts: &[Stmt], out: &mut HashSet<String>) {
+///
+/// `pub(crate)`: also used by `lower.rs` to pre-allocate one BIR block per label before
+/// lowering a function body, for exactly the same reason (a `goto` may jump forward).
+pub(crate) fn collect_labels_many(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         collect_labels(s, out);
     }
 }
 
-fn collect_labels(stmt: &Stmt, out: &mut HashSet<String>) {
+pub(crate) fn collect_labels(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Block { stmts, .. } => collect_labels_many(stmts, out),
         Stmt::If {

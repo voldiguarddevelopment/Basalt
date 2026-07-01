@@ -39,6 +39,22 @@ fn is_float_kind(k: ScalarKind) -> bool {
     )
 }
 
+/// Whether an integer `ScalarKind` is signed. Used by BIR lowering (`lower.rs`) to pick
+/// `icmp`'s signed vs. unsigned predicates and `sext` vs. `zext` for a widening integer cast;
+/// meaningless for a float kind (never called with one).
+pub(crate) fn is_signed_kind(k: ScalarKind) -> bool {
+    !matches!(
+        k,
+        ScalarKind::Bool
+            | ScalarKind::UChar
+            | ScalarKind::UShort
+            | ScalarKind::UInt
+            | ScalarKind::ULong
+            | ScalarKind::ULongLong
+            | ScalarKind::WcharT
+    )
+}
+
 impl Ty {
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self, Ty::Unknown)

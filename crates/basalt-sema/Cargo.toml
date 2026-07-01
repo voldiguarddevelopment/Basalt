@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+basalt-bir = { path = "../basalt-bir" }
 basalt-diag = { path = "../basalt-diag" }
 basalt-frontend-c = { path = "../basalt-frontend-c" }

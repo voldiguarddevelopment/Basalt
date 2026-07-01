@@ -75,6 +75,7 @@ version = "0.0.0"
 name = "basalt-sema"
 version = "0.0.0"
 dependencies = [
+ "basalt-bir",
  "basalt-diag",
  "basalt-frontend-c",
 ]

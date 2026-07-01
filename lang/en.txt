@@ -24,6 +24,7 @@ E300 = type error: {0}
 E301 = undefined symbol: {0}
 E302 = redefinition of {0}
 E303 = invalid CUDA qualifier on {0}: {1}
+E304 = lowering does not yet support {0}: {1}
 
 E400 = malformed BIR: {0}
 E401 = BIR round-trip mismatch

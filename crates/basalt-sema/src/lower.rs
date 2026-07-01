@@ -1,0 +1,2576 @@
+// AST-to-BIR lowering: turns a type-checked `TranslationUnit` into a `basalt_bir::Module`.
+// Entry point: `lower`. Assumes `checker::check` already ran and returned no fatal problems
+// for the parts being lowered; given something it cannot make sense of, this pass degrades to
+// a diagnostic plus a best-effort placeholder rather than panicking or guessing (the project's
+// "no silently-wrong codegen" rule applies to backends, but the same spirit governs this pass:
+// a `Module` containing an `E304` diagnostic is not meant to be handed to a backend).
+//
+// GPU intrinsics (`threadIdx`/`blockIdx`/`blockDim`/`gridDim`, `__syncthreads`, barriers,
+// shuffles, atomics) are explicitly out of scope for this pass — a later task owns lowering
+// them to BIR's dedicated GPU-intrinsic ops. A reference to one of the four builtins reports
+// `E304` and yields a placeholder value; a call to `__syncthreads` (or any other function)
+// falls into the generic call-lowering gap below.
+//
+// Locals are stack slots, not SSA values. Every `VarDecl` (including parameters, which BIR
+// itself passes as plain SSA values via `ValRef::Param`) gets a synthetic memory location and
+// is accessed via `load`/`store`, mem2reg-style promotion to real SSA form is explicitly a
+// later pass's job (ARCHITECTURE.md's mid-end). This keeps this pass a straightforward
+// syntax-directed translation, at the cost of some redundant loads/stores and a trailing dead
+// block after every `return`/`break`/`continue`/`goto` (this pass always opens a fresh block
+// after a terminator, whether or not anything ever branches to it) that a later cleanup pass
+// is expected to fold away.
+//
+// # Synthesizing stack-slot addresses: a BIR gap
+//
+// BIR has no `alloca`-style instruction — nothing that says "reserve a new, distinct storage
+// location and hand back its address". Inventing one is out of scope here (ARCHITECTURE.md
+// requires printer + parser + oracle lowering to land together for a new op). The workaround:
+// each local variable is assigned a small integer slot index at lowering time, and its address
+// is materialized as `const.i ptr.<space> (slot * SLOT_STRIDE)` — an ordinary integer constant
+// whose declared type happens to be a pointer. Nothing in BIR's printer/parser stops this (a
+// pointer's own type carries only an address space, never a pointee type, so its "value" was
+// already opaque), and it gives every local a stable, distinct address without adding new BIR
+// surface. `SLOT_STRIDE` is a generous fixed spacing (documented below) standing in for a real
+// stack-frame layout a later pass would compute tightly.
+//
+// # Address spaces
+//
+// - A local variable's own slot: `AddrSpace::Local`, unless CUDA-qualified `__shared__`
+//   (`AddrSpace::Shared`) or `__constant__` (`AddrSpace::Constant`).
+// - A function parameter's own slot: `AddrSpace::Param`.
+// - The pointee of a pointer *value* (a dereference, `->`, or indexing through a pointer
+//   variable rather than an array): `AddrSpace::Global`, the common case for a CUDA kernel
+//   argument pointing into device memory. Sema's own `Ty::Pointer` carries no address-space
+//   annotation at all (a checker-era simplification), so this pass cannot do better without
+//   deeper source-level qualifier tracking than the AST currently carries for arbitrary
+//   pointer-typed *expressions* (only declarations carry `CudaQualifiers`).
+// - Indexing/member access through an array or struct/union *lvalue* (not a pointer):
+//   inherits the base's own space (still the same storage region).
+//
+// # Arrays and structs: no aggregate BIR type
+//
+// BIR's `Ty` is `Scalar | Ptr | Vec | Void` — no fixed-size array, no struct/record type, no
+// `getelementptr`-style op. An array-typed local decays to its slot's base address (matching C);
+// indexing and member access are lowered as manual pointer arithmetic (`add` typed as a
+// pointer, offset computed from a packed, unpadded field layout this pass derives from the
+// checker's own `StructInfo` — no alignment/padding rules are applied, a documented
+// simplification). A *whole* aggregate used as a value (assigned, returned, passed, compared)
+// has nothing to lower to (no aggregate value type, no memcpy-equivalent op) and is reported as
+// `E304` instead of silently taking its address and mislabeling that as the value.
+//
+// Sema's own `Ty::Array` does not carry an element count (the checker never needed it). This
+// pass does not need it either for indexing (only the element type matters for computing a
+// byte offset), but `sizeof` on an array falls back to a single element's size with an `E304`
+// diagnostic when the count would have mattered.
+//
+// # Other discovered BIR gaps
+//
+// - No call instruction at all: every `Expr::Call` reports `E304` and yields a placeholder
+//   (arguments — and the callee, if not a plain named function — are still lowered for their
+//   side effects first, matching real evaluation order as far as it goes). A narrower
+//   same-translation-unit-only call was considered and rejected: without a real `call` op there
+//   is nothing sound to lower it to.
+// - `BinOp::Div`/`BinOp::Rem` do not distinguish signed from unsigned (unlike `icmp`, which has
+//   separate signed/unsigned predicates, and `ashr`/`lshr`). A backend lowering a bare `div` has
+//   no way to recover the operand's signedness from BIR alone; this pass always emits the one
+//   opcode BIR provides and flags the gap here rather than inventing `udiv`/`sdiv` unilaterally.
+// - No module-level data segment: a top-level (`Item::Var`) global has no storage to lower to,
+//   so it is registered for name resolution only and every reference to it reports `E304`.
+// - `switch` lowers to BIR's native `Term::Switch` (a real match, not a `condbr` chain) but only
+//   recognizes `case`/`default` labels that are direct entries of the switch's own body block —
+//   the overwhelmingly common style. A label buried inside a nested statement (Duff's-device
+//   style) is not detected; this is a narrow, documented gap, not a claim of full support.
+//
+// New diagnostic code: `ECode::LoweringUnsupported` (`E304`), covering every gap above.
+
+use std::collections::{HashMap, HashSet};
+
+use basalt_bir::{
+    AddrSpace as BSpace, BinOp as BBin, Block as BBlock, BlockId, CastOp as BCast, FCmpPred,
+    Function as BFunction, ICmpPred, Inst as BInst, InstId, Module, Op as BOp, Scalar as BScalar,
+    Term as BTerm, Ty as BTy, ValRef,
+};
+use basalt_diag::{Diag, ECode};
+use basalt_frontend_c::ast::{
+    AssignOp, BinOp as ABin, EnumDecl, Expr, FunctionDecl, IncDecOp, Item, ScalarKind, Stmt,
+    TagKind, TranslationUnit, Type, UnaryOp, VarDecl,
+};
+use basalt_frontend_c::{FloatLit, FloatSuffix, IntBase, IntLit, Span as FSpan};
+
+use crate::checker::{
+    collect_labels_many, compound_binop, conv_span, float_lit_ty, int_lit_ty, CUDA_DIM3_BUILTINS,
+};
+use crate::scope::{FuncSig, ScopeStack, StructInfo, ValueSym};
+use crate::ty::{assignable, is_signed_kind, promote, Ty};
+
+/// Spacing between two locals' synthesized slot addresses (see the module header). Generous
+/// enough that no array/struct this pass lays out (packed, no padding) can plausibly overrun
+/// into a neighboring slot.
+const SLOT_STRIDE: i64 = 1 << 16;
+
+/// Lowers a type-checked translation unit to BIR. Returns the module built so far alongside
+/// every diagnostic collected along the way; a non-empty diagnostic list means some part of the
+/// input could not be soundly lowered (see the module header for exactly what) and the module
+/// should not be treated as ready for a backend.
+pub fn lower(tu: &TranslationUnit) -> (Module, Vec<Diag>) {
+    let mut lw = Lowerer {
+        scopes: ScopeStack::new(),
+        diags: Vec::new(),
+        funcs: Vec::new(),
+        unlowered_globals: HashSet::new(),
+        enum_values: HashMap::new(),
+        insts: Vec::new(),
+        blocks: Vec::new(),
+        insts_by_block: HashMap::new(),
+        cur: BlockId(0),
+        locals: Vec::new(),
+        next_slot: 0,
+        ctrl_stack: Vec::new(),
+        label_blocks: HashMap::new(),
+        fn_ret: Ty::Scalar(ScalarKind::Void),
+    };
+    lw.scopes.push();
+    lw.lower_items(&tu.items);
+    lw.scopes.pop();
+    let module = Module {
+        funcs: lw.funcs,
+        launch_bounds: None,
+        shared_mem_bytes: 0,
+        target_dtypes: Vec::new(),
+    };
+    (module, lw.diags)
+}
+
+#[derive(Clone)]
+struct LocalSlot {
+    slot: u32,
+    ty: Ty,
+    space: BSpace,
+}
+
+/// An addressable location: where it lives (`addr`, `space`) and what sema type is stored
+/// there. `ty == Ty::Unknown` marks a location that could not be resolved — already
+/// diagnosed, callers should propagate silently rather than reporting a second time.
+struct LValue {
+    addr: ValRef,
+    ty: Ty,
+    space: BSpace,
+}
+
+/// What a `break`/`continue` targets. `continue` always looks for the innermost `Loop` entry,
+/// skipping over any `Switch` frames above it (a `switch` only ever redefines `break`).
+enum CtrlCtx {
+    Loop {
+        break_bb: BlockId,
+        continue_bb: BlockId,
+    },
+    Switch {
+        break_bb: BlockId,
+    },
+}
+
+enum CaseLabel {
+    Value(i64),
+    Default,
+}
+
+struct Lowerer {
+    /// struct/union/enum/typedef tags plus the global function/variable namespace, built up
+    /// front exactly like `checker::Checker` does, since struct layouts and function return
+    /// types must be known before a body that references them is lowered.
+    scopes: ScopeStack,
+    diags: Vec<Diag>,
+    funcs: Vec<BFunction>,
+    /// Names of top-level `Item::Var` globals: registered for resolution so referencing one
+    /// reports the specific "no data segment" gap instead of a generic undefined-symbol error.
+    unlowered_globals: HashSet<String>,
+    enum_values: HashMap<String, i64>,
+
+    // Per-function transient state; reset at the top of `lower_function_body`.
+    insts: Vec<BInst>,
+    blocks: Vec<Option<BBlock>>,
+    /// Instructions appended to a block that is open (allocated, not yet terminated) but not
+    /// necessarily the *most recently* opened one — `if`/ternary lowering interleaves building
+    /// two branch blocks before either is terminated, so this is keyed by block rather than
+    /// being a single current-block buffer.
+    insts_by_block: HashMap<u32, Vec<InstId>>,
+    cur: BlockId,
+    locals: Vec<HashMap<String, LocalSlot>>,
+    next_slot: u32,
+    ctrl_stack: Vec<CtrlCtx>,
+    label_blocks: HashMap<String, BlockId>,
+    fn_ret: Ty,
+}
+
+// ---- free helpers: type mapping, sizes, casts --------------------------------------------
+
+fn to_bir_scalar(k: ScalarKind) -> Option<BScalar> {
+    use ScalarKind::*;
+    Some(match k {
+        Void => return None,
+        Bool => BScalar::I1,
+        Char | SChar | UChar => BScalar::I8,
+        Short | UShort => BScalar::I16,
+        Int | UInt | WcharT => BScalar::I32,
+        Long | ULong | LongLong | ULongLong => BScalar::I64,
+        Float => BScalar::F32,
+        // BIR has no 80/128-bit float type; `long double` truncates to `f64` (documented
+        // lossy fallback, matching the "map to the nearest BIR scalar width" instruction).
+        Double | LongDouble => BScalar::F64,
+    })
+}
+
+/// Maps a sema type to the BIR type of its *value* (not its storage address — see
+/// `LValue`/`slot_lvalue` for that). Pointer-like sema types always map to `Ptr(Global)`; the
+/// module header explains why this pass cannot generally do better for an arbitrary pointer
+/// *expression*. Array/struct/union map to the same, matching their pointer-decayed value.
+fn to_bir_ty(ty: &Ty) -> BTy {
+    match ty {
+        Ty::Scalar(k) => to_bir_scalar(*k).map(BTy::Scalar).unwrap_or(BTy::Void),
+        Ty::Pointer(_) | Ty::Array(_) | Ty::Struct(_) | Ty::Union(_) => BTy::Ptr(BSpace::Global),
+        Ty::Enum(_) => BTy::Scalar(BScalar::I32),
+        Ty::Function { .. } | Ty::Unknown => BTy::Scalar(BScalar::I32),
+    }
+}
+
+fn is_aggregate(ty: &Ty) -> bool {
+    matches!(ty, Ty::Array(_) | Ty::Struct(_) | Ty::Union(_))
+}
+
+fn is_signed(ty: &Ty) -> bool {
+    match ty {
+        Ty::Scalar(k) => is_signed_kind(*k),
+        Ty::Enum(_) => true,
+        _ => false,
+    }
+}
+
+fn scalar_bits(s: BScalar) -> u32 {
+    match s {
+        BScalar::I1 => 1,
+        BScalar::I8 => 8,
+        BScalar::I16 | BScalar::F16 => 16,
+        BScalar::I32 | BScalar::F32 => 32,
+        BScalar::I64 | BScalar::F64 => 64,
+    }
+}
+
+fn scalar_byte_size(s: BScalar) -> u32 {
+    match s {
+        BScalar::I1 | BScalar::I8 => 1,
+        BScalar::I16 | BScalar::F16 => 2,
+        BScalar::I32 | BScalar::F32 => 4,
+        BScalar::I64 | BScalar::F64 => 8,
+    }
+}
+
+fn natural_align(t: BTy) -> u32 {
+    match t {
+        BTy::Scalar(s) => scalar_byte_size(s),
+        BTy::Ptr(_) => 8,
+        BTy::Vec(s, n) => scalar_byte_size(s) * u32::from(n),
+        BTy::Void => 1,
+    }
+}
+
+fn is_float_scalar(s: BScalar) -> bool {
+    matches!(s, BScalar::F16 | BScalar::F32 | BScalar::F64)
+}
+
+// ---- linearizing the instruction arena into block-print order -----------------------------
+//
+// BIR requires a function's instruction arena to be appended strictly in the order it prints
+// (block 0's instructions, then block 1's, ...), since a `%<id>` doubles as that arena index.
+// This pass builds several blocks concurrently (`if`, ternary, and `&&`/`||` all leave more
+// than one allocated block open across a span of lowering, e.g. filling `then_bb` and then
+// `else_bb` before either is terminated), so `self.insts` ends up in *creation* order, which is
+// not the same as block-print order once a block's own content is filled in later than a
+// higher-numbered block's. This is fixed up once per function, right before it is handed back:
+// walk the already-terminated blocks in block-id order, assign each instruction encountered a
+// fresh id in that order, and rewrite every `ValRef::Val` (in every op's operands, `phi`'s
+// incoming values, and every terminator) through the resulting remap table. Every cross-block
+// value reference this pass ever produces (only `phi`, from `if`/ternary/`&&`/`||`'s merge
+// blocks) already goes from a lower block id to a higher one, so this is a straightforward
+// reindexing, not a real reschedule.
+
+fn remap_valref(v: ValRef, remap: &[u32]) -> ValRef {
+    match v {
+        ValRef::Param(p) => ValRef::Param(p),
+        ValRef::Val(id) => ValRef::Val(InstId(remap[id.0 as usize])),
+    }
+}
+
+fn remap_op(op: BOp, remap: &[u32]) -> BOp {
+    let rv = |v: ValRef| remap_valref(v, remap);
+    match op {
+        BOp::ConstInt(v) => BOp::ConstInt(v),
+        BOp::ConstFloat(v) => BOp::ConstFloat(v),
+        BOp::Bin(b, a, c) => BOp::Bin(b, rv(a), rv(c)),
+        BOp::ICmp(p, ty, a, c) => BOp::ICmp(p, ty, rv(a), rv(c)),
+        BOp::FCmp(p, ty, a, c) => BOp::FCmp(p, ty, rv(a), rv(c)),
+        BOp::Select(c, a, b) => BOp::Select(rv(c), rv(a), rv(b)),
+        BOp::Cast(c, ty, v) => BOp::Cast(c, ty, rv(v)),
+        BOp::Load {
+            ptr,
+            space,
+            align,
+            volatile,
+        } => BOp::Load {
+            ptr: rv(ptr),
+            space,
+            align,
+            volatile,
+        },
+        BOp::Store {
+            ptr,
+            val,
+            ty,
+            space,
+            align,
+            volatile,
+        } => BOp::Store {
+            ptr: rv(ptr),
+            val: rv(val),
+            ty,
+            space,
+            align,
+            volatile,
+        },
+        BOp::Phi(incoming) => BOp::Phi(incoming.into_iter().map(|(bb, v)| (bb, rv(v))).collect()),
+        BOp::Shuffle(k, a, b) => BOp::Shuffle(k, rv(a), rv(b)),
+        BOp::Ballot(a) => BOp::Ballot(rv(a)),
+        BOp::VoteAny(a) => BOp::VoteAny(rv(a)),
+        BOp::VoteAll(a) => BOp::VoteAll(rv(a)),
+        BOp::Atomic(a, ptr, v, space) => BOp::Atomic(a, rv(ptr), rv(v), space),
+        BOp::AtomicCas(ptr, cmp, new, space) => BOp::AtomicCas(rv(ptr), rv(cmp), rv(new), space),
+        other => other,
+    }
+}
+
+fn remap_term(t: BTerm, remap: &[u32]) -> BTerm {
+    match t {
+        BTerm::Br(b) => BTerm::Br(b),
+        BTerm::CondBr(c, t1, t2) => BTerm::CondBr(remap_valref(c, remap), t1, t2),
+        BTerm::Switch(v, d, cases) => BTerm::Switch(remap_valref(v, remap), d, cases),
+        BTerm::Ret(v) => BTerm::Ret(v.map(|x| remap_valref(x, remap))),
+    }
+}
+
+fn linearize_by_block_order(
+    blocks: Vec<BBlock>,
+    old_insts: Vec<BInst>,
+) -> (Vec<BBlock>, Vec<BInst>) {
+    let mut remap = vec![0u32; old_insts.len()];
+    let mut order: Vec<InstId> = Vec::with_capacity(old_insts.len());
+    for b in &blocks {
+        for &id in &b.insts {
+            remap[id.0 as usize] = order.len() as u32;
+            order.push(id);
+        }
+    }
+    let new_insts: Vec<BInst> = order
+        .iter()
+        .map(|id| {
+            let inst = &old_insts[id.0 as usize];
+            BInst {
+                ty: inst.ty,
+                op: remap_op(inst.op.clone(), &remap),
+            }
+        })
+        .collect();
+    let new_blocks: Vec<BBlock> = blocks
+        .into_iter()
+        .map(|b| {
+            let new_ids: Vec<InstId> = b
+                .insts
+                .iter()
+                .map(|id| InstId(remap[id.0 as usize]))
+                .collect();
+            BBlock {
+                insts: new_ids,
+                term: remap_term(b.term, &remap),
+            }
+        })
+        .collect();
+    (new_blocks, new_insts)
+}
+
+fn switch_body_stmts(body: &Stmt) -> Vec<&Stmt> {
+    match body {
+        Stmt::Block { stmts, .. } => stmts.iter().collect(),
+        other => vec![other],
+    }
+}
+
+fn is_lvalue_shaped(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Ident { .. } | Expr::Member { .. } | Expr::Index { .. }
+    ) || matches!(
+        e,
+        Expr::Unary {
+            op: UnaryOp::Deref,
+            ..
+        }
+    )
+}
+
+/// Recovers an integer literal's numeric value from its lexed text (digits/prefix/suffix all
+/// still present there; `IntLit` only classifies the shape). Best-effort: a literal wide
+/// enough to overflow `i64` as signed is reinterpreted via `u64`, matching two's-complement
+/// truncation rather than failing outright.
+fn int_lit_value(lit: &IntLit) -> i64 {
+    let mut s = lit.text.as_str();
+    while let Some(c) = s.chars().next_back() {
+        if c.is_ascii_alphabetic() {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    let (radix, digits) = match lit.base {
+        IntBase::Dec => (10, s),
+        IntBase::Oct => (8, s),
+        IntBase::Hex => (16, s.trim_start_matches("0x").trim_start_matches("0X")),
+        IntBase::Bin => (2, s.trim_start_matches("0b").trim_start_matches("0B")),
+    };
+    i64::from_str_radix(digits, radix)
+        .or_else(|_| u64::from_str_radix(digits, radix).map(|v| v as i64))
+        .unwrap_or(0)
+}
+
+fn float_lit_value(lit: &FloatLit) -> f64 {
+    let mut s = lit.text.as_str();
+    if matches!(lit.suffix, FloatSuffix::F | FloatSuffix::L) {
+        s = &s[..s.len() - 1];
+    }
+    s.parse::<f64>().unwrap_or(0.0)
+}
+
+// ---- Lowerer: item-level registration -----------------------------------------------------
+
+impl Lowerer {
+    fn lower_items(&mut self, items: &[Item]) {
+        for item in items {
+            self.lower_item(item);
+        }
+    }
+
+    fn lower_item(&mut self, item: &Item) {
+        match item {
+            Item::Struct(d) => {
+                let mut fields = Vec::with_capacity(d.fields.len());
+                for f in &d.fields {
+                    let ty = self.resolve_type(&f.ty);
+                    fields.push((f.name.clone(), ty));
+                }
+                if let Some(name) = &d.name {
+                    self.scopes.declare_struct(name, StructInfo { fields });
+                }
+            }
+            Item::Union(d) => {
+                let mut fields = Vec::with_capacity(d.fields.len());
+                for f in &d.fields {
+                    let ty = self.resolve_type(&f.ty);
+                    fields.push((f.name.clone(), ty));
+                }
+                if let Some(name) = &d.name {
+                    self.scopes.declare_union(name, StructInfo { fields });
+                }
+            }
+            Item::Enum(d) => self.lower_enum_decl(d),
+            Item::Typedef(d) => {
+                let ty = self.resolve_type(&d.ty);
+                self.scopes.declare_typedef(&d.alias, ty);
+            }
+            Item::Namespace(ns) => {
+                self.scopes.push();
+                self.lower_items(&ns.items);
+                self.scopes.pop();
+            }
+            Item::Function(f) => self.lower_function_item(f),
+            Item::Var(v) => self.lower_global_var(v),
+            // Out of scope, matching `checker::Checker::check_item`: never descended into.
+            Item::Template(_) => {}
+        }
+    }
+
+    fn lower_enum_decl(&mut self, d: &EnumDecl) {
+        if let Some(name) = &d.name {
+            self.scopes.declare_enum(name);
+        }
+        let enum_ty = match &d.name {
+            Some(n) => Ty::Enum(n.clone()),
+            None => Ty::Scalar(ScalarKind::Int),
+        };
+        let mut next = 0i64;
+        for v in &d.variants {
+            let value = match &v.init {
+                Some(init) => self.const_eval_i64(init).unwrap_or_else(|| {
+                    self.diag_unsupported(
+                        v.span,
+                        "non-constant enumerator initializer",
+                        "falling back to auto-increment from the previous value",
+                    );
+                    next
+                }),
+                None => next,
+            };
+            self.enum_values.insert(v.name.clone(), value);
+            next = value + 1;
+            self.scopes
+                .declare_value(&v.name, ValueSym::EnumConst(enum_ty.clone()));
+        }
+    }
+
+    fn lower_global_var(&mut self, v: &VarDecl) {
+        let ty = self.resolve_type(&v.ty);
+        self.scopes.declare_value(&v.name, ValueSym::Var(ty));
+        self.unlowered_globals.insert(v.name.clone());
+        self.diag_unsupported(
+            v.span,
+            "global variable storage",
+            "BIR has no module-level data segment yet",
+        );
+    }
+
+    fn lower_function_item(&mut self, f: &FunctionDecl) {
+        let ret = self.resolve_type(&f.ret);
+        let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+        let sig = FuncSig {
+            ret: ret.clone(),
+            params: param_tys.clone(),
+            variadic: f.variadic,
+        };
+        self.scopes.declare_value(&f.name, ValueSym::Func(sig));
+        if let Some(body) = &f.body {
+            self.lower_function_body(f, ret, &param_tys, body);
+        }
+    }
+
+    /// Mirrors `checker::Checker::resolve_type`'s shape but does not also re-visit an array's
+    /// size expression: that visit exists in the checker purely to catch diagnostics inside the
+    /// size expression, which this pass assumes already happened. Kept as its own small
+    /// function rather than sharing code with the checker's version, which would need a
+    /// callback threaded through for that one difference — more machinery than the ~25 lines
+    /// it would save.
+    fn resolve_type(&mut self, ty: &Type) -> Ty {
+        match ty {
+            Type::Scalar { kind, .. } => Ty::Scalar(*kind),
+            Type::Tag {
+                kind, name, span, ..
+            } => {
+                if name.is_empty() {
+                    return Ty::Unknown;
+                }
+                let found = match kind {
+                    TagKind::Struct => self.scopes.lookup_struct(name).is_some(),
+                    TagKind::Union => self.scopes.lookup_union(name).is_some(),
+                    TagKind::Enum => self.scopes.lookup_enum(name).is_some(),
+                };
+                if !found {
+                    self.diags.push(
+                        Diag::new(ECode::UndefinedSymbol)
+                            .with_span(conv_span(*span))
+                            .with_arg(name.clone()),
+                    );
+                    return Ty::Unknown;
+                }
+                match kind {
+                    TagKind::Struct => Ty::Struct(name.clone()),
+                    TagKind::Union => Ty::Union(name.clone()),
+                    TagKind::Enum => Ty::Enum(name.clone()),
+                }
+            }
+            Type::Named { name, span, .. } => {
+                if let Some(t) = self.scopes.lookup_typedef(name) {
+                    return t.clone();
+                }
+                if self.scopes.lookup_struct(name).is_some() {
+                    return Ty::Struct(name.clone());
+                }
+                if self.scopes.lookup_union(name).is_some() {
+                    return Ty::Union(name.clone());
+                }
+                if self.scopes.lookup_enum(name).is_some() {
+                    return Ty::Enum(name.clone());
+                }
+                self.diags.push(
+                    Diag::new(ECode::UndefinedSymbol)
+                        .with_span(conv_span(*span))
+                        .with_arg(name.clone()),
+                );
+                Ty::Unknown
+            }
+            Type::Pointer { pointee, .. } => Ty::Pointer(Box::new(self.resolve_type(pointee))),
+            Type::Array { elem, .. } => Ty::Array(Box::new(self.resolve_type(elem))),
+            Type::Instantiated { .. } => Ty::Unknown,
+        }
+    }
+
+    // ---- struct/union layout (packed, no padding — see module header) -------------------
+
+    fn size_of_ty(&self, ty: &Ty) -> u64 {
+        match ty {
+            Ty::Scalar(k) => to_bir_scalar(*k)
+                .map(|s| u64::from(scalar_byte_size(s)))
+                .unwrap_or(0),
+            Ty::Pointer(_) => 8,
+            Ty::Enum(_) => 4,
+            // Documented gap: `Ty::Array` carries no element count, so this cannot compute a
+            // real total size; treated as a single element (flagged at each `sizeof` call site
+            // that takes this path, not silently here).
+            Ty::Array(elem) => self.size_of_ty(elem),
+            Ty::Struct(n) => self
+                .scopes
+                .lookup_struct(n)
+                .map(|info| info.fields.iter().map(|(_, t)| self.size_of_ty(t)).sum())
+                .unwrap_or(0),
+            Ty::Union(n) => self
+                .scopes
+                .lookup_union(n)
+                .map(|info| {
+                    info.fields
+                        .iter()
+                        .map(|(_, t)| self.size_of_ty(t))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0),
+            Ty::Function { .. } | Ty::Unknown => 0,
+        }
+    }
+
+    fn field_offset(&self, ty: &Ty, field: &str) -> Option<(u64, Ty)> {
+        match ty {
+            Ty::Struct(n) => {
+                let info = self.scopes.lookup_struct(n)?;
+                let mut off = 0u64;
+                for (fname, fty) in &info.fields {
+                    if fname == field {
+                        return Some((off, fty.clone()));
+                    }
+                    off += self.size_of_ty(fty);
+                }
+                None
+            }
+            // Union fields overlay the same storage; every field starts at offset 0.
+            Ty::Union(n) => {
+                let info = self.scopes.lookup_union(n)?;
+                info.fields
+                    .iter()
+                    .find(|(fname, _)| fname == field)
+                    .map(|(_, fty)| (0u64, fty.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    // ---- constant folding (enumerators, case labels) -------------------------------------
+
+    fn const_eval_i64(&self, e: &Expr) -> Option<i64> {
+        match e {
+            Expr::IntLit { value, .. } => Some(int_lit_value(value)),
+            Expr::CharLit { value, .. } => Some(i64::from(value.value)),
+            Expr::Unary { op, expr, .. } => {
+                let v = self.const_eval_i64(expr)?;
+                Some(match op {
+                    UnaryOp::Neg => v.wrapping_neg(),
+                    UnaryOp::Plus => v,
+                    UnaryOp::BitNot => !v,
+                    _ => return None,
+                })
+            }
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let l = self.const_eval_i64(lhs)?;
+                let r = self.const_eval_i64(rhs)?;
+                Some(match op {
+                    ABin::Add => l.wrapping_add(r),
+                    ABin::Sub => l.wrapping_sub(r),
+                    ABin::Mul => l.wrapping_mul(r),
+                    ABin::Div if r != 0 => l.wrapping_div(r),
+                    ABin::Rem if r != 0 => l.wrapping_rem(r),
+                    ABin::BitAnd => l & r,
+                    ABin::BitOr => l | r,
+                    ABin::BitXor => l ^ r,
+                    ABin::Shl => l.wrapping_shl(r as u32),
+                    ABin::Shr => l.wrapping_shr(r as u32),
+                    _ => return None,
+                })
+            }
+            Expr::Ident { name, .. } => self.enum_values.get(name).copied(),
+            _ => None,
+        }
+    }
+
+    fn diag_unsupported(
+        &mut self,
+        span: FSpan,
+        what: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.diags.push(
+            Diag::new(ECode::LoweringUnsupported)
+                .with_span(conv_span(span))
+                .with_arg(what.into())
+                .with_arg(detail.into()),
+        );
+    }
+}
+
+// ---- Lowerer: function bodies, blocks, and the stack-slot bookkeeping ----------------------
+
+impl Lowerer {
+    fn lower_function_body(&mut self, f: &FunctionDecl, ret: Ty, param_tys: &[Ty], body: &[Stmt]) {
+        self.insts = Vec::new();
+        self.blocks = Vec::new();
+        self.insts_by_block = HashMap::new();
+        self.locals = vec![HashMap::new()];
+        self.next_slot = 0;
+        self.ctrl_stack = Vec::new();
+        self.label_blocks = HashMap::new();
+        self.fn_ret = ret.clone();
+
+        let entry = self.alloc_block();
+        self.cur = entry;
+
+        // Pre-allocate one block per label so a forward `goto` has somewhere to point (a label
+        // may be declared after the `goto` that targets it). Sorted for determinism: `Module`
+        // must print byte-identically regardless of `HashSet`'s iteration order.
+        let mut labelset = HashSet::new();
+        collect_labels_many(body, &mut labelset);
+        let mut sorted_labels: Vec<&String> = labelset.iter().collect();
+        sorted_labels.sort();
+        for name in sorted_labels {
+            let b = self.alloc_block();
+            self.label_blocks.insert(name.clone(), b);
+        }
+
+        let mut bir_params = Vec::with_capacity(f.params.len());
+        for (i, (p, pty)) in f.params.iter().zip(param_tys.iter()).enumerate() {
+            bir_params.push(to_bir_ty(pty));
+            if let Some(name) = &p.name {
+                let slot = self.new_slot(pty.clone(), BSpace::Param);
+                self.bind_local(name, slot.clone());
+                // An aggregate-by-value parameter shares the "whole aggregate has no BIR
+                // value" gap documented above: there is no value to store here, so the
+                // parameter's slot is simply never initialized (a member access against it
+                // would read synthetic, unwritten storage — a known, narrow limitation, not a
+                // silent miscompile of anything this pass otherwise claims to support).
+                if !is_aggregate(pty) && !pty.is_unknown() {
+                    let lv = self.slot_lvalue(&slot);
+                    self.store_addr(&lv, ValRef::Param(i as u32));
+                }
+            }
+        }
+
+        for s in body {
+            self.lower_stmt(s);
+        }
+        self.close_fallthrough();
+
+        let name = f.name.clone();
+        let blocks: Vec<BBlock> = std::mem::take(&mut self.blocks)
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| {
+                b.unwrap_or_else(|| {
+                    panic!(
+                        "lowering bug: block bb{i} in '{name}' was allocated but never terminated"
+                    )
+                })
+            })
+            .collect();
+        let (blocks, insts) = linearize_by_block_order(blocks, std::mem::take(&mut self.insts));
+
+        let func = BFunction {
+            name,
+            params: bir_params,
+            ret: to_bir_ty(&ret),
+            blocks,
+            insts,
+        };
+        self.funcs.push(func);
+    }
+
+    /// Closes off whatever block is open when a function body's statement list runs out
+    /// (falling off the end without an explicit `return`, or the trailing dead block left open
+    /// after the body's final statement if that was itself a terminator). Defaults to a zeroed
+    /// return value for a non-void function — this pass does not check for a missing `return`
+    /// on every control path (the checker does not either, see its module header).
+    fn close_fallthrough(&mut self) {
+        let fr = self.fn_ret.clone();
+        let term = if matches!(fr, Ty::Scalar(ScalarKind::Void)) {
+            BTerm::Ret(None)
+        } else if is_aggregate(&fr) {
+            self.diags.push(
+                Diag::new(ECode::LoweringUnsupported)
+                    .with_arg("whole-aggregate value")
+                    .with_arg(
+                        "function falls through its end without a return; cannot synthesize a struct/union/array return value",
+                    ),
+            );
+            BTerm::Ret(None)
+        } else {
+            let z = self.zero_of(&fr);
+            BTerm::Ret(Some(z))
+        };
+        self.terminate(term);
+    }
+
+    fn alloc_block(&mut self) -> BlockId {
+        let id = BlockId(self.blocks.len() as u32);
+        self.blocks.push(None);
+        id
+    }
+
+    fn push(&mut self, ty: BTy, op: BOp) -> ValRef {
+        let id = InstId(self.insts.len() as u32);
+        self.insts.push(BInst { ty, op });
+        self.insts_by_block.entry(self.cur.0).or_default().push(id);
+        ValRef::Val(id)
+    }
+
+    fn push_void(&mut self, op: BOp) {
+        let id = InstId(self.insts.len() as u32);
+        self.insts.push(BInst { ty: BTy::Void, op });
+        self.insts_by_block.entry(self.cur.0).or_default().push(id);
+    }
+
+    /// Finalizes the currently-open block (`self.cur`) with `term`. Callers must set
+    /// `self.cur` to whichever block should receive subsequent instructions next — this never
+    /// does that implicitly, since some callers (`if`, ternary, `&&`/`||`) need to leave more
+    /// than one already-allocated block open across several steps.
+    fn terminate(&mut self, term: BTerm) {
+        let ids = self.insts_by_block.remove(&self.cur.0).unwrap_or_default();
+        self.blocks[self.cur.0 as usize] = Some(BBlock { insts: ids, term });
+    }
+
+    fn zero_of(&mut self, ty: &Ty) -> ValRef {
+        let bty = to_bir_ty(ty);
+        if ty.is_float() {
+            self.push(bty, BOp::ConstFloat(0.0))
+        } else {
+            self.push(bty, BOp::ConstInt(0))
+        }
+    }
+
+    fn new_slot(&mut self, ty: Ty, space: BSpace) -> LocalSlot {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        LocalSlot { slot, ty, space }
+    }
+
+    fn bind_local(&mut self, name: &str, slot: LocalSlot) {
+        self.locals
+            .last_mut()
+            .expect("at least one local scope must be open while lowering a function body")
+            .insert(name.to_string(), slot);
+    }
+
+    fn find_local(&self, name: &str) -> Option<LocalSlot> {
+        self.locals
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    fn slot_addr(&mut self, s: &LocalSlot) -> ValRef {
+        self.push(
+            BTy::Ptr(s.space),
+            BOp::ConstInt(i64::from(s.slot) * SLOT_STRIDE),
+        )
+    }
+
+    fn slot_lvalue(&mut self, s: &LocalSlot) -> LValue {
+        let addr = self.slot_addr(s);
+        LValue {
+            addr,
+            ty: s.ty.clone(),
+            space: s.space,
+        }
+    }
+
+    fn lvalue_unknown(&mut self) -> LValue {
+        let addr = self.push(BTy::Ptr(BSpace::Local), BOp::ConstInt(0));
+        LValue {
+            addr,
+            ty: Ty::Unknown,
+            space: BSpace::Local,
+        }
+    }
+
+    fn load_addr(&mut self, lv: &LValue) -> (ValRef, Ty) {
+        let bty = to_bir_ty(&lv.ty);
+        let align = natural_align(bty);
+        let v = self.push(
+            bty,
+            BOp::Load {
+                ptr: lv.addr,
+                space: lv.space,
+                align,
+                volatile: false,
+            },
+        );
+        (v, lv.ty.clone())
+    }
+
+    fn store_addr(&mut self, lv: &LValue, val: ValRef) {
+        let bty = to_bir_ty(&lv.ty);
+        let align = natural_align(bty);
+        self.push_void(BOp::Store {
+            ptr: lv.addr,
+            val,
+            ty: bty,
+            space: lv.space,
+            align,
+            volatile: false,
+        });
+    }
+}
+
+// ---- Lowerer: statements --------------------------------------------------------------------
+//
+// Every `lower_*` statement helper below leaves `self.cur` pointing at an open (allocated,
+// not yet terminated) block when it returns — including the ones (`break`/`continue`/
+// `return`/`goto`) that terminate the block they were called in: they immediately open a fresh
+// one for whatever (reachable or not) code textually follows. This lets every caller just keep
+// appending/terminating without checking whether the previous statement already closed things
+// off.
+
+impl Lowerer {
+    fn lower_stmt(&mut self, s: &Stmt) {
+        match s {
+            Stmt::Expr { expr, .. } => {
+                self.lower_expr(expr);
+            }
+            Stmt::Empty { .. } => {}
+            Stmt::Block { stmts, .. } => {
+                self.locals.push(HashMap::new());
+                for st in stmts {
+                    self.lower_stmt(st);
+                }
+                self.locals.pop();
+            }
+            Stmt::Decl { decls, .. } => {
+                for d in decls {
+                    self.lower_var_decl(d);
+                }
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                span,
+            } => self.lower_if(cond, then_branch, else_branch.as_deref(), *span),
+            Stmt::While { cond, body, span } => self.lower_while(cond, body, *span),
+            Stmt::DoWhile { body, cond, span } => self.lower_do_while(body, cond, *span),
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+                span,
+            } => self.lower_for(init.as_deref(), cond.as_ref(), step.as_ref(), body, *span),
+            Stmt::Switch { expr, body, span } => self.lower_switch(expr, body, *span),
+            // Reached only when a `case`/`default` sits outside `lower_switch`'s flattened
+            // top-level view (e.g. nested/Duff's-device style, see the module header) — the
+            // label itself is not dispatched to, only its wrapped statement still lowers.
+            Stmt::Case { stmt, .. } => self.lower_stmt(stmt),
+            Stmt::Default { stmt, .. } => self.lower_stmt(stmt),
+            Stmt::Break { span } => self.lower_break(*span),
+            Stmt::Continue { span } => self.lower_continue(*span),
+            Stmt::Return { expr, span } => self.lower_return(expr.as_ref(), *span),
+            Stmt::Label { name, stmt, .. } => self.lower_label(name, stmt),
+            Stmt::Goto { label, span } => self.lower_goto(label, *span),
+        }
+    }
+
+    fn lower_var_decl(&mut self, v: &VarDecl) {
+        let ty = self.resolve_type(&v.ty);
+        if ty.is_unknown() {
+            if let Some(init) = &v.init {
+                self.lower_expr(init);
+            }
+            let slot = self.new_slot(Ty::Unknown, BSpace::Local);
+            self.bind_local(&v.name, slot);
+            return;
+        }
+        let space = if v.cuda_quals.is_shared {
+            BSpace::Shared
+        } else if v.cuda_quals.is_constant {
+            BSpace::Constant
+        } else {
+            BSpace::Local
+        };
+        let slot = self.new_slot(ty.clone(), space);
+        self.bind_local(&v.name, slot.clone());
+        if let Some(init) = &v.init {
+            if is_aggregate(&ty) {
+                self.diag_unsupported(
+                    v.span,
+                    "aggregate initializer",
+                    "struct/union/array initializers are not lowered",
+                );
+                self.lower_expr(init);
+            } else {
+                let (iv, ity) = self.lower_expr(init);
+                if !ity.is_unknown() {
+                    let coerced = self.coerce_to(iv, &ity, &ty);
+                    let lv = self.slot_lvalue(&slot);
+                    self.store_addr(&lv, coerced);
+                }
+            }
+        }
+    }
+
+    fn lower_if(&mut self, cond: &Expr, then_s: &Stmt, else_s: Option<&Stmt>, _span: FSpan) {
+        let (cv, cty) = self.lower_expr(cond);
+        let branch_val = if cty.is_unknown() {
+            self.push(BTy::Scalar(BScalar::I1), BOp::ConstInt(1))
+        } else {
+            self.truthy(cv, &cty)
+        };
+        let then_bb = self.alloc_block();
+        let else_bb = self.alloc_block();
+        let merge_bb = self.alloc_block();
+        self.terminate(BTerm::CondBr(branch_val, then_bb, else_bb));
+
+        self.cur = then_bb;
+        self.lower_stmt(then_s);
+        self.terminate(BTerm::Br(merge_bb));
+
+        self.cur = else_bb;
+        if let Some(e) = else_s {
+            self.lower_stmt(e);
+        }
+        self.terminate(BTerm::Br(merge_bb));
+
+        self.cur = merge_bb;
+    }
+
+    fn lower_while(&mut self, cond: &Expr, body: &Stmt, _span: FSpan) {
+        let cond_bb = self.alloc_block();
+        let body_bb = self.alloc_block();
+        let exit_bb = self.alloc_block();
+        self.terminate(BTerm::Br(cond_bb));
+
+        self.cur = cond_bb;
+        let (cv, cty) = self.lower_expr(cond);
+        let branch_val = if cty.is_unknown() {
+            self.push(BTy::Scalar(BScalar::I1), BOp::ConstInt(1))
+        } else {
+            self.truthy(cv, &cty)
+        };
+        self.terminate(BTerm::CondBr(branch_val, body_bb, exit_bb));
+
+        self.cur = body_bb;
+        self.ctrl_stack.push(CtrlCtx::Loop {
+            break_bb: exit_bb,
+            continue_bb: cond_bb,
+        });
+        self.lower_stmt(body);
+        self.ctrl_stack.pop();
+        self.terminate(BTerm::Br(cond_bb));
+
+        self.cur = exit_bb;
+    }
+
+    fn lower_do_while(&mut self, body: &Stmt, cond: &Expr, _span: FSpan) {
+        let body_bb = self.alloc_block();
+        let cond_bb = self.alloc_block();
+        let exit_bb = self.alloc_block();
+        self.terminate(BTerm::Br(body_bb));
+
+        self.cur = body_bb;
+        self.ctrl_stack.push(CtrlCtx::Loop {
+            break_bb: exit_bb,
+            continue_bb: cond_bb,
+        });
+        self.lower_stmt(body);
+        self.ctrl_stack.pop();
+        self.terminate(BTerm::Br(cond_bb));
+
+        self.cur = cond_bb;
+        let (cv, cty) = self.lower_expr(cond);
+        let branch_val = if cty.is_unknown() {
+            self.push(BTy::Scalar(BScalar::I1), BOp::ConstInt(1))
+        } else {
+            self.truthy(cv, &cty)
+        };
+        self.terminate(BTerm::CondBr(branch_val, body_bb, exit_bb));
+
+        self.cur = exit_bb;
+    }
+
+    fn lower_for(
+        &mut self,
+        init: Option<&Stmt>,
+        cond: Option<&Expr>,
+        step: Option<&Expr>,
+        body: &Stmt,
+        _span: FSpan,
+    ) {
+        self.locals.push(HashMap::new());
+        if let Some(i) = init {
+            self.lower_stmt(i);
+        }
+        let cond_bb = self.alloc_block();
+        let body_bb = self.alloc_block();
+        let step_bb = self.alloc_block();
+        let exit_bb = self.alloc_block();
+        self.terminate(BTerm::Br(cond_bb));
+
+        self.cur = cond_bb;
+        if let Some(c) = cond {
+            let (cv, cty) = self.lower_expr(c);
+            let branch_val = if cty.is_unknown() {
+                self.push(BTy::Scalar(BScalar::I1), BOp::ConstInt(1))
+            } else {
+                self.truthy(cv, &cty)
+            };
+            self.terminate(BTerm::CondBr(branch_val, body_bb, exit_bb));
+        } else {
+            self.terminate(BTerm::Br(body_bb));
+        }
+
+        self.cur = body_bb;
+        self.ctrl_stack.push(CtrlCtx::Loop {
+            break_bb: exit_bb,
+            continue_bb: step_bb,
+        });
+        self.lower_stmt(body);
+        self.ctrl_stack.pop();
+        self.terminate(BTerm::Br(step_bb));
+
+        self.cur = step_bb;
+        if let Some(s) = step {
+            self.lower_expr(s);
+        }
+        self.terminate(BTerm::Br(cond_bb));
+
+        self.cur = exit_bb;
+        self.locals.pop();
+    }
+
+    fn lower_switch(&mut self, expr: &Expr, body: &Stmt, _span: FSpan) {
+        let (sv, _sty) = self.lower_expr(expr);
+        let stmts = switch_body_stmts(body);
+        let exit_bb = self.alloc_block();
+        let entry_blocks: Vec<BlockId> = stmts.iter().map(|_| self.alloc_block()).collect();
+
+        let mut cases: Vec<(i64, BlockId)> = Vec::new();
+        let mut default_bb: Option<BlockId> = None;
+        for (i, st) in stmts.iter().enumerate() {
+            let (labels, _inner) = self.peel_case_labels(st, i as i64);
+            for lbl in labels {
+                match lbl {
+                    CaseLabel::Value(v) => cases.push((v, entry_blocks[i])),
+                    CaseLabel::Default => default_bb = Some(entry_blocks[i]),
+                }
+            }
+        }
+        let default_target = default_bb.unwrap_or(exit_bb);
+        self.terminate(BTerm::Switch(sv, default_target, cases));
+
+        self.ctrl_stack.push(CtrlCtx::Switch { break_bb: exit_bb });
+        for (i, st) in stmts.iter().enumerate() {
+            self.cur = entry_blocks[i];
+            let (_labels, inner) = self.peel_case_labels(st, i as i64);
+            self.lower_stmt(inner);
+            let fallthrough = entry_blocks.get(i + 1).copied().unwrap_or(exit_bb);
+            self.terminate(BTerm::Br(fallthrough));
+        }
+        self.ctrl_stack.pop();
+
+        self.cur = exit_bb;
+    }
+
+    /// Peels leading `case`/`default` wrappers off a switch body's top-level statement,
+    /// returning every label found (in source order) plus the statement they ultimately wrap.
+    /// `seed` (the statement's own index within the switch) keeps synthesized fallback values
+    /// for non-constant case labels from colliding with each other across a single `switch`.
+    fn peel_case_labels<'e>(&mut self, s: &'e Stmt, seed: i64) -> (Vec<CaseLabel>, &'e Stmt) {
+        let mut labels = Vec::new();
+        let mut cur = s;
+        let mut n = 0i64;
+        loop {
+            match cur {
+                Stmt::Case { value, stmt, span } => {
+                    let v = self.const_eval_i64(value).unwrap_or_else(|| {
+                        self.diag_unsupported(
+                            *span,
+                            "non-constant case label",
+                            "value must be a compile-time integer constant",
+                        );
+                        i64::MIN + seed * 1000 + n
+                    });
+                    n += 1;
+                    labels.push(CaseLabel::Value(v));
+                    cur = stmt;
+                }
+                Stmt::Default { stmt, .. } => {
+                    labels.push(CaseLabel::Default);
+                    cur = stmt;
+                }
+                _ => break,
+            }
+        }
+        (labels, cur)
+    }
+
+    fn lower_break(&mut self, span: FSpan) {
+        let target = self.ctrl_stack.last().map(|c| match c {
+            CtrlCtx::Loop { break_bb, .. } | CtrlCtx::Switch { break_bb } => *break_bb,
+        });
+        match target {
+            Some(bb) => self.terminate(BTerm::Br(bb)),
+            None => {
+                self.diags.push(
+                    Diag::new(ECode::TypeError)
+                        .with_span(conv_span(span))
+                        .with_arg("'break' used outside of a loop or switch"),
+                );
+                self.terminate(BTerm::Ret(None));
+            }
+        }
+        self.cur = self.alloc_block();
+    }
+
+    fn lower_continue(&mut self, span: FSpan) {
+        let target = self.ctrl_stack.iter().rev().find_map(|c| match c {
+            CtrlCtx::Loop { continue_bb, .. } => Some(*continue_bb),
+            CtrlCtx::Switch { .. } => None,
+        });
+        match target {
+            Some(bb) => self.terminate(BTerm::Br(bb)),
+            None => {
+                self.diags.push(
+                    Diag::new(ECode::TypeError)
+                        .with_span(conv_span(span))
+                        .with_arg("'continue' used outside of a loop"),
+                );
+                self.terminate(BTerm::Ret(None));
+            }
+        }
+        self.cur = self.alloc_block();
+    }
+
+    fn lower_return(&mut self, expr: Option<&Expr>, span: FSpan) {
+        let fr = self.fn_ret.clone();
+        let is_void = matches!(fr, Ty::Scalar(ScalarKind::Void));
+        let term = match expr {
+            None => BTerm::Ret(None),
+            Some(e) => {
+                let (v, ty) = self.lower_expr(e);
+                if ty.is_unknown() {
+                    BTerm::Ret(if is_void {
+                        None
+                    } else {
+                        Some(self.zero_of(&fr))
+                    })
+                } else if is_aggregate(&ty) {
+                    self.diag_unsupported(
+                        span,
+                        "whole-aggregate return",
+                        "returning a struct/union/array by value has no BIR representation",
+                    );
+                    BTerm::Ret(if is_void {
+                        None
+                    } else {
+                        Some(self.zero_of(&fr))
+                    })
+                } else {
+                    let coerced = self.coerce_to(v, &ty, &fr);
+                    BTerm::Ret(Some(coerced))
+                }
+            }
+        };
+        self.terminate(term);
+        self.cur = self.alloc_block();
+    }
+
+    fn lower_label(&mut self, name: &str, stmt: &Stmt) {
+        let bb = *self
+            .label_blocks
+            .get(name)
+            .expect("every label was pre-allocated from the same tree this walks");
+        self.terminate(BTerm::Br(bb));
+        self.cur = bb;
+        self.lower_stmt(stmt);
+    }
+
+    fn lower_goto(&mut self, label: &str, span: FSpan) {
+        match self.label_blocks.get(label).copied() {
+            Some(bb) => self.terminate(BTerm::Br(bb)),
+            None => {
+                self.diags.push(
+                    Diag::new(ECode::UndefinedSymbol)
+                        .with_span(conv_span(span))
+                        .with_arg(label.to_string()),
+                );
+                self.terminate(BTerm::Ret(None));
+            }
+        }
+        self.cur = self.alloc_block();
+    }
+}
+
+// ---- Lowerer: expressions -------------------------------------------------------------------
+
+impl Lowerer {
+    /// A universal fallback for anything this pass cannot make sense of: a well-formed but
+    /// meaningless value, paired with `Ty::Unknown` so every later use of it silently
+    /// propagates instead of reporting a second diagnostic (mirrors `checker::Ty::Unknown`'s
+    /// own suppression rule).
+    fn placeholder(&mut self) -> (ValRef, Ty) {
+        (
+            self.push(BTy::Scalar(BScalar::I32), BOp::ConstInt(0)),
+            Ty::Unknown,
+        )
+    }
+
+    fn diag_for_unresolved_name(&mut self, name: &str, span: FSpan) {
+        if CUDA_DIM3_BUILTINS.contains(&name) {
+            self.diag_unsupported(span, "GPU intrinsic", name);
+        } else if self.unlowered_globals.contains(name) {
+            self.diag_unsupported(span, "global variable storage", name);
+        } else if matches!(self.scopes.lookup_value(name), Some(ValueSym::Func(_))) {
+            self.diag_unsupported(span, "function-pointer value", name);
+        } else {
+            self.diags.push(
+                Diag::new(ECode::UndefinedSymbol)
+                    .with_span(conv_span(span))
+                    .with_arg(name.to_string()),
+            );
+        }
+    }
+
+    fn lower_expr(&mut self, e: &Expr) -> (ValRef, Ty) {
+        match e {
+            Expr::IntLit { value, .. } => {
+                let ty = int_lit_ty(value);
+                let v = self.push(to_bir_ty(&ty), BOp::ConstInt(int_lit_value(value)));
+                (v, ty)
+            }
+            Expr::FloatLit { value, .. } => {
+                let ty = float_lit_ty(value);
+                let v = self.push(to_bir_ty(&ty), BOp::ConstFloat(float_lit_value(value)));
+                (v, ty)
+            }
+            Expr::CharLit { value, .. } => {
+                let ty = Ty::Scalar(ScalarKind::Char);
+                let v = self.push(to_bir_ty(&ty), BOp::ConstInt(i64::from(value.value)));
+                (v, ty)
+            }
+            Expr::StrLit { span, .. } => {
+                // Same underlying gap as a module-level global: nowhere in BIR to put the
+                // bytes yet. A null-ish pointer placeholder lets the rest of the expression
+                // still type-check further.
+                self.diag_unsupported(
+                    *span,
+                    "string literal",
+                    "no BIR data-segment representation",
+                );
+                let ty = Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Char)));
+                let v = self.push(BTy::Ptr(BSpace::Global), BOp::ConstInt(0));
+                (v, ty)
+            }
+            Expr::Ident { name, span } => self.lower_ident_value(name, *span),
+            Expr::Index { .. } | Expr::Member { .. } => {
+                let lv = self.lower_lvalue(e);
+                self.value_of_lvalue(lv, e.span())
+            }
+            Expr::Unary {
+                op: UnaryOp::Deref, ..
+            } => {
+                let lv = self.lower_lvalue(e);
+                self.value_of_lvalue(lv, e.span())
+            }
+            Expr::Unary {
+                op: UnaryOp::Addr,
+                expr,
+                ..
+            } => {
+                let lv = self.lower_lvalue(expr);
+                if lv.ty.is_unknown() {
+                    self.placeholder()
+                } else {
+                    (lv.addr, Ty::Pointer(Box::new(lv.ty)))
+                }
+            }
+            Expr::Unary { op, expr, span } => self.lower_unary(*op, expr, *span),
+            Expr::Binary { op, lhs, rhs, span } => self.lower_binary(*op, lhs, rhs, *span),
+            Expr::Assign { op, lhs, rhs, span } => self.lower_assign(*op, lhs, rhs, *span),
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+                span,
+            } => self.lower_ternary(cond, then_branch, else_branch, *span),
+            Expr::Cast { ty, expr, span } => self.lower_cast(ty, expr, *span),
+            Expr::PreIncDec { op, expr, span } => self.lower_incdec(*op, expr, *span, true),
+            Expr::PostIncDec { op, expr, span } => self.lower_incdec(*op, expr, *span, false),
+            Expr::SizeofExpr { expr, .. } => {
+                // The operand is lowered for its type only; sizeof does not execute at
+                // runtime, but this pass has no separate non-emitting type-inference path (it
+                // computes types as a side effect of value lowering), so the operand's
+                // instructions still end up in the function even though nothing references
+                // their result. Harmless except for an operand with an observable side effect
+                // (`sizeof(x++)`), which is both rare and already dubious style.
+                let (_, ty) = self.lower_expr(expr);
+                let bytes = if ty.is_unknown() {
+                    0
+                } else {
+                    self.size_of_ty(&ty)
+                };
+                let v = self.push(BTy::Scalar(BScalar::I64), BOp::ConstInt(bytes as i64));
+                (v, Ty::Scalar(ScalarKind::ULong))
+            }
+            Expr::SizeofType { ty, .. } => {
+                let t = self.resolve_type(ty);
+                let bytes = if t.is_unknown() {
+                    0
+                } else {
+                    self.size_of_ty(&t)
+                };
+                let v = self.push(BTy::Scalar(BScalar::I64), BOp::ConstInt(bytes as i64));
+                (v, Ty::Scalar(ScalarKind::ULong))
+            }
+            Expr::Call { callee, args, span } => self.lower_call(callee, args, *span),
+            Expr::Comma { exprs, .. } => {
+                let mut last = self.placeholder();
+                for ex in exprs {
+                    last = self.lower_expr(ex);
+                }
+                last
+            }
+            Expr::Error { .. } => self.placeholder(),
+        }
+    }
+
+    fn lower_ident_value(&mut self, name: &str, span: FSpan) -> (ValRef, Ty) {
+        if let Some(slot) = self.find_local(name) {
+            if slot.ty.is_unknown() {
+                return self.placeholder();
+            }
+            if is_aggregate(&slot.ty) {
+                let addr = self.slot_addr(&slot);
+                return match &slot.ty {
+                    Ty::Array(elem) => (addr, Ty::Pointer(elem.clone())),
+                    _ => {
+                        self.diag_unsupported(
+                            span,
+                            "whole-aggregate value",
+                            "struct/union used by value (no BIR aggregate type)",
+                        );
+                        self.placeholder()
+                    }
+                };
+            }
+            let lv = self.slot_lvalue(&slot);
+            return self.load_addr(&lv);
+        }
+        if CUDA_DIM3_BUILTINS.contains(&name) {
+            self.diag_unsupported(span, "GPU intrinsic", name);
+            return self.placeholder();
+        }
+        if let Some(&v) = self.enum_values.get(name) {
+            return (
+                self.push(BTy::Scalar(BScalar::I32), BOp::ConstInt(v)),
+                Ty::Scalar(ScalarKind::Int),
+            );
+        }
+        self.diag_for_unresolved_name(name, span);
+        self.placeholder()
+    }
+
+    /// Computes an expression's address plus what sema type lives there. Used directly for
+    /// `&expr` and assignment targets, and recursively as the base of `Index`/`Member` chains.
+    fn lower_lvalue(&mut self, e: &Expr) -> LValue {
+        match e {
+            Expr::Ident { name, span } => {
+                if let Some(slot) = self.find_local(name) {
+                    return self.slot_lvalue(&slot);
+                }
+                if CUDA_DIM3_BUILTINS.contains(&name.as_str()) {
+                    self.diag_unsupported(*span, "GPU intrinsic", name);
+                } else if self.enum_values.contains_key(name) {
+                    self.diags.push(
+                        Diag::new(ECode::TypeError)
+                            .with_span(conv_span(*span))
+                            .with_arg(format!("'{name}' is not addressable")),
+                    );
+                } else {
+                    self.diag_for_unresolved_name(name, *span);
+                }
+                self.lvalue_unknown()
+            }
+            Expr::Unary {
+                op: UnaryOp::Deref,
+                expr,
+                span,
+            } => {
+                let (v, ty) = self.lower_expr(expr);
+                if ty.is_unknown() {
+                    return self.lvalue_unknown();
+                }
+                match ty.deref_target() {
+                    Some(target) => LValue {
+                        addr: v,
+                        ty: target,
+                        space: BSpace::Global,
+                    },
+                    None => {
+                        self.diag_unsupported(*span, "dereference", "operand is not a pointer");
+                        self.lvalue_unknown()
+                    }
+                }
+            }
+            Expr::Index { base, index, span } => self.lower_index_lvalue(base, index, *span),
+            Expr::Member {
+                base,
+                name,
+                arrow,
+                span,
+            } => self.lower_member_lvalue(base, name, *arrow, *span),
+            _ => {
+                self.diags.push(
+                    Diag::new(ECode::TypeError)
+                        .with_span(conv_span(e.span()))
+                        .with_arg("expression is not addressable"),
+                );
+                self.lvalue_unknown()
+            }
+        }
+    }
+
+    fn value_of_lvalue(&mut self, lv: LValue, span: FSpan) -> (ValRef, Ty) {
+        if lv.ty.is_unknown() {
+            return self.placeholder();
+        }
+        if is_aggregate(&lv.ty) {
+            return match &lv.ty {
+                Ty::Array(elem) => (lv.addr, Ty::Pointer(elem.clone())),
+                _ => {
+                    self.diag_unsupported(
+                        span,
+                        "whole-aggregate value",
+                        "struct/union used by value (no BIR aggregate type)",
+                    );
+                    self.placeholder()
+                }
+            };
+        }
+        self.load_addr(&lv)
+    }
+
+    fn lower_index_lvalue(&mut self, base: &Expr, index: &Expr, span: FSpan) -> LValue {
+        let (idx_val, idx_ty) = self.lower_expr(index);
+        if idx_ty.is_unknown() {
+            return self.lvalue_unknown();
+        }
+        let (base_addr, base_space, elem_ty) = if is_lvalue_shaped(base) {
+            let lv = self.lower_lvalue(base);
+            if lv.ty.is_unknown() {
+                return self.lvalue_unknown();
+            }
+            match lv.ty.clone() {
+                Ty::Array(elem) => (lv.addr, lv.space, *elem),
+                Ty::Pointer(elem) => {
+                    let (v, _) = self.load_addr(&lv);
+                    (v, BSpace::Global, *elem)
+                }
+                _ => {
+                    self.diag_unsupported(span, "indexing", "base is not an array or pointer");
+                    return self.lvalue_unknown();
+                }
+            }
+        } else {
+            let (v, ty) = self.lower_expr(base);
+            if ty.is_unknown() {
+                return self.lvalue_unknown();
+            }
+            match ty.deref_target() {
+                Some(elem) => (v, BSpace::Global, elem),
+                None => {
+                    self.diag_unsupported(span, "indexing", "base is not an array or pointer");
+                    return self.lvalue_unknown();
+                }
+            }
+        };
+        let esz = self.size_of_ty(&elem_ty) as i64;
+        let idx64 = self.widen_index_i64(idx_val, &idx_ty);
+        let i64t = BTy::Scalar(BScalar::I64);
+        let esz_val = self.push(i64t, BOp::ConstInt(esz));
+        let byte_off = self.push(i64t, BOp::Bin(BBin::Mul, idx64, esz_val));
+        let ptrty = BTy::Ptr(base_space);
+        let addr = self.push(ptrty, BOp::Bin(BBin::Add, base_addr, byte_off));
+        LValue {
+            addr,
+            ty: elem_ty,
+            space: base_space,
+        }
+    }
+
+    fn lower_member_lvalue(&mut self, base: &Expr, name: &str, arrow: bool, span: FSpan) -> LValue {
+        let (base_addr, base_space, struct_ty) = if arrow {
+            let (v, ty) = self.lower_expr(base);
+            if ty.is_unknown() {
+                return self.lvalue_unknown();
+            }
+            match ty.deref_target() {
+                Some(t) => (v, BSpace::Global, t),
+                None => {
+                    self.diag_unsupported(span, "member access", "'->' on a non-pointer type");
+                    return self.lvalue_unknown();
+                }
+            }
+        } else {
+            let lv = self.lower_lvalue(base);
+            if lv.ty.is_unknown() {
+                return self.lvalue_unknown();
+            }
+            (lv.addr, lv.space, lv.ty)
+        };
+        if !matches!(struct_ty, Ty::Struct(_) | Ty::Union(_)) {
+            self.diag_unsupported(span, "member access", "base is not a struct/union");
+            return self.lvalue_unknown();
+        }
+        match self.field_offset(&struct_ty, name) {
+            Some((off, fty)) => {
+                let off_val = self.push(BTy::Scalar(BScalar::I64), BOp::ConstInt(off as i64));
+                let addr = self.push(
+                    BTy::Ptr(base_space),
+                    BOp::Bin(BBin::Add, base_addr, off_val),
+                );
+                LValue {
+                    addr,
+                    ty: fty,
+                    space: base_space,
+                }
+            }
+            None => {
+                self.diag_unsupported(span, "member access", format!("unknown field '{name}'"));
+                self.lvalue_unknown()
+            }
+        }
+    }
+}
+
+// ---- Lowerer: operators, casts, calls -------------------------------------------------------
+
+impl Lowerer {
+    /// Converts an already-lowered value from one sema type to another, choosing BIR's cast
+    /// opcode from the source/destination scalar shapes. Used both for an explicit `(T)expr`
+    /// cast and for C's implicit arithmetic promotion (widening both operands of a binary op
+    /// to their common type before applying it).
+    fn coerce_to(&mut self, v: ValRef, from: &Ty, to: &Ty) -> ValRef {
+        let from_b = to_bir_ty(from);
+        let to_b = to_bir_ty(to);
+        if from_b == to_b {
+            return v;
+        }
+        match (from_b, to_b) {
+            (BTy::Scalar(fs), BTy::Scalar(ts)) => {
+                let f_float = is_float_scalar(fs);
+                let t_float = is_float_scalar(ts);
+                let op = if f_float && t_float {
+                    if scalar_bits(ts) > scalar_bits(fs) {
+                        BCast::FpExt
+                    } else {
+                        BCast::FpTrunc
+                    }
+                } else if f_float {
+                    if is_signed(to) {
+                        BCast::FpToSi
+                    } else {
+                        BCast::FpToUi
+                    }
+                } else if t_float {
+                    if is_signed(from) {
+                        BCast::SiToFp
+                    } else {
+                        BCast::UiToFp
+                    }
+                } else if scalar_bits(ts) > scalar_bits(fs) {
+                    if is_signed(from) {
+                        BCast::Sext
+                    } else {
+                        BCast::Zext
+                    }
+                } else {
+                    BCast::Trunc
+                };
+                self.push(to_b, BOp::Cast(op, from_b, v))
+            }
+            _ => {
+                // Pointer<->pointer, pointer<->integer, enum<->int, or anything else this pass
+                // does not model precisely: `bitcast` is the closest existing opcode. BIR's
+                // pointers are opaque (no defined bit pattern), so a pointer/integer bitcast
+                // here is at best a best-effort placeholder conversion, not a real reinterpret
+                // — a documented limitation, not a claim of correctness.
+                self.push(to_b, BOp::Cast(BCast::Bitcast, from_b, v))
+            }
+        }
+    }
+
+    fn widen_index_i64(&mut self, v: ValRef, ty: &Ty) -> ValRef {
+        match to_bir_ty(ty) {
+            BTy::Scalar(BScalar::I64) => v,
+            BTy::Scalar(_) => self.coerce_to(v, ty, &Ty::Scalar(ScalarKind::Long)),
+            _ => v,
+        }
+    }
+
+    fn truthy(&mut self, v: ValRef, ty: &Ty) -> ValRef {
+        let bty = to_bir_ty(ty);
+        let i1 = BTy::Scalar(BScalar::I1);
+        if ty.is_float() {
+            let zero = self.push(bty, BOp::ConstFloat(0.0));
+            self.push(i1, BOp::FCmp(FCmpPred::One, bty, v, zero))
+        } else {
+            let zero = self.push(bty, BOp::ConstInt(0));
+            self.push(i1, BOp::ICmp(ICmpPred::Ne, bty, v, zero))
+        }
+    }
+
+    fn lower_cast(&mut self, ty: &Type, expr: &Expr, span: FSpan) -> (ValRef, Ty) {
+        let target = self.resolve_type(ty);
+        let (v, src) = self.lower_expr(expr);
+        if src.is_unknown() || target.is_unknown() {
+            return self.placeholder();
+        }
+        if is_aggregate(&target) || is_aggregate(&src) {
+            self.diag_unsupported(
+                span,
+                "cast involving a struct/union/array",
+                "no BIR aggregate type",
+            );
+            return self.placeholder();
+        }
+        (self.coerce_to(v, &src, &target), target)
+    }
+
+    fn lower_unary(&mut self, op: UnaryOp, expr: &Expr, _span: FSpan) -> (ValRef, Ty) {
+        let (v, ty) = self.lower_expr(expr);
+        if ty.is_unknown() {
+            return self.placeholder();
+        }
+        let bty = to_bir_ty(&ty);
+        match op {
+            UnaryOp::Plus => (v, ty),
+            UnaryOp::Neg => {
+                if ty.is_float() {
+                    let zero = self.push(bty, BOp::ConstFloat(0.0));
+                    (self.push(bty, BOp::Bin(BBin::FSub, zero, v)), ty)
+                } else {
+                    let zero = self.push(bty, BOp::ConstInt(0));
+                    (self.push(bty, BOp::Bin(BBin::Sub, zero, v)), ty)
+                }
+            }
+            UnaryOp::BitNot => {
+                let allones = self.push(bty, BOp::ConstInt(-1));
+                (self.push(bty, BOp::Bin(BBin::Xor, v, allones)), ty)
+            }
+            UnaryOp::Not => {
+                // `!x` is `x == 0`, result an `int` per C — computed directly rather than
+                // negating `truthy`'s `x != 0`, which would need a second comparison anyway.
+                let i32t = BTy::Scalar(BScalar::I32);
+                let zero_op = if ty.is_float() {
+                    BOp::ConstFloat(0.0)
+                } else {
+                    BOp::ConstInt(0)
+                };
+                let zero = self.push(bty, zero_op);
+                let cmp = if ty.is_float() {
+                    self.push(
+                        BTy::Scalar(BScalar::I1),
+                        BOp::FCmp(FCmpPred::Oeq, bty, v, zero),
+                    )
+                } else {
+                    self.push(
+                        BTy::Scalar(BScalar::I1),
+                        BOp::ICmp(ICmpPred::Eq, bty, v, zero),
+                    )
+                };
+                (
+                    self.push(i32t, BOp::Cast(BCast::Zext, BTy::Scalar(BScalar::I1), cmp)),
+                    Ty::Scalar(ScalarKind::Int),
+                )
+            }
+            UnaryOp::Deref | UnaryOp::Addr => {
+                unreachable!("Deref/Addr are handled directly in lower_expr/lower_lvalue")
+            }
+        }
+    }
+}
+
+// ---- Lowerer: binary operators ---------------------------------------------------------------
+
+impl Lowerer {
+    fn lower_binary(&mut self, op: ABin, lhs: &Expr, rhs: &Expr, span: FSpan) -> (ValRef, Ty) {
+        if matches!(op, ABin::LogOr | ABin::LogAnd) {
+            return self.lower_logical(op, lhs, rhs);
+        }
+        let (lv, lty) = self.lower_expr(lhs);
+        let (rv, rty) = self.lower_expr(rhs);
+        if lty.is_unknown() || rty.is_unknown() {
+            return self.placeholder();
+        }
+        match op {
+            ABin::Eq | ABin::Ne | ABin::Lt | ABin::Gt | ABin::Le | ABin::Ge => {
+                self.lower_compare(op, lv, &lty, rv, &rty)
+            }
+            ABin::Add => self.lower_add(lv, &lty, rv, &rty, span),
+            ABin::Sub => self.lower_sub(lv, &lty, rv, &rty, span),
+            // The checker already rejected non-numeric `Mul`/`Div`/`Rem` and non-integer
+            // bitwise/shift operands; this pass assumes that already happened and does not
+            // re-validate it.
+            ABin::Mul
+            | ABin::Div
+            | ABin::Rem
+            | ABin::BitOr
+            | ABin::BitXor
+            | ABin::BitAnd
+            | ABin::Shl
+            | ABin::Shr => self.lower_arith(op, lv, &lty, rv, &rty),
+            ABin::LogOr | ABin::LogAnd => unreachable!("handled above"),
+        }
+    }
+
+    /// `&&`/`||`: lowered via a branch to a merge block with a `phi`, not eagerly, since C
+    /// requires short-circuit evaluation (the right operand's side effects must not happen
+    /// when the left operand alone decides the result).
+    fn lower_logical(&mut self, op: ABin, lhs: &Expr, rhs: &Expr) -> (ValRef, Ty) {
+        let (lv, lty) = self.lower_expr(lhs);
+        if lty.is_unknown() {
+            return self.placeholder();
+        }
+        let lb = self.truthy(lv, &lty);
+        let i32t = BTy::Scalar(BScalar::I32);
+        let short_const = if matches!(op, ABin::LogAnd) { 0 } else { 1 };
+        let short_val = self.push(i32t, BOp::ConstInt(short_const));
+        let short_bb = self.cur;
+
+        let rhs_bb = self.alloc_block();
+        let merge_bb = self.alloc_block();
+        match op {
+            ABin::LogAnd => self.terminate(BTerm::CondBr(lb, rhs_bb, merge_bb)),
+            ABin::LogOr => self.terminate(BTerm::CondBr(lb, merge_bb, rhs_bb)),
+            _ => unreachable!(),
+        }
+
+        self.cur = rhs_bb;
+        let (rv, rty) = self.lower_expr(rhs);
+        let rb32 = if rty.is_unknown() {
+            self.push(i32t, BOp::ConstInt(0))
+        } else {
+            let rb = self.truthy(rv, &rty);
+            self.push(i32t, BOp::Cast(BCast::Zext, BTy::Scalar(BScalar::I1), rb))
+        };
+        let rhs_end_bb = self.cur;
+        self.terminate(BTerm::Br(merge_bb));
+
+        self.cur = merge_bb;
+        let phi = self.push(
+            i32t,
+            BOp::Phi(vec![(short_bb, short_val), (rhs_end_bb, rb32)]),
+        );
+        (phi, Ty::Scalar(ScalarKind::Int))
+    }
+
+    fn lower_compare(
+        &mut self,
+        op: ABin,
+        lv: ValRef,
+        lty: &Ty,
+        rv: ValRef,
+        rty: &Ty,
+    ) -> (ValRef, Ty) {
+        let i1 = BTy::Scalar(BScalar::I1);
+        let is_ptr_cmp = lty.is_pointer_like() || rty.is_pointer_like();
+        let cmp = if is_ptr_cmp {
+            let cmp_ty = BTy::Ptr(BSpace::Global);
+            let pred = match op {
+                ABin::Eq => ICmpPred::Eq,
+                ABin::Ne => ICmpPred::Ne,
+                ABin::Lt => ICmpPred::Ult,
+                ABin::Gt => ICmpPred::Ugt,
+                ABin::Le => ICmpPred::Ule,
+                ABin::Ge => ICmpPred::Uge,
+                _ => unreachable!(),
+            };
+            self.push(i1, BOp::ICmp(pred, cmp_ty, lv, rv))
+        } else if lty.is_float() || rty.is_float() {
+            let ct = promote(lty, rty);
+            let bty = to_bir_ty(&ct);
+            let l2 = self.coerce_to(lv, lty, &ct);
+            let r2 = self.coerce_to(rv, rty, &ct);
+            let pred = match op {
+                ABin::Eq => FCmpPred::Oeq,
+                ABin::Ne => FCmpPred::One,
+                ABin::Lt => FCmpPred::Olt,
+                ABin::Gt => FCmpPred::Ogt,
+                ABin::Le => FCmpPred::Ole,
+                ABin::Ge => FCmpPred::Oge,
+                _ => unreachable!(),
+            };
+            self.push(i1, BOp::FCmp(pred, bty, l2, r2))
+        } else {
+            let ct = promote(lty, rty);
+            let bty = to_bir_ty(&ct);
+            let l2 = self.coerce_to(lv, lty, &ct);
+            let r2 = self.coerce_to(rv, rty, &ct);
+            let signed = is_signed(&ct);
+            let pred = match op {
+                ABin::Eq => ICmpPred::Eq,
+                ABin::Ne => ICmpPred::Ne,
+                ABin::Lt => {
+                    if signed {
+                        ICmpPred::Slt
+                    } else {
+                        ICmpPred::Ult
+                    }
+                }
+                ABin::Gt => {
+                    if signed {
+                        ICmpPred::Sgt
+                    } else {
+                        ICmpPred::Ugt
+                    }
+                }
+                ABin::Le => {
+                    if signed {
+                        ICmpPred::Sle
+                    } else {
+                        ICmpPred::Ule
+                    }
+                }
+                ABin::Ge => {
+                    if signed {
+                        ICmpPred::Sge
+                    } else {
+                        ICmpPred::Uge
+                    }
+                }
+                _ => unreachable!(),
+            };
+            self.push(i1, BOp::ICmp(pred, bty, l2, r2))
+        };
+        let i32t = BTy::Scalar(BScalar::I32);
+        (
+            self.push(i32t, BOp::Cast(BCast::Zext, i1, cmp)),
+            Ty::Scalar(ScalarKind::Int),
+        )
+    }
+
+    /// Mul/Div/Rem/bitwise/shift/plain-arithmetic Add/Sub, after ruling out pointer arithmetic
+    /// (the caller handles `Add`/`Sub` pointer cases before falling here). See the module
+    /// header for the `div`/`rem` signedness gap this inherits from BIR.
+    fn lower_arith(
+        &mut self,
+        op: ABin,
+        lv: ValRef,
+        lty: &Ty,
+        rv: ValRef,
+        rty: &Ty,
+    ) -> (ValRef, Ty) {
+        let result_ty = promote(lty, rty);
+        let bty = to_bir_ty(&result_ty);
+        let l2 = self.coerce_to(lv, lty, &result_ty);
+        let r2 = self.coerce_to(rv, rty, &result_ty);
+        let is_float = result_ty.is_float();
+        let signed = is_signed(&result_ty);
+        let bop = match op {
+            ABin::Add => {
+                if is_float {
+                    BBin::FAdd
+                } else {
+                    BBin::Add
+                }
+            }
+            ABin::Sub => {
+                if is_float {
+                    BBin::FSub
+                } else {
+                    BBin::Sub
+                }
+            }
+            ABin::Mul => {
+                if is_float {
+                    BBin::FMul
+                } else {
+                    BBin::Mul
+                }
+            }
+            ABin::Div => {
+                if is_float {
+                    BBin::FDiv
+                } else {
+                    BBin::Div
+                }
+            }
+            ABin::Rem => {
+                if is_float {
+                    BBin::FRem
+                } else {
+                    BBin::Rem
+                }
+            }
+            ABin::BitOr => BBin::Or,
+            ABin::BitXor => BBin::Xor,
+            ABin::BitAnd => BBin::And,
+            ABin::Shl => BBin::Shl,
+            ABin::Shr => {
+                if signed {
+                    BBin::Ashr
+                } else {
+                    BBin::Lshr
+                }
+            }
+            ABin::Eq
+            | ABin::Ne
+            | ABin::Lt
+            | ABin::Gt
+            | ABin::Le
+            | ABin::Ge
+            | ABin::LogOr
+            | ABin::LogAnd => {
+                unreachable!("handled by lower_compare/lower_logical")
+            }
+        };
+        (self.push(bty, BOp::Bin(bop, l2, r2)), result_ty)
+    }
+
+    fn lower_add(
+        &mut self,
+        lv: ValRef,
+        lty: &Ty,
+        rv: ValRef,
+        rty: &Ty,
+        span: FSpan,
+    ) -> (ValRef, Ty) {
+        if lty.is_pointer_like() && rty.is_integer() {
+            return self.lower_ptr_offset(lv, lty, rv, rty);
+        }
+        if rty.is_pointer_like() && lty.is_integer() {
+            return self.lower_ptr_offset(rv, rty, lv, lty);
+        }
+        if lty.is_arithmetic() && rty.is_arithmetic() {
+            return self.lower_arith(ABin::Add, lv, lty, rv, rty);
+        }
+        self.diag_unsupported(
+            span,
+            "'+' operand combination",
+            "not arithmetic or pointer+integer",
+        );
+        self.placeholder()
+    }
+
+    fn lower_sub(
+        &mut self,
+        lv: ValRef,
+        lty: &Ty,
+        rv: ValRef,
+        rty: &Ty,
+        span: FSpan,
+    ) -> (ValRef, Ty) {
+        if lty.is_pointer_like() && rty.is_pointer_like() {
+            self.diag_unsupported(
+                span,
+                "pointer difference",
+                "BIR pointers are opaque; no integer representation to subtract",
+            );
+            return self.placeholder();
+        }
+        if lty.is_pointer_like() && rty.is_integer() {
+            let ity = Ty::Scalar(ScalarKind::Long);
+            let i64t = BTy::Scalar(BScalar::I64);
+            let r64 = self.widen_index_i64(rv, rty);
+            let zero = self.push(i64t, BOp::ConstInt(0));
+            let neg = self.push(i64t, BOp::Bin(BBin::Sub, zero, r64));
+            return self.lower_ptr_offset(lv, lty, neg, &ity);
+        }
+        if lty.is_arithmetic() && rty.is_arithmetic() {
+            return self.lower_arith(ABin::Sub, lv, lty, rv, rty);
+        }
+        self.diag_unsupported(
+            span,
+            "'-' operand combination",
+            "not arithmetic or pointer-integer",
+        );
+        self.placeholder()
+    }
+
+    fn lower_ptr_offset(&mut self, pv: ValRef, pty: &Ty, iv: ValRef, ity: &Ty) -> (ValRef, Ty) {
+        let elem = pty.deref_target().unwrap_or(Ty::Unknown);
+        if elem.is_unknown() {
+            return self.placeholder();
+        }
+        let esz = self.size_of_ty(&elem) as i64;
+        let idx64 = self.widen_index_i64(iv, ity);
+        let i64t = BTy::Scalar(BScalar::I64);
+        let esz_val = self.push(i64t, BOp::ConstInt(esz));
+        let byte_off = self.push(i64t, BOp::Bin(BBin::Mul, idx64, esz_val));
+        // Arbitrary pointer-*value* arithmetic (as opposed to a known local's own storage,
+        // handled through `LValue`) defaults to `Global` — see the module header.
+        let addr = self.push(BTy::Ptr(BSpace::Global), BOp::Bin(BBin::Add, pv, byte_off));
+        (addr, Ty::Pointer(Box::new(elem)))
+    }
+}
+
+// ---- Lowerer: assignment, increment/decrement, ternary, calls -------------------------------
+
+impl Lowerer {
+    fn lower_assign(&mut self, op: AssignOp, lhs: &Expr, rhs: &Expr, span: FSpan) -> (ValRef, Ty) {
+        let lv = self.lower_lvalue(lhs);
+        if lv.ty.is_unknown() {
+            self.lower_expr(rhs);
+            return self.placeholder();
+        }
+        if is_aggregate(&lv.ty) {
+            self.diag_unsupported(
+                span,
+                "whole-aggregate assignment",
+                "struct/union/array copy has no BIR representation",
+            );
+            self.lower_expr(rhs);
+            return self.placeholder();
+        }
+        match op {
+            AssignOp::Assign => {
+                let (rv, rty) = self.lower_expr(rhs);
+                if rty.is_unknown() {
+                    return self.placeholder();
+                }
+                let coerced = self.coerce_to(rv, &rty, &lv.ty);
+                self.store_addr(&lv, coerced);
+                (coerced, lv.ty)
+            }
+            _ => {
+                let bin = compound_binop(op);
+                let (rv, rty) = self.lower_expr(rhs);
+                if rty.is_unknown() {
+                    return self.placeholder();
+                }
+                let (cur_v, cur_ty) = self.load_addr(&lv);
+                let (result_v, result_ty) = match bin {
+                    ABin::Add => self.lower_add(cur_v, &cur_ty, rv, &rty, span),
+                    ABin::Sub => self.lower_sub(cur_v, &cur_ty, rv, &rty, span),
+                    other => self.lower_arith(other, cur_v, &cur_ty, rv, &rty),
+                };
+                if result_ty.is_unknown() {
+                    return self.placeholder();
+                }
+                let coerced = self.coerce_to(result_v, &result_ty, &lv.ty);
+                self.store_addr(&lv, coerced);
+                (coerced, lv.ty)
+            }
+        }
+    }
+
+    fn lower_incdec(
+        &mut self,
+        op: IncDecOp,
+        expr: &Expr,
+        _span: FSpan,
+        is_pre: bool,
+    ) -> (ValRef, Ty) {
+        let lv = self.lower_lvalue(expr);
+        if lv.ty.is_unknown() {
+            return self.placeholder();
+        }
+        let (cur_v, cur_ty) = self.load_addr(&lv);
+        let (new_v, new_ty) = if cur_ty.is_pointer() {
+            let delta = if matches!(op, IncDecOp::Inc) { 1 } else { -1 };
+            let deltav = self.push(BTy::Scalar(BScalar::I64), BOp::ConstInt(delta));
+            self.lower_ptr_offset(cur_v, &cur_ty, deltav, &Ty::Scalar(ScalarKind::Long))
+        } else if cur_ty.is_float() {
+            let bty = to_bir_ty(&cur_ty);
+            let one = self.push(bty, BOp::ConstFloat(1.0));
+            let bop = if matches!(op, IncDecOp::Inc) {
+                BBin::FAdd
+            } else {
+                BBin::FSub
+            };
+            (self.push(bty, BOp::Bin(bop, cur_v, one)), cur_ty.clone())
+        } else {
+            let bty = to_bir_ty(&cur_ty);
+            let one = self.push(bty, BOp::ConstInt(1));
+            let bop = if matches!(op, IncDecOp::Inc) {
+                BBin::Add
+            } else {
+                BBin::Sub
+            };
+            (self.push(bty, BOp::Bin(bop, cur_v, one)), cur_ty.clone())
+        };
+        let coerced = self.coerce_to(new_v, &new_ty, &cur_ty);
+        self.store_addr(&lv, coerced);
+        if is_pre {
+            (coerced, cur_ty)
+        } else {
+            (cur_v, cur_ty)
+        }
+    }
+
+    fn lower_ternary(
+        &mut self,
+        cond: &Expr,
+        then_e: &Expr,
+        else_e: &Expr,
+        span: FSpan,
+    ) -> (ValRef, Ty) {
+        let (cv, cty) = self.lower_expr(cond);
+        if cty.is_unknown() {
+            self.lower_expr(then_e);
+            self.lower_expr(else_e);
+            return self.placeholder();
+        }
+        let cb = self.truthy(cv, &cty);
+        let then_bb = self.alloc_block();
+        let else_bb = self.alloc_block();
+        let merge_bb = self.alloc_block();
+        self.terminate(BTerm::CondBr(cb, then_bb, else_bb));
+
+        self.cur = then_bb;
+        let (tv, tty) = self.lower_expr(then_e);
+        let then_end = self.cur;
+
+        self.cur = else_bb;
+        let (ev, ety) = self.lower_expr(else_e);
+        let else_end = self.cur;
+
+        if tty.is_unknown() || ety.is_unknown() {
+            self.cur = then_end;
+            self.terminate(BTerm::Br(merge_bb));
+            self.cur = else_end;
+            self.terminate(BTerm::Br(merge_bb));
+            self.cur = merge_bb;
+            return self.placeholder();
+        }
+
+        let result_ty = if assignable(&tty, &ety) {
+            tty.clone()
+        } else if assignable(&ety, &tty) {
+            ety.clone()
+        } else {
+            self.diag_unsupported(
+                span,
+                "ternary branch types",
+                "incompatible types in the two branches",
+            );
+            self.cur = then_end;
+            self.terminate(BTerm::Br(merge_bb));
+            self.cur = else_end;
+            self.terminate(BTerm::Br(merge_bb));
+            self.cur = merge_bb;
+            return self.placeholder();
+        };
+        if is_aggregate(&result_ty) {
+            self.diag_unsupported(
+                span,
+                "whole-aggregate value",
+                "ternary over a struct/union/array",
+            );
+            self.cur = then_end;
+            self.terminate(BTerm::Br(merge_bb));
+            self.cur = else_end;
+            self.terminate(BTerm::Br(merge_bb));
+            self.cur = merge_bb;
+            return self.placeholder();
+        }
+
+        let bty = to_bir_ty(&result_ty);
+        self.cur = then_end;
+        let tv2 = self.coerce_to(tv, &tty, &result_ty);
+        self.terminate(BTerm::Br(merge_bb));
+
+        self.cur = else_end;
+        let ev2 = self.coerce_to(ev, &ety, &result_ty);
+        self.terminate(BTerm::Br(merge_bb));
+
+        self.cur = merge_bb;
+        let phi = self.push(bty, BOp::Phi(vec![(then_end, tv2), (else_end, ev2)]));
+        (phi, result_ty)
+    }
+
+    /// BIR has no call instruction (see the module header). The callee (if not a plain named
+    /// function) and every argument are still lowered for their side effects, matching real
+    /// evaluation order as far as it goes, then a diagnostic plus a zeroed placeholder of the
+    /// statically-known return type (if resolvable) stand in for the call itself.
+    fn lower_call(&mut self, callee: &Expr, args: &[Expr], span: FSpan) -> (ValRef, Ty) {
+        let ret_ty = if let Expr::Ident { name, .. } = callee {
+            match self.scopes.lookup_value(name).cloned() {
+                Some(ValueSym::Func(sig)) => sig.ret,
+                _ => Ty::Unknown,
+            }
+        } else {
+            self.lower_expr(callee);
+            Ty::Unknown
+        };
+        for a in args {
+            self.lower_expr(a);
+        }
+        self.diag_unsupported(span, "function call", "BIR has no call instruction");
+        if ret_ty.is_unknown() || is_aggregate(&ret_ty) {
+            self.placeholder()
+        } else {
+            let v = self.zero_of(&ret_ty);
+            (v, ret_ty)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use basalt_diag::ECode;
+    use basalt_frontend_c::ast::TranslationUnit;
+    use basalt_frontend_c::{lex, parse};
+
+    use super::lower;
+    use crate::check;
+
+    fn parse_ok(src: &str) -> TranslationUnit {
+        let (tokens, lex_errs) = lex(src);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        let (tu, parse_errs) = parse(&tokens);
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        tu
+    }
+
+    fn checked(src: &str) -> TranslationUnit {
+        let tu = parse_ok(src);
+        let diags = check(&tu);
+        assert!(diags.is_empty(), "unexpected sema diagnostics: {diags:?}");
+        tu
+    }
+
+    fn codes(diags: &[basalt_diag::Diag]) -> Vec<ECode> {
+        diags.iter().map(|d| d.code).collect()
+    }
+
+    fn assert_roundtrip(m: &basalt_bir::Module) {
+        let text = basalt_bir::print(m);
+        let reparsed = match basalt_bir::parse(&text) {
+            Ok(m) => m,
+            Err(e) => panic!("parse(print(m)) failed: {e}\n--- printed BIR ---\n{text}"),
+        };
+        assert_eq!(
+            &reparsed, m,
+            "parse(print(m)) != m\n--- printed BIR ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn lowers_trivial_constant_return() {
+        let tu = checked("int f() { return 42; }");
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(m.funcs.len(), 1);
+        assert_eq!(m.funcs[0].name, "f");
+        assert_eq!(
+            m.funcs[0].ret,
+            basalt_bir::Ty::Scalar(basalt_bir::Scalar::I32)
+        );
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("const.i i32 42"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn lowers_locals_arithmetic_and_return() {
+        let tu = checked(
+            r#"
+            int f(int a, int b) {
+                int x = a + b;
+                int y = x * 2;
+                return y;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("add i32"), "{text}");
+        assert!(text.contains("mul i32"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn lowers_if_else() {
+        let tu = checked(
+            r#"
+            int f(int a) {
+                int r;
+                if (a > 0) {
+                    r = 1;
+                } else {
+                    r = -1;
+                }
+                return r;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &m.funcs[0];
+        assert!(f.blocks.len() >= 4, "{f:?}");
+        assert!(f
+            .blocks
+            .iter()
+            .any(|b| matches!(b.term, basalt_bir::Term::CondBr(..))));
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn lowers_while_with_break_and_continue() {
+        let tu = checked(
+            r#"
+            int f(int n) {
+                int i = 0;
+                int sum = 0;
+                while (i < n) {
+                    i = i + 1;
+                    if (i == 5) {
+                        continue;
+                    }
+                    if (i == 10) {
+                        break;
+                    }
+                    sum = sum + i;
+                }
+                return sum;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn lowers_for_loop() {
+        let tu = checked(
+            r#"
+            int f(int n) {
+                int sum = 0;
+                for (int i = 0; i < n; i = i + 1) {
+                    sum = sum + i;
+                }
+                return sum;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("icmp"), "{text}");
+    }
+
+    #[test]
+    fn lowers_ternary_via_compare_and_phi() {
+        let tu = checked(
+            r#"
+            int f(int a, int b) {
+                return a > b ? a : b;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("icmp sgt"), "{text}");
+        assert!(text.contains("phi"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn unsupported_call_reports_diag_without_panicking() {
+        let tu = checked(
+            r#"
+            int g(int x) {
+                return x;
+            }
+            int f() {
+                return g(1);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(
+            codes(&diags).contains(&ECode::LoweringUnsupported),
+            "{diags:?}"
+        );
+        assert_eq!(m.funcs.len(), 2);
+    }
+
+    #[test]
+    fn switch_with_fallthrough_and_break_lowers_to_native_switch() {
+        let tu = checked(
+            r#"
+            int f(int x) {
+                int r = 0;
+                switch (x) {
+                    case 1:
+                        r = 1;
+                        break;
+                    case 2:
+                    case 3:
+                        r = 2;
+                        break;
+                    default:
+                        r = -1;
+                }
+                return r;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &m.funcs[0];
+        assert!(
+            f.blocks.iter().any(
+                |b| matches!(&b.term, basalt_bir::Term::Switch(_, _, cases) if cases.len() == 3)
+            ),
+            "{f:?}"
+        );
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn array_indexing_lowers_via_pointer_arithmetic() {
+        let tu = checked(
+            r#"
+            int f(int *p) {
+                int a[4];
+                a[0] = 1;
+                p[1] = a[0];
+                return p[1];
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("mul i64"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn struct_member_access_lowers_via_byte_offset() {
+        let tu = checked(
+            r#"
+            struct Point { int x; int y; };
+            int f(struct Point p) {
+                p.x = 1;
+                p.y = 2;
+                return p.x + p.y;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_roundtrip(&m);
+    }
+}
