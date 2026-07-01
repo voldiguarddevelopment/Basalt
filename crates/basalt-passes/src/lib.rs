@@ -7,7 +7,13 @@
 // `phi` instructions at control-flow merge points. `global`-space memory (an actual pointer
 // dereference into device memory, not a synthesized local's home) is never touched — it stays
 // exactly as written, regardless of how "SSA" the rest of a function becomes.
+//
+// `regalloc::allocate` consumes SSA-form BIR (typically `construct_ssa`'s output) and assigns
+// every value a fixed register or spill-slot location via linear scan; see that module's
+// header for the algorithm and its documented simplifications.
 
+mod regalloc;
 mod ssa;
 
+pub use regalloc::{allocate, Allocation, Location, RegClass, ValueId};
 pub use ssa::construct_ssa;
