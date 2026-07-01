@@ -97,6 +97,8 @@ dependencies = [
  "basalt-backend",
  "basalt-bir",
  "basalt-diag",
+ "basalt-frontend-c",
+ "basalt-sema",
  "object",
 ]
 
