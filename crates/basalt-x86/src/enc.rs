@@ -44,6 +44,7 @@ pub const RDI: u8 = 7;
 pub const R8: u8 = 8;
 pub const R9: u8 = 9;
 pub const R10: u8 = 10;
+pub const R11: u8 = 11;
 
 /// SysV integer-class argument registers, in passing order.
 pub const INT_ARG_REGS: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
