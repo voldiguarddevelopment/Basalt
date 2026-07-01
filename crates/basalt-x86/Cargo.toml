@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+basalt-bir = { path = "../basalt-bir" }
+basalt-backend = { path = "../basalt-backend" }
+basalt-diag = { path = "../basalt-diag" }
+
+[dev-dependencies]
+object = { version = "0.39", default-features = false, features = ["read", "elf"] }

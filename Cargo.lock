@@ -93,6 +93,12 @@ version = "0.0.0"
 [[package]]
 name = "basalt-x86"
 version = "0.0.0"
+dependencies = [
+ "basalt-backend",
+ "basalt-bir",
+ "basalt-diag",
+ "object",
+]
 
 [[package]]
 name = "cfg-if"
