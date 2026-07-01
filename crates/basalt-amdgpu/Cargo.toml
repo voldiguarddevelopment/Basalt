@@ -1,0 +1,6 @@
+[package]
+name = "basalt-amdgpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

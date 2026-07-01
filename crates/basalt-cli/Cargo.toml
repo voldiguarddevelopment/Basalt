@@ -1,0 +1,25 @@
+[package]
+name = "basalt-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "basalt"
+path = "src/main.rs"
+
+[features]
+llvm = ["dep:basalt-llvm"]
+mlir = ["dep:basalt-mlir"]
+clif = ["dep:basalt-clif"]
+ptx = []
+amdgpu = []
+spirv = []
+tensix = []
+
+[dependencies]
+basalt-bir = { path = "../basalt-bir" }
+basalt-diag = { path = "../basalt-diag" }
+basalt-backend = { path = "../basalt-backend" }
+basalt-llvm = { path = "../basalt-llvm", optional = true }
+basalt-mlir = { path = "../basalt-mlir", optional = true }
+basalt-clif = { path = "../basalt-clif", optional = true }

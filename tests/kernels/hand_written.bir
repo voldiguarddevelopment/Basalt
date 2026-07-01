@@ -1,0 +1,20 @@
+module {
+  launch_bounds max_threads=128 min_blocks=1
+  shared_mem_bytes 0
+  target_dtypes i32
+
+  func @select_max(i32, i32) -> i32 {
+  bb0:
+    %0 = icmp sgt i32 %arg0, %arg1
+    condbr %0, bb1, bb2
+  bb1:
+    br bb3
+  bb2:
+    %1 = const.i i32 1
+    %2 = add i32 %arg1, %1
+    br bb3
+  bb3:
+    %3 = phi i32 [bb1 -> %arg0, bb2 -> %2]
+    ret %3
+  }
+}

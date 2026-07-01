@@ -1,0 +1,6 @@
+[package]
+name = "basalt-frontend-triton"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

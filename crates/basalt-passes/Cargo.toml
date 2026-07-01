@@ -1,0 +1,6 @@
+[package]
+name = "basalt-passes"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

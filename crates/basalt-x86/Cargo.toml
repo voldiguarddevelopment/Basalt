@@ -1,0 +1,6 @@
+[package]
+name = "basalt-x86"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

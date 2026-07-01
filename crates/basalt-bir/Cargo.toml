@@ -1,0 +1,6 @@
+[package]
+name = "basalt-bir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

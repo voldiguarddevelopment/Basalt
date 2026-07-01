@@ -1,0 +1,34 @@
+# Basalt default (English) diagnostic message table.
+#
+# Format: one entry per line, `<E-code> = <message template>`. Whitespace around both
+# sides of `=` is trimmed. Blank lines and lines starting with `#` are ignored. A template
+# may reference a diagnostic's positional arguments with `{0}`, `{1}`, ... placeholders.
+# See crates/basalt-diag/src/lang.rs for the loader this file is parsed by.
+
+E090 = backend does not support this operation
+E091 = backend does not support this type
+E092 = backend does not support this address space
+E093 = backend does not support this hardware feature
+E099 = rank-2 tile requested on a backend without a matrix path
+
+E100 = unknown flag: {0}
+E101 = missing argument for flag: {0}
+E102 = invalid argument for flag {0}: {1}
+E103 = conflicting flags: {0} and {1}
+
+E200 = lex error: {0}
+E201 = parse error: {0}
+E202 = unterminated {0}
+
+E300 = type error: {0}
+E301 = undefined symbol: {0}
+E302 = redefinition of {0}
+
+E400 = malformed BIR: {0}
+E401 = BIR round-trip mismatch
+
+E500 = I/O error reading {0}: {1}
+E501 = language table not found: {0}
+E502 = malformed language table entry at line {0}
+E503 = duplicate message for {0} at line {1}
+E504 = no message registered for this E-code

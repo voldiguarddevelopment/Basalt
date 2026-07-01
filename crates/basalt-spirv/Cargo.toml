@@ -1,0 +1,6 @@
+[package]
+name = "basalt-spirv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
