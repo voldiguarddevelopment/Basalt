@@ -5,7 +5,7 @@
 // their own namespace too, tracked separately from enum constants.
 //
 // Struct/union *field* names are not part of this table at all — member-access checking looks
-// them up directly on the `StructInfo` for the accessed type, per CLAUDE.md's sema task scope.
+// them up directly on the `StructInfo` for the accessed type.
 
 use std::collections::HashMap;
 

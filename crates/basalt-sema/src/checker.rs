@@ -29,6 +29,24 @@
 // `break`/`continue` misuse and an undefined `goto` label reuse the existing sema codes rather
 // than minting new ones: `break`/`continue` outside their required context is `E300` (a
 // structural type/context error), an unknown label is `E301` (an unresolved symbol reference).
+//
+// CUDA support (ARCHITECTURE.md §6): `basalt-frontend-c` recognizes `__global__`/`__device__`/
+// `__host__`/`__shared__`/`__constant__` positionally (see its `CudaQualifiers`) but does not
+// judge them; this pass does. `check_function_cuda_quals`/`check_var_cuda_quals` reject
+// nonsensical combinations (`__global__` combined with `__host__`/`__device__`, either of those
+// on a variable, more than one memory-space qualifier on a variable, ...) and a non-`void`
+// `__global__` function, all under the new `E303` code.
+//
+// `threadIdx`/`blockIdx`/`blockDim`/`gridDim` are modeled as ordinary values of a synthetic
+// struct type (`CUDA_DIM3_STRUCT`, with `x`/`y`/`z` unsigned members) rather than special-cased
+// in member-access checking: this reuses `check_member`'s existing struct-field lookup as-is,
+// the same way a real `dim3` would work if the user had declared it. `__syncthreads` is an
+// ordinary zero-parameter `void` function, so it reuses `check_call`'s existing arity check for
+// free. Both are seeded into the fresh scope `check_function_body` pushes, and only for a
+// `__global__`/`__device__` function — never for a plain host function. This is the stricter of
+// the two designs the task allows: using a builtin outside a device context is deliberately an
+// ordinary `E301` (undefined symbol), on the view that silently accepting `threadIdx` in host
+// code would hide a real portability bug rather than catch one.
 
 use std::collections::HashSet;
 
@@ -42,6 +60,15 @@ use basalt_frontend_c::{FloatLit, FloatSuffix, IntLit, Span as FSpan};
 
 use crate::scope::{FuncSig, ScopeStack, StructInfo, ValueSym};
 use crate::ty::{assignable, promote, Ty};
+
+/// Name the synthetic `x`/`y`/`z` struct backing `threadIdx`/`blockIdx`/`blockDim`/`gridDim` is
+/// registered under, in the scope `check_function_body` pushes for a device/kernel body.
+/// Distinct from `dim3` (the name CUDA's own headers use) since this pass never parses those
+/// headers and a user's own same-named struct, if any, lives in an outer scope regardless.
+const CUDA_DIM3_STRUCT: &str = "__basalt_cuda_dim3";
+
+/// The four `dim3`-typed builtin values available inside a device/kernel body.
+const CUDA_DIM3_BUILTINS: [&str; 4] = ["threadIdx", "blockIdx", "blockDim", "gridDim"];
 
 fn conv_span(s: FSpan) -> DSpan {
     DSpan::new(
@@ -183,6 +210,15 @@ impl Checker {
         );
     }
 
+    fn err_cuda(&mut self, span: FSpan, name: &str, detail: impl Into<String>) {
+        self.diags.push(
+            Diag::new(ECode::InvalidCudaQualifier)
+                .with_span(conv_span(span))
+                .with_arg(name.to_string())
+                .with_arg(detail.into()),
+        );
+    }
+
     // ---- items ----------------------------------------------------------------------------
 
     fn check_items(&mut self, items: &[Item]) {
@@ -272,6 +308,7 @@ impl Checker {
     }
 
     fn check_var_decl(&mut self, v: &VarDecl) {
+        self.check_var_cuda_quals(v);
         let ty = self.resolve_type(&v.ty);
         if let Some(init) = &v.init {
             let it = self.type_of(init);
@@ -287,8 +324,36 @@ impl Checker {
         }
     }
 
+    /// Checks the CUDA qualifiers (if any) on a variable declaration: `__shared__`,
+    /// `__constant__`, and `__device__` are the ones that make sense on a variable;
+    /// `__global__`/`__host__` are function-only, and a variable naming more than one memory
+    /// space at once (`__shared__ __constant__ int x;`) is nonsensical, since each names a
+    /// distinct piece of memory the value could live in.
+    fn check_var_cuda_quals(&mut self, v: &VarDecl) {
+        let q = v.cuda_quals;
+        if q.is_global || q.is_host {
+            self.err_cuda(
+                v.span,
+                &v.name,
+                "'__global__'/'__host__' apply to functions, not variables",
+            );
+        }
+        let mem_spaces = [q.is_shared, q.is_constant, q.is_device]
+            .into_iter()
+            .filter(|b| *b)
+            .count();
+        if mem_spaces > 1 {
+            self.err_cuda(
+                v.span,
+                &v.name,
+                "a variable cannot combine more than one of '__shared__'/'__constant__'/'__device__'",
+            );
+        }
+    }
+
     fn check_function_item(&mut self, f: &FunctionDecl) {
         let ret = self.resolve_type(&f.ret);
+        self.check_function_cuda_quals(f, &ret);
         let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
         let sig = FuncSig {
             ret: ret.clone(),
@@ -303,6 +368,34 @@ impl Checker {
         }
     }
 
+    /// Checks the CUDA qualifiers (if any) on a function declaration. Valid combinations are
+    /// the empty set (an ordinary host function), `__host__` alone, `__device__` alone,
+    /// `__global__` alone, and `__host__ __device__` together (real CUDA compiles that pair
+    /// twice, once per target); `__global__` combined with either of the other two is rejected,
+    /// as is either memory-space qualifier (`__shared__`/`__constant__`) landing on a function
+    /// instead of a variable. A `__global__` kernel is further required to return `void`, the
+    /// only return type CUDA allows for one.
+    fn check_function_cuda_quals(&mut self, f: &FunctionDecl, ret: &Ty) {
+        let q = f.cuda_quals;
+        if q.is_shared || q.is_constant {
+            self.err_cuda(
+                f.span,
+                &f.name,
+                "'__shared__'/'__constant__' apply to variables, not functions",
+            );
+        }
+        if q.is_global && (q.is_device || q.is_host) {
+            self.err_cuda(
+                f.span,
+                &f.name,
+                "'__global__' cannot be combined with '__host__' or '__device__'",
+            );
+        }
+        if q.is_global && !ret.is_unknown() && !matches!(ret, Ty::Scalar(ScalarKind::Void)) {
+            self.err_cuda(f.span, &f.name, "a '__global__' function must return void");
+        }
+    }
+
     fn check_function_body(&mut self, f: &FunctionDecl, ret: Ty, param_tys: &[Ty], body: &[Stmt]) {
         let prev_ret = self.current_fn_ret.replace(ret);
         let mut labels = HashSet::new();
@@ -312,6 +405,9 @@ impl Checker {
         let prev_switch = std::mem::replace(&mut self.switch_depth, 0);
 
         self.scopes.push();
+        if f.cuda_quals.is_global || f.cuda_quals.is_device {
+            self.seed_cuda_builtins();
+        }
         for (p, ty) in f.params.iter().zip(param_tys.iter()) {
             if let Some(name) = &p.name {
                 if self.scopes.declare_value(name, ValueSym::Var(ty.clone())) {
@@ -328,6 +424,36 @@ impl Checker {
         self.current_fn_labels = prev_labels;
         self.loop_depth = prev_loop;
         self.switch_depth = prev_switch;
+    }
+
+    /// Populates the function-body scope just pushed with the builtins available inside a
+    /// kernel/device body: `threadIdx`/`blockIdx`/`blockDim`/`gridDim` as values of a synthetic
+    /// `x`/`y`/`z` struct type, and `__syncthreads` as an ordinary zero-parameter `void`
+    /// function. Both ride the checker's existing member-access and call-arity machinery
+    /// instead of needing special cases there.
+    fn seed_cuda_builtins(&mut self) {
+        self.scopes.declare_struct(
+            CUDA_DIM3_STRUCT,
+            StructInfo {
+                fields: vec![
+                    ("x".to_string(), Ty::Scalar(ScalarKind::UInt)),
+                    ("y".to_string(), Ty::Scalar(ScalarKind::UInt)),
+                    ("z".to_string(), Ty::Scalar(ScalarKind::UInt)),
+                ],
+            },
+        );
+        let dim3 = Ty::Struct(CUDA_DIM3_STRUCT.to_string());
+        for name in CUDA_DIM3_BUILTINS {
+            self.scopes.declare_value(name, ValueSym::Var(dim3.clone()));
+        }
+        self.scopes.declare_value(
+            "__syncthreads",
+            ValueSym::Func(FuncSig {
+                ret: Ty::Scalar(ScalarKind::Void),
+                params: Vec::new(),
+                variadic: false,
+            }),
+        );
     }
 
     // ---- statements -------------------------------------------------------------------------

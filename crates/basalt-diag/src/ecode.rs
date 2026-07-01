@@ -54,6 +54,9 @@ pub enum ECode {
     UndefinedSymbol,
     /// Sema encountered a duplicate definition of the same identifier.
     Redefinition,
+    /// Sema encountered an invalid combination of CUDA execution-space qualifiers (e.g.
+    /// `__global__` combined with `__device__`), or one on a declaration it cannot apply to.
+    InvalidCudaQualifier,
 
     /// BIR textual parser rejected the input.
     BirParseError,
@@ -91,6 +94,7 @@ impl ECode {
         ECode::TypeError,
         ECode::UndefinedSymbol,
         ECode::Redefinition,
+        ECode::InvalidCudaQualifier,
         ECode::BirParseError,
         ECode::BirRoundTripMismatch,
         ECode::IoError,
@@ -118,6 +122,7 @@ impl ECode {
             ECode::TypeError => "E300",
             ECode::UndefinedSymbol => "E301",
             ECode::Redefinition => "E302",
+            ECode::InvalidCudaQualifier => "E303",
             ECode::BirParseError => "E400",
             ECode::BirRoundTripMismatch => "E401",
             ECode::IoError => "E500",

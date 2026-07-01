@@ -432,7 +432,7 @@ impl<'a> Parser<'a> {
         let start = self.cur().span.start;
         self.bump(); // `typedef`
         let base = match self.parse_decl_specifiers(out) {
-            Some((ty, _)) => ty,
+            Some((ty, _, _)) => ty,
             None => {
                 self.synchronize();
                 return;
@@ -531,7 +531,7 @@ impl<'a> Parser<'a> {
                 _ => {
                     let mut scratch = Vec::new();
                     match self.parse_decl_specifiers(&mut scratch) {
-                        Some((base, _)) => {
+                        Some((base, _, _)) => {
                             let (ty, name, span) = self.parse_declarator(base);
                             match name {
                                 Some(n) => params.push(TemplateParam {
@@ -591,7 +591,7 @@ impl<'a> Parser<'a> {
     /// (prototype or definition) or one or more variable declarators.
     fn parse_decl_or_def(&mut self, out: &mut Vec<Item>) {
         let start = self.cur().span.start;
-        let (base, is_forward_tag) = match self.parse_decl_specifiers(out) {
+        let (base, is_forward_tag, cuda_quals) = match self.parse_decl_specifiers(out) {
             Some(r) => r,
             None => {
                 self.synchronize();
@@ -620,6 +620,7 @@ impl<'a> Parser<'a> {
                     params,
                     variadic,
                     body: Some(stmts),
+                    cuda_quals,
                     span,
                 }));
             } else if self.eat_punct(Punct::Semi) {
@@ -629,6 +630,7 @@ impl<'a> Parser<'a> {
                     params,
                     variadic,
                     body: None,
+                    cuda_quals,
                     span: Span::new(start, self.prev_span_end().end),
                 }));
             } else {
@@ -652,6 +654,7 @@ impl<'a> Parser<'a> {
                     ty: cur_ty,
                     name: n,
                     init,
+                    cuda_quals,
                     span: cur_span,
                 })),
                 None => self
@@ -719,14 +722,67 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Recognizes one of the fixed CUDA execution-space qualifier spellings at the current
+    /// position and folds it into `cuda`, consuming the token. These lex as plain `Ident` (see
+    /// `token.rs`), so this is a name match rather than a keyword match; any other identifier
+    /// is left alone for the caller to try as the type name itself.
+    fn eat_cuda_qualifier(&mut self, cuda: &mut CudaQualifiers) -> bool {
+        let name = match &self.cur().kind {
+            TokenKind::Ident(name) => name.as_str(),
+            _ => return false,
+        };
+        if !is_cuda_qualifier_name(name) {
+            return false;
+        }
+        match name {
+            "__global__" => cuda.is_global = true,
+            "__device__" => cuda.is_device = true,
+            "__host__" => cuda.is_host = true,
+            "__shared__" => cuda.is_shared = true,
+            "__constant__" => cuda.is_constant = true,
+            _ => unreachable!("is_cuda_qualifier_name and this match must list the same names"),
+        }
+        self.bump();
+        true
+    }
+
+    /// Consumes `const`/`volatile` and CUDA qualifiers in any mixture and order (real CUDA-C
+    /// source doesn't fix one relative to the other, e.g. both `const __device__ float x` and
+    /// `__device__ const float x` occur).
+    fn consume_prefix_specifiers(&mut self, quals: &mut Qualifiers, cuda: &mut CudaQualifiers) {
+        loop {
+            match self.peek_keyword() {
+                Some(Keyword::Const) => {
+                    quals.is_const = true;
+                    self.bump();
+                    continue;
+                }
+                Some(Keyword::Volatile) => {
+                    quals.is_volatile = true;
+                    self.bump();
+                    continue;
+                }
+                _ => {}
+            }
+            if !self.eat_cuda_qualifier(cuda) {
+                break;
+            }
+        }
+    }
+
     /// Parses a decl-specifier sequence: qualifiers plus exactly one of a scalar-keyword run,
     /// a tag (`struct`/`union`/`enum`), or a plain identifier naming a type. Returns the
-    /// resulting `Type` and whether it was a bare tag reference with no body (used by the
-    /// caller to tell a forward declaration like `struct Foo;` apart from a vacuous one).
-    fn parse_decl_specifiers(&mut self, out: &mut Vec<Item>) -> Option<(Type, bool)> {
+    /// resulting `Type`, whether it was a bare tag reference with no body (used by the caller
+    /// to tell a forward declaration like `struct Foo;` apart from a vacuous one), and whatever
+    /// CUDA qualifiers (`__global__`, `__shared__`, ...) preceded it.
+    fn parse_decl_specifiers(
+        &mut self,
+        out: &mut Vec<Item>,
+    ) -> Option<(Type, bool, CudaQualifiers)> {
         let start = self.cur().span.start;
         let mut quals = Qualifiers::default();
-        self.consume_quals(&mut quals);
+        let mut cuda = CudaQualifiers::default();
+        self.consume_prefix_specifiers(&mut quals, &mut cuda);
 
         let (mut ty, is_forward_tag) = match self.peek_keyword() {
             Some(Keyword::Struct | Keyword::Union | Keyword::Enum) => self.parse_tag(out),
@@ -745,7 +801,7 @@ impl<'a> Parser<'a> {
 
         self.consume_quals(&mut quals);
         apply_quals(&mut ty, quals);
-        Some((ty, is_forward_tag))
+        Some((ty, is_forward_tag, cuda))
     }
 
     /// Builds a `Type::Named` for a bare identifier just consumed in type-specifier position,
@@ -826,7 +882,7 @@ impl<'a> Parser<'a> {
         let cp = self.checkpoint();
         if self.looks_like_type_start() {
             let mut scratch = Vec::new();
-            if let Some((base, _)) = self.parse_decl_specifiers(&mut scratch) {
+            if let Some((base, _, _)) = self.parse_decl_specifiers(&mut scratch) {
                 // Already at a boundary (e.g. right after a nested instantiation that
                 // consumed a pending split `>>` — see `eat_close_angle` — so the token here
                 // physically belongs to whatever follows the whole argument list, not to this
@@ -1022,7 +1078,7 @@ impl<'a> Parser<'a> {
 
     fn parse_field(&mut self, out: &mut Vec<Item>, fields: &mut Vec<FieldDecl>) {
         let base = match self.parse_decl_specifiers(out) {
-            Some((ty, _)) => ty,
+            Some((ty, _, _)) => ty,
             None => {
                 self.synchronize_field();
                 return;
@@ -1211,7 +1267,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             match self.parse_decl_specifiers(out) {
-                Some((base, _)) => {
+                Some((base, _, _)) => {
                     let (ty, name, span) = self.parse_declarator(base);
                     params.push(ParamDecl { ty, name, span });
                 }
@@ -1258,17 +1314,19 @@ impl<'a> Parser<'a> {
     // ---- statements --------------------------------------------------------------------
 
     /// True if the decl-specifier sequence starting here is unambiguous without a symbol
-    /// table: a scalar keyword, a qualifier, or a tag keyword. A bare identifier is never
-    /// treated as a declaration start, even if it names a typedef — this layer has no symbol
-    /// table to know that, so `Foo bar;` where `Foo` is a typedef parses as an (ill-formed,
-    /// but not hung-on) expression-statement instead. Same documented gap as
-    /// `next_starts_type`, applied at statement granularity.
+    /// table: a scalar keyword, a qualifier, a tag keyword, or one of the fixed CUDA
+    /// execution-space qualifier spellings (`__shared__ float tile[16];` must parse as a
+    /// declaration, not an expression-statement). A bare identifier is otherwise never treated
+    /// as a declaration start, even if it names a typedef — this layer has no symbol table to
+    /// know that, so `Foo bar;` where `Foo` is a typedef parses as an (ill-formed, but not
+    /// hung-on) expression-statement instead. Same documented gap as `next_starts_type`,
+    /// applied at statement granularity.
     fn stmt_starts_decl(&self) -> bool {
         match self.peek_keyword() {
             Some(k) if is_scalar_keyword(k) => true,
             Some(Keyword::Const | Keyword::Volatile) => true,
             Some(Keyword::Struct | Keyword::Union | Keyword::Enum) => true,
-            _ => false,
+            _ => matches!(&self.cur().kind, TokenKind::Ident(name) if is_cuda_qualifier_name(name)),
         }
     }
 
@@ -1350,8 +1408,8 @@ impl<'a> Parser<'a> {
     fn parse_decl_stmt(&mut self) -> Stmt {
         let start = self.cur().span.start;
         let mut scratch = Vec::new();
-        let base = match self.parse_decl_specifiers(&mut scratch) {
-            Some((ty, _)) => ty,
+        let (base, cuda_quals) = match self.parse_decl_specifiers(&mut scratch) {
+            Some((ty, _, cuda)) => (ty, cuda),
             None => {
                 self.synchronize_stmt();
                 return Stmt::Empty {
@@ -1378,6 +1436,7 @@ impl<'a> Parser<'a> {
                     ty,
                     name: n,
                     init,
+                    cuda_quals,
                     span: dspan,
                 }),
                 None => self
@@ -1635,7 +1694,7 @@ impl<'a> Parser<'a> {
     fn parse_cast_type(&mut self) -> Type {
         let mut scratch = Vec::new();
         let base = match self.parse_decl_specifiers(&mut scratch) {
-            Some((ty, _)) => ty,
+            Some((ty, _, _)) => ty,
             None => {
                 return Type::Scalar {
                     kind: ScalarKind::Int,
@@ -2130,6 +2189,18 @@ impl<'a> Parser<'a> {
             }
         }
     }
+}
+
+/// The fixed set of CUDA execution-space qualifier spellings this frontend recognizes. These
+/// are ordinary identifiers to the lexer (see `token.rs`), so recognizing them is a name match
+/// made at the specific points that need it (decl-specifier position, and deciding whether a
+/// statement starting with a bare identifier is a declaration) rather than anything the lexer
+/// or keyword table is involved in.
+fn is_cuda_qualifier_name(s: &str) -> bool {
+    matches!(
+        s,
+        "__global__" | "__device__" | "__host__" | "__shared__" | "__constant__"
+    )
 }
 
 fn is_scalar_keyword(k: Keyword) -> bool {

@@ -226,3 +226,147 @@ fn goto_undefined_label_reports_e301() {
     let diags = check(&tu);
     assert!(codes(&diags).contains(&ECode::UndefinedSymbol));
 }
+
+// ---- CUDA qualifiers and builtins -------------------------------------------------------
+
+#[test]
+fn valid_global_kernel_with_void_return_has_no_diagnostics() {
+    let tu = parse_ok(
+        r#"
+        __global__ void kernel(float *out, int n) {
+            int i = n;
+            out[i] = 0.0f;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn global_kernel_with_non_void_return_reports_e303() {
+    let tu = parse_ok(
+        r#"
+        __global__ int kernel(int n) {
+            return n;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::InvalidCudaQualifier));
+}
+
+#[test]
+fn combined_host_device_function_is_valid() {
+    let tu = parse_ok(
+        r#"
+        __host__ __device__ int add(int a, int b) {
+            return a + b;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn global_combined_with_device_reports_e303() {
+    let tu = parse_ok(
+        r#"
+        __global__ __device__ void kernel(int n) {
+            int x = n;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::InvalidCudaQualifier));
+}
+
+#[test]
+fn shared_and_constant_variable_declarations_are_recognized_without_error() {
+    let tu = parse_ok(
+        r#"
+        __device__ void kernel() {
+            __shared__ float tile[16];
+            __constant__ int table[4];
+            tile[0] = 0.0f;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn shared_and_constant_together_on_one_variable_reports_e303() {
+    let tu = parse_ok(
+        r#"
+        __device__ void kernel() {
+            __shared__ __constant__ int x;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::InvalidCudaQualifier));
+}
+
+#[test]
+fn kernel_body_can_use_dim3_builtins_as_unsigned_integers() {
+    let tu = parse_ok(
+        r#"
+        __global__ void kernel(unsigned int *out) {
+            unsigned int i = threadIdx.x;
+            unsigned int j = blockIdx.y;
+            unsigned int k = blockDim.z;
+            unsigned int l = gridDim.x;
+            out[0] = i + j + k + l;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn syncthreads_with_no_arguments_has_no_error() {
+    let tu = parse_ok(
+        r#"
+        __global__ void kernel() {
+            __syncthreads();
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn syncthreads_with_an_argument_reports_arity_error() {
+    let tu = parse_ok(
+        r#"
+        __global__ void kernel() {
+            __syncthreads(1);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::TypeError));
+}
+
+// This crate deliberately makes the builtins available only inside a `__global__`/`__device__`
+// body (see checker.rs's module header for the reasoning): an ordinary host function gets no
+// special seeding, so `threadIdx`/`__syncthreads` there are unresolved identifiers exactly like
+// any other undeclared name, reported the normal way (`E301`).
+#[test]
+fn builtins_are_not_available_in_an_ordinary_host_function() {
+    let tu = parse_ok(
+        r#"
+        int host_fn() {
+            int i = threadIdx.x;
+            return i;
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::UndefinedSymbol));
+}

@@ -365,6 +365,30 @@ pub struct Qualifiers {
     pub is_volatile: bool,
 }
 
+/// CUDA execution-space qualifiers recognized on a function or variable declaration
+/// (`__global__`, `__device__`, `__host__`, `__shared__`, `__constant__`). These spellings are
+/// not reserved words in the general grammar (see `token.rs`'s note on why they lex as plain
+/// `Ident`), so this layer only recognizes them positionally, in decl-specifier position, and
+/// records which ones were written — it does not judge whether the combination or the
+/// declaration they landed on makes sense (e.g. `__global__ __device__` together, or
+/// `__shared__` on a function). That validation belongs to `basalt-sema`, which has the scope
+/// information (function vs. variable, kernel body vs. host code) to do it properly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CudaQualifiers {
+    pub is_global: bool,
+    pub is_device: bool,
+    pub is_host: bool,
+    pub is_shared: bool,
+    pub is_constant: bool,
+}
+
+impl CudaQualifiers {
+    /// True if none of the recognized spellings were present.
+    pub fn is_empty(&self) -> bool {
+        *self == CudaQualifiers::default()
+    }
+}
+
 /// Resolved scalar type, after combining the multiset of specifier keywords a declaration
 /// used (`unsigned long long int`, `signed char`, ...) into one canonical kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,6 +554,9 @@ pub struct FunctionDecl {
     /// `None` for a prototype (`;`-terminated); `Some` is the parsed statement list of a
     /// `{ ... }` body (possibly empty).
     pub body: Option<Vec<Stmt>>,
+    /// CUDA qualifiers written on this declaration's decl-specifier sequence, e.g.
+    /// `__global__`/`__device__`/`__host__`. See `CudaQualifiers`.
+    pub cuda_quals: CudaQualifiers,
     pub span: Span,
 }
 
@@ -540,6 +567,9 @@ pub struct VarDecl {
     /// The parsed initializer expression, if `= expr` was present (an assignment-expression
     /// per the C grammar — no top-level comma, since that separates declarators instead).
     pub init: Option<Expr>,
+    /// CUDA qualifiers written on this declaration's decl-specifier sequence, e.g.
+    /// `__shared__`/`__constant__`/`__device__`. See `CudaQualifiers`.
+    pub cuda_quals: CudaQualifiers,
     pub span: Span,
 }
 
