@@ -5,11 +5,26 @@
 // "no silently-wrong codegen" rule applies to backends, but the same spirit governs this pass:
 // a `Module` containing an `E304` diagnostic is not meant to be handed to a backend).
 //
-// GPU intrinsics (`threadIdx`/`blockIdx`/`blockDim`/`gridDim`, `__syncthreads`, barriers,
-// shuffles, atomics) are explicitly out of scope for this pass — a later task owns lowering
-// them to BIR's dedicated GPU-intrinsic ops. A reference to one of the four builtins reports
-// `E304` and yields a placeholder value; a call to `__syncthreads` (or any other function)
-// falls into the generic call-lowering gap below.
+// GPU intrinsics: `threadIdx.x`/`blockIdx.y`/`blockDim.z`/`gridDim.x`-style member access on
+// one of the four dim3-like builtins (see `checker::CUDA_DIM3_BUILTINS`) lowers directly to
+// BIR's `tid.*`/`bid.*`/`bdim.*`/`gdim.*` index ops (`gpu_index_op_for`), and a call to
+// `__syncthreads` lowers to `barrier`. Warp shuffle (`__shfl`/`__shfl_up`/`__shfl_down`/
+// `__shfl_xor`), warp vote (`__ballot`/`__any`/`__all`), and the atomic read-modify-write/
+// compare-and-swap builtins (`atomicAdd`/`atomicSub`/`atomicExch`/`atomicMin`/`atomicMax`/
+// `atomicAnd`/`atomicOr`/`atomicXor`/`atomicCAS`) lower the same way: `lower_call` recognizes
+// each by callee name and emits the matching `shuffle.*`/`ballot`/`vote.*`/`atomic.*` op
+// directly, rather than going through a real `call` instruction (BIR has none — see the gap
+// noted below). The maskless legacy CUDA spellings are used for shuffle/vote rather than the
+// `_sync` forms, since BIR's ops carry no warp-mask operand to put one in.
+//
+// All of the above are seeded into a device/kernel body's scope by
+// `checker::seed_cuda_builtins` as ordinary `int`/`int*`-typed functions, not generic over
+// every scalar type real CUDA overloads them across (e.g. `atomicAdd` on a `float*`). This
+// pass lowers exactly what the checker typed them as; passing e.g. a `float` argument still
+// type-checks (sema's `assignable` is permissive between scalar kinds) but is coerced to `int`
+// via `coerce_to`'s ordinary numeric conversion, not a bit-level reinterpret — a known
+// simplification inherited from the checker's monomorphic builtin signatures, not a new gap
+// introduced here.
 //
 // Locals are stack slots, not SSA values. Every `VarDecl` (including parameters, which BIR
 // itself passes as plain SSA values via `ValRef::Param`) gets a synthetic memory location and
@@ -86,9 +101,9 @@
 use std::collections::{HashMap, HashSet};
 
 use basalt_bir::{
-    AddrSpace as BSpace, BinOp as BBin, Block as BBlock, BlockId, CastOp as BCast, FCmpPred,
-    Function as BFunction, ICmpPred, Inst as BInst, InstId, Module, Op as BOp, Scalar as BScalar,
-    Term as BTerm, Ty as BTy, ValRef,
+    AddrSpace as BSpace, AtomicOp as BAtomicOp, BinOp as BBin, Block as BBlock, BlockId,
+    CastOp as BCast, FCmpPred, Function as BFunction, ICmpPred, Inst as BInst, InstId, Module,
+    Op as BOp, Scalar as BScalar, ShuffleKind as BShuffleKind, Term as BTerm, Ty as BTy, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 use basalt_frontend_c::ast::{
@@ -98,7 +113,8 @@ use basalt_frontend_c::ast::{
 use basalt_frontend_c::{FloatLit, FloatSuffix, IntBase, IntLit, Span as FSpan};
 
 use crate::checker::{
-    collect_labels_many, compound_binop, conv_span, float_lit_ty, int_lit_ty, CUDA_DIM3_BUILTINS,
+    collect_labels_many, compound_binop, conv_span, float_lit_ty, int_lit_ty,
+    CUDA_ATOMIC_CAS_BUILTIN, CUDA_DIM3_BUILTINS,
 };
 use crate::scope::{FuncSig, ScopeStack, StructInfo, ValueSym};
 use crate::ty::{assignable, is_signed_kind, promote, Ty};
@@ -275,6 +291,77 @@ fn natural_align(t: BTy) -> u32 {
 
 fn is_float_scalar(s: BScalar) -> bool {
     matches!(s, BScalar::F16 | BScalar::F32 | BScalar::F64)
+}
+
+// ---- GPU intrinsic name tables ------------------------------------------------------------
+//
+// These map a builtin's *source* spelling straight to its BIR op, independent of
+// `checker::seed_cuda_builtins`'s bookkeeping (which only exists to give the builtin a type
+// for ordinary call-arity/argument checking). Lowering recognizes these names unconditionally,
+// the same way it already does for `checker::CUDA_DIM3_BUILTINS` — this pass assumes the
+// checker already rejected any use outside a device/kernel body, so it never re-checks that
+// context here.
+
+/// Maps a `threadIdx`/`blockIdx`/`blockDim`/`gridDim` builtin plus a `.x`/`.y`/`.z` field to
+/// its BIR index intrinsic (e.g. `threadIdx.x` -> `Op::TidX`). `None` for anything else, so the
+/// caller falls back to ordinary struct-member lowering.
+fn gpu_index_op_for(builtin: &str, field: &str) -> Option<BOp> {
+    Some(match (builtin, field) {
+        ("threadIdx", "x") => BOp::TidX,
+        ("threadIdx", "y") => BOp::TidY,
+        ("threadIdx", "z") => BOp::TidZ,
+        ("blockIdx", "x") => BOp::BidX,
+        ("blockIdx", "y") => BOp::BidY,
+        ("blockIdx", "z") => BOp::BidZ,
+        ("blockDim", "x") => BOp::BdimX,
+        ("blockDim", "y") => BOp::BdimY,
+        ("blockDim", "z") => BOp::BdimZ,
+        ("gridDim", "x") => BOp::GdimX,
+        ("gridDim", "y") => BOp::GdimY,
+        ("gridDim", "z") => BOp::GdimZ,
+        _ => return None,
+    })
+}
+
+/// Maps a shuffle builtin's name to BIR's `ShuffleKind`, or `None` if `name` is not one of
+/// `checker::CUDA_SHUFFLE_BUILTINS`.
+fn shuffle_kind_for(name: &str) -> Option<BShuffleKind> {
+    Some(match name {
+        "__shfl" => BShuffleKind::Idx,
+        "__shfl_up" => BShuffleKind::Up,
+        "__shfl_down" => BShuffleKind::Down,
+        "__shfl_xor" => BShuffleKind::Xor,
+        _ => return None,
+    })
+}
+
+/// Maps a vote builtin's name to the `Op` tuple-variant constructor it lowers to (each takes
+/// exactly the one predicate operand), or `None` if `name` is not one of
+/// `checker::CUDA_VOTE_BUILTINS`.
+fn vote_ctor_for(name: &str) -> Option<fn(ValRef) -> BOp> {
+    Some(match name {
+        "__ballot" => BOp::Ballot,
+        "__any" => BOp::VoteAny,
+        "__all" => BOp::VoteAll,
+        _ => return None,
+    })
+}
+
+/// Maps an atomic read-modify-write builtin's name to BIR's `AtomicOp`, or `None` if `name` is
+/// not one of `checker::CUDA_ATOMIC_RMW_BUILTINS`. `atomicCAS` is handled separately (three
+/// operands, `Op::AtomicCas` rather than `Op::Atomic`).
+fn atomic_op_for(name: &str) -> Option<BAtomicOp> {
+    Some(match name {
+        "atomicAdd" => BAtomicOp::Add,
+        "atomicSub" => BAtomicOp::Sub,
+        "atomicExch" => BAtomicOp::Exch,
+        "atomicMin" => BAtomicOp::Min,
+        "atomicMax" => BAtomicOp::Max,
+        "atomicAnd" => BAtomicOp::And,
+        "atomicOr" => BAtomicOp::Or,
+        "atomicXor" => BAtomicOp::Xor,
+        _ => return None,
+    })
 }
 
 // ---- linearizing the instruction arena into block-print order -----------------------------
@@ -1377,7 +1464,24 @@ impl Lowerer {
                 (v, ty)
             }
             Expr::Ident { name, span } => self.lower_ident_value(name, *span),
-            Expr::Index { .. } | Expr::Member { .. } => {
+            Expr::Index { .. } => {
+                let lv = self.lower_lvalue(e);
+                self.value_of_lvalue(lv, e.span())
+            }
+            Expr::Member {
+                base, name, arrow, ..
+            } => {
+                if !arrow {
+                    if let Expr::Ident {
+                        name: base_name, ..
+                    } = base.as_ref()
+                    {
+                        if let Some(op) = gpu_index_op_for(base_name, name) {
+                            let v = self.push(BTy::Scalar(BScalar::I32), op);
+                            return (v, Ty::Scalar(ScalarKind::UInt));
+                        }
+                    }
+                }
                 let lv = self.lower_lvalue(e);
                 self.value_of_lvalue(lv, e.span())
             }
@@ -2299,7 +2403,29 @@ impl Lowerer {
     /// function) and every argument are still lowered for their side effects, matching real
     /// evaluation order as far as it goes, then a diagnostic plus a zeroed placeholder of the
     /// statically-known return type (if resolvable) stand in for the call itself.
+    ///
+    /// GPU intrinsic calls (`__syncthreads`, shuffle/vote/atomic builtins) are the exception:
+    /// each has a dedicated BIR op, so they are special-cased by callee name here rather than
+    /// falling through to the generic no-call-instruction gap below.
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], span: FSpan) -> (ValRef, Ty) {
+        if let Expr::Ident { name, .. } = callee {
+            let name = name.as_str();
+            if name == "__syncthreads" {
+                return self.lower_syncthreads_call(args);
+            }
+            if let Some(kind) = shuffle_kind_for(name) {
+                return self.lower_shuffle_call(kind, args);
+            }
+            if let Some(ctor) = vote_ctor_for(name) {
+                return self.lower_vote_call(ctor, args);
+            }
+            if let Some(aop) = atomic_op_for(name) {
+                return self.lower_atomic_rmw_call(aop, args, span);
+            }
+            if name == CUDA_ATOMIC_CAS_BUILTIN {
+                return self.lower_atomic_cas_call(args, span);
+            }
+        }
         let ret_ty = if let Expr::Ident { name, .. } = callee {
             match self.scopes.lookup_value(name).cloned() {
                 Some(ValueSym::Func(sig)) => sig.ret,
@@ -2319,6 +2445,106 @@ impl Lowerer {
             let v = self.zero_of(&ret_ty);
             (v, ret_ty)
         }
+    }
+
+    /// `__syncthreads()` -> `barrier`. Any arguments (there should be none — the checker
+    /// enforces zero-arity) are still lowered first for their side effects, matching the
+    /// generic call path's evaluation-order guarantee.
+    fn lower_syncthreads_call(&mut self, args: &[Expr]) -> (ValRef, Ty) {
+        for a in args {
+            self.lower_expr(a);
+        }
+        self.push_void(BOp::Barrier);
+        (
+            self.zero_of(&Ty::Scalar(ScalarKind::Void)),
+            Ty::Scalar(ScalarKind::Void),
+        )
+    }
+
+    /// Lowers every call argument left to right, for evaluation-order and side-effect parity
+    /// with the generic call path even when a builtin's fixed arity does not match what was
+    /// actually written (malformed input the checker should already have flagged; this pass
+    /// degrades to a placeholder rather than indexing out of bounds).
+    fn lower_call_args(&mut self, args: &[Expr]) -> Vec<(ValRef, Ty)> {
+        args.iter().map(|a| self.lower_expr(a)).collect()
+    }
+
+    /// `__shfl`/`__shfl_up`/`__shfl_down`/`__shfl_xor(value, lane_or_offset)` -> `shuffle.*`.
+    /// Both operands are coerced to `int`, matching the `int`-only builtin signature
+    /// `checker::seed_cuda_builtins` declares (see the module header).
+    fn lower_shuffle_call(&mut self, kind: BShuffleKind, args: &[Expr]) -> (ValRef, Ty) {
+        let vals = self.lower_call_args(args);
+        if vals.len() != 2 || vals.iter().any(|(_, t)| t.is_unknown()) {
+            return self.placeholder();
+        }
+        let ity = Ty::Scalar(ScalarKind::Int);
+        let v = self.coerce_to(vals[0].0, &vals[0].1, &ity);
+        let lane = self.coerce_to(vals[1].0, &vals[1].1, &ity);
+        let i32t = BTy::Scalar(BScalar::I32);
+        (self.push(i32t, BOp::Shuffle(kind, v, lane)), ity)
+    }
+
+    /// `__ballot`/`__any`/`__all(predicate)` -> `ballot`/`vote.any`/`vote.all`.
+    fn lower_vote_call(&mut self, ctor: fn(ValRef) -> BOp, args: &[Expr]) -> (ValRef, Ty) {
+        let vals = self.lower_call_args(args);
+        if vals.len() != 1 || vals[0].1.is_unknown() {
+            return self.placeholder();
+        }
+        let ity = Ty::Scalar(ScalarKind::Int);
+        let pred = self.coerce_to(vals[0].0, &vals[0].1, &ity);
+        let i32t = BTy::Scalar(BScalar::I32);
+        (self.push(i32t, ctor(pred)), ity)
+    }
+
+    /// `atomicAdd`/`atomicSub`/`atomicExch`/`atomicMin`/`atomicMax`/`atomicAnd`/`atomicOr`/
+    /// `atomicXor(address, value)` -> `atomic.*`. `address`'s own lowered value is used
+    /// directly as the op's pointer operand (it is already the address, not something to load
+    /// through); `value` is coerced to `int`, per the module header's documented `int`-only
+    /// simplification.
+    fn lower_atomic_rmw_call(
+        &mut self,
+        aop: BAtomicOp,
+        args: &[Expr],
+        span: FSpan,
+    ) -> (ValRef, Ty) {
+        let vals = self.lower_call_args(args);
+        if vals.len() != 2 || vals.iter().any(|(_, t)| t.is_unknown()) {
+            return self.placeholder();
+        }
+        let (addr, addr_ty) = &vals[0];
+        if !addr_ty.is_pointer_like() {
+            self.diag_unsupported(span, "atomic builtin", "first argument is not a pointer");
+            return self.placeholder();
+        }
+        let ity = Ty::Scalar(ScalarKind::Int);
+        let val = self.coerce_to(vals[1].0, &vals[1].1, &ity);
+        let i32t = BTy::Scalar(BScalar::I32);
+        (
+            self.push(i32t, BOp::Atomic(aop, *addr, val, BSpace::Global)),
+            ity,
+        )
+    }
+
+    /// `atomicCAS(address, compare, value)` -> `atomic.cas`, same operand handling as
+    /// `lower_atomic_rmw_call`.
+    fn lower_atomic_cas_call(&mut self, args: &[Expr], span: FSpan) -> (ValRef, Ty) {
+        let vals = self.lower_call_args(args);
+        if vals.len() != 3 || vals.iter().any(|(_, t)| t.is_unknown()) {
+            return self.placeholder();
+        }
+        let (addr, addr_ty) = &vals[0];
+        if !addr_ty.is_pointer_like() {
+            self.diag_unsupported(span, "atomic builtin", "first argument is not a pointer");
+            return self.placeholder();
+        }
+        let ity = Ty::Scalar(ScalarKind::Int);
+        let cmp = self.coerce_to(vals[1].0, &vals[1].1, &ity);
+        let new = self.coerce_to(vals[2].0, &vals[2].1, &ity);
+        let i32t = BTy::Scalar(BScalar::I32);
+        (
+            self.push(i32t, BOp::AtomicCas(*addr, cmp, new, BSpace::Global)),
+            ity,
+        )
     }
 }
 
@@ -2572,5 +2798,131 @@ mod tests {
         let (m, diags) = lower(&tu);
         assert!(diags.is_empty(), "{diags:?}");
         assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn gpu_index_intrinsics_lower_to_dedicated_ops() {
+        let tu = checked(
+            r#"
+            __global__ void kernel(int *out) {
+                out[0] = threadIdx.x + blockIdx.y * blockDim.z + gridDim.x;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("tid.x"), "{text}");
+        assert!(text.contains("bid.y"), "{text}");
+        assert!(text.contains("bdim.z"), "{text}");
+        assert!(text.contains("gdim.x"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn syncthreads_call_lowers_to_barrier_with_no_diagnostic() {
+        let tu = checked(
+            r#"
+            __global__ void kernel() {
+                __syncthreads();
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("barrier"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn shuffle_builtin_lowers_to_shuffle_op() {
+        let tu = checked(
+            r#"
+            __global__ void kernel(int *out) {
+                int v = threadIdx.x;
+                out[0] = __shfl_xor(v, 1);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("shuffle.xor"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn vote_builtin_lowers_to_ballot_op() {
+        let tu = checked(
+            r#"
+            __global__ void kernel(int *out) {
+                int p = threadIdx.x;
+                out[0] = __ballot(p);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("ballot"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn atomic_rmw_builtin_lowers_to_atomic_op() {
+        let tu = checked(
+            r#"
+            __global__ void kernel(int *addr) {
+                int old = atomicAdd(addr, 1);
+                *addr = old;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("atomic.add"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn atomic_cas_builtin_lowers_to_atomic_cas_op() {
+        let tu = checked(
+            r#"
+            __global__ void kernel(int *addr) {
+                int old = atomicCAS(addr, 0, 1);
+                *addr = old;
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("atomic.cas"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    /// `assignable` permits an integer literal in a pointer-typed parameter slot (modeling C's
+    /// null-constant `0`, see `ty::assignable`), so `atomicAdd(0, 5)` type-checks in the sema
+    /// pass with no diagnostic at all. Lowering still cannot make sense of a non-pointer
+    /// address: this is the genuine, sema-valid-but-unlowerable case the module header's
+    /// `int`-only-builtin simplification does not paper over, and it must degrade to `E304`
+    /// rather than emitting a bogus `atomic.add` against a non-address value.
+    #[test]
+    fn atomic_with_non_pointer_address_reports_e304_without_panicking() {
+        let tu = checked(
+            r#"
+            __global__ void kernel() {
+                int r = atomicAdd(0, 5);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(
+            codes(&diags).contains(&ECode::LoweringUnsupported),
+            "{diags:?}"
+        );
+        assert_eq!(m.funcs.len(), 1);
     }
 }

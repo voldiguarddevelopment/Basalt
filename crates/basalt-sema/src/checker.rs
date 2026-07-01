@@ -47,6 +47,15 @@
 // the two designs the task allows: using a builtin outside a device context is deliberately an
 // ordinary `E301` (undefined symbol), on the view that silently accepting `threadIdx` in host
 // code would hide a real portability bug rather than catch one.
+//
+// Warp shuffle (`CUDA_SHUFFLE_BUILTINS`), warp vote (`CUDA_VOTE_BUILTINS`), and atomic
+// read-modify-write/compare-and-swap (`CUDA_ATOMIC_RMW_BUILTINS`/`CUDA_ATOMIC_CAS_BUILTIN`)
+// are seeded the same way, as ordinary functions reusing `check_call`'s machinery. Each is
+// typed monomorphically over `int`/`int*` rather than overloaded across every CUDA scalar type
+// real hardware supports (e.g. `atomicAdd` on a `float*`): the pass has no generic/overload
+// resolution machinery, and this reuses the argument-type permissiveness `assignable` already
+// has between scalar kinds rather than adding one. `lower.rs` maps each of these names to its
+// BIR op directly by name, the same way it already does for the four `dim3` builtins.
 
 use std::collections::HashSet;
 
@@ -72,6 +81,31 @@ pub(crate) const CUDA_DIM3_STRUCT: &str = "__basalt_cuda_dim3";
 
 /// The four `dim3`-typed builtin values available inside a device/kernel body.
 pub(crate) const CUDA_DIM3_BUILTINS: [&str; 4] = ["threadIdx", "blockIdx", "blockDim", "gridDim"];
+
+/// Warp-shuffle builtins. The maskless legacy CUDA spellings, not the `_sync` forms: BIR's
+/// `shuffle.*` op has no warp-mask operand to put one in, so a `_sync` mask argument would
+/// have nowhere honest to go.
+pub(crate) const CUDA_SHUFFLE_BUILTINS: [&str; 4] =
+    ["__shfl", "__shfl_up", "__shfl_down", "__shfl_xor"];
+
+/// Warp-vote builtins, same maskless-spelling reasoning as `CUDA_SHUFFLE_BUILTINS`.
+pub(crate) const CUDA_VOTE_BUILTINS: [&str; 3] = ["__ballot", "__any", "__all"];
+
+/// Atomic read-modify-write builtins with a direct one-to-one `basalt_bir::AtomicOp` mapping.
+pub(crate) const CUDA_ATOMIC_RMW_BUILTINS: [&str; 8] = [
+    "atomicAdd",
+    "atomicSub",
+    "atomicExch",
+    "atomicMin",
+    "atomicMax",
+    "atomicAnd",
+    "atomicOr",
+    "atomicXor",
+];
+
+/// Atomic compare-and-swap, kept separate from `CUDA_ATOMIC_RMW_BUILTINS` since it takes a
+/// third operand and maps to BIR's own separate `atomic.cas` op.
+pub(crate) const CUDA_ATOMIC_CAS_BUILTIN: &str = "atomicCAS";
 
 pub(crate) fn conv_span(s: FSpan) -> DSpan {
     DSpan::new(
@@ -434,9 +468,11 @@ impl Checker {
 
     /// Populates the function-body scope just pushed with the builtins available inside a
     /// kernel/device body: `threadIdx`/`blockIdx`/`blockDim`/`gridDim` as values of a synthetic
-    /// `x`/`y`/`z` struct type, and `__syncthreads` as an ordinary zero-parameter `void`
-    /// function. Both ride the checker's existing member-access and call-arity machinery
-    /// instead of needing special cases there.
+    /// `x`/`y`/`z` struct type, `__syncthreads` as an ordinary zero-parameter `void` function,
+    /// and the warp-shuffle/warp-vote/atomic builtins as ordinary `int`/`int*`-typed functions
+    /// (see the module header for why those are monomorphic rather than overloaded). All of
+    /// them ride the checker's existing member-access and call-arity machinery instead of
+    /// needing special cases there.
     fn seed_cuda_builtins(&mut self) {
         self.scopes.declare_struct(
             CUDA_DIM3_STRUCT,
@@ -457,6 +493,47 @@ impl Checker {
             ValueSym::Func(FuncSig {
                 ret: Ty::Scalar(ScalarKind::Void),
                 params: Vec::new(),
+                variadic: false,
+            }),
+        );
+
+        let int = Ty::Scalar(ScalarKind::Int);
+        for name in CUDA_SHUFFLE_BUILTINS {
+            self.scopes.declare_value(
+                name,
+                ValueSym::Func(FuncSig {
+                    ret: int.clone(),
+                    params: vec![int.clone(), int.clone()],
+                    variadic: false,
+                }),
+            );
+        }
+        for name in CUDA_VOTE_BUILTINS {
+            self.scopes.declare_value(
+                name,
+                ValueSym::Func(FuncSig {
+                    ret: int.clone(),
+                    params: vec![int.clone()],
+                    variadic: false,
+                }),
+            );
+        }
+        let int_ptr = Ty::Pointer(Box::new(int.clone()));
+        for name in CUDA_ATOMIC_RMW_BUILTINS {
+            self.scopes.declare_value(
+                name,
+                ValueSym::Func(FuncSig {
+                    ret: int.clone(),
+                    params: vec![int_ptr.clone(), int.clone()],
+                    variadic: false,
+                }),
+            );
+        }
+        self.scopes.declare_value(
+            CUDA_ATOMIC_CAS_BUILTIN,
+            ValueSym::Func(FuncSig {
+                ret: int.clone(),
+                params: vec![int_ptr, int.clone(), int],
                 variadic: false,
             }),
         );
