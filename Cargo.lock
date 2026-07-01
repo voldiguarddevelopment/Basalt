@@ -74,6 +74,10 @@ version = "0.0.0"
 [[package]]
 name = "basalt-sema"
 version = "0.0.0"
+dependencies = [
+ "basalt-diag",
+ "basalt-frontend-c",
+]
 
 [[package]]
 name = "basalt-spirv"

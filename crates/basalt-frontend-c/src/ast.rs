@@ -1,23 +1,19 @@
 // AST for declarations, types, expressions, and statements: structs/enums/unions/typedefs/
 // namespaces, the type grammar needed to describe them (scalars, pointers, arrays, tag/named
-// types), function signatures and bodies, full expressions, and full C control flow.
+// types, basic template instantiation), function signatures and bodies, full expressions, and
+// full C control flow.
 //
-// `TokenRange` remains only where something is deliberately out of scope even now: a
-// `template<...>` body (structural recognition only, no instantiation — see `TemplateDecl`)
-// and function-pointer declarators (not parsed at all — see `parse::Parser::parse_declarator`).
+// Basic templates are parsed, not just recognized: a `template<...>` header's parameters are
+// real `TemplateParam`s and its body is a fully parsed `Item` (see `TemplateDecl`), and
+// `Name<Arg, ...>` in type position is a real `Type::Instantiated` rather than opaque text. What
+// is deliberately still out of scope: template substitution/monomorphization (a later, sema-stage
+// concern — `T`/`N` parse as an ordinary `Type::Named`/non-type expression, not resolved against
+// the enclosing template's parameter list) and function-pointer declarators (not parsed at all —
+// see `parse::Parser::parse_declarator`).
 //
 // Every node carries a `Span` so diagnostics can point at source text without re-deriving it.
 
 use crate::token::{CharLit, FloatLit, IntLit, Span, StrLit};
-
-/// A half-open range of indices into the token slice the parser was given, plus the `Span`
-/// that range covers, so a later pass can either re-slice the tokens or just point at source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenRange {
-    pub start: usize,
-    pub end: usize,
-    pub span: Span,
-}
 
 /// Assignment operators, `=` and its compound forms. All are right-associative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +430,16 @@ pub enum Type {
         size: Option<Box<Expr>>,
         span: Span,
     },
+    /// `Name<Arg, ...>`, a template instantiation used in type position (`Foo<int>`,
+    /// `Vector<Vector<int>>`, ...). See `parse::Parser::try_parse_template_args` for how `Name`
+    /// followed by `<` is told apart from a less-than expression; `args` is whatever the
+    /// argument list parsed to, with no check that `Name` names a known template or that the
+    /// argument count/kinds match one (no symbol table at this stage).
+    Instantiated {
+        name: String,
+        args: Vec<TemplateArg>,
+        span: Span,
+    },
 }
 
 impl Type {
@@ -443,9 +449,18 @@ impl Type {
             | Type::Tag { span, .. }
             | Type::Named { span, .. }
             | Type::Pointer { span, .. }
-            | Type::Array { span, .. } => *span,
+            | Type::Array { span, .. }
+            | Type::Instantiated { span, .. } => *span,
         }
     }
+}
+
+/// One argument in a template-argument list: either a type (`Foo<int>`) or a constant
+/// expression (`Array<N + 1>`). See `Type::Instantiated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateArg {
+    Type(Type),
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,20 +543,33 @@ pub struct VarDecl {
     pub span: Span,
 }
 
+/// A type parameter (`typename T` / `class T`) or a basic non-type parameter (`int N`, whose
+/// declared type is carried by the `NonType` payload). Default arguments (`typename T = int`)
+/// are not modeled — out of scope for "basic" templates (ARCHITECTURE.md §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateParamKind {
+    Type,
+    NonType(Type),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateParam {
     pub name: String,
+    pub kind: TemplateParamKind,
     pub span: Span,
 }
 
-/// A `template<...> ...` declaration, recognized structurally only: the parameter list is
-/// parsed, but the templated item itself (struct/function/etc.) is captured as an opaque
-/// `body` range rather than parsed and instantiated. `name` is a best-effort guess (see
-/// `parse::Parser::guess_template_item_name`), not a guarantee.
+/// A `template<...> item` declaration. Unlike `Type::Instantiated`, this is the *declaration*
+/// side: `params` is the parsed parameter list and `body` is the templated item itself, parsed
+/// exactly as it would be outside a template (a real `StructDecl`/`FunctionDecl`/etc., not an
+/// opaque token range) — `T`/`N` used in type position inside it parse the same as any other
+/// unknown named type, since this stage has no symbol table to resolve them against `params`.
+/// `name` is derived from `body` where that has an obvious one (see
+/// `parse::Parser::item_name`), not a guarantee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateDecl {
     pub params: Vec<TemplateParam>,
     pub name: Option<String>,
-    pub body: TokenRange,
+    pub body: Box<Item>,
     pub span: Span,
 }

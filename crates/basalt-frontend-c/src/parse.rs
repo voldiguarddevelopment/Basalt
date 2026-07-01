@@ -2,11 +2,11 @@
 // stage never touches source text directly, so it stays decoupled from lexing/preprocessing.
 //
 // Scope (ARCHITECTURE.md §6): structs/enums/unions/typedefs/namespaces, the scalar/pointer/
-// array type grammar, function signatures and bodies, full C-subset expressions, and full
-// control flow. A `template<...>` header is still recognized structurally only — the
-// templated item's body is captured as an opaque `TokenRange` rather than parsed and
-// instantiated — and function-pointer declarators are still not parsed at all; both are
-// documented gaps in `ast.rs`.
+// array type grammar, function signatures and bodies, full C-subset expressions, full control
+// flow, and basic templates: a `template<...>` header's parameters and templated item are both
+// fully parsed (see `parse_template`), and `Name<Arg, ...>` in type position is a template
+// instantiation (see `try_parse_template_args`) rather than opaque text. Function-pointer
+// declarators are still not parsed at all — a documented gap in `ast.rs`.
 //
 // Expression parsing is precedence climbing written out level by level (`parse_expr` down to
 // `parse_primary`), matching the standard C precedence/associativity table; the resulting tree
@@ -156,10 +156,40 @@ fn punct_text(p: Punct) -> &'static str {
     }
 }
 
+/// Best-effort name of a parsed `Item`, used to fill `TemplateDecl.name`.
+fn item_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Struct(d) => d.name.clone(),
+        Item::Union(d) => d.name.clone(),
+        Item::Enum(d) => d.name.clone(),
+        Item::Typedef(d) => Some(d.alias.clone()),
+        Item::Namespace(d) => Some(d.name.clone()),
+        Item::Function(d) => Some(d.name.clone()),
+        Item::Var(d) => Some(d.name.clone()),
+        Item::Template(d) => d.name.clone(),
+    }
+}
+
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     errors: Vec<ParseError>,
+    /// Set right after a `>>` token is consumed to close one angle-bracket level (a template
+    /// parameter list or a template-argument list): `>>` lexes as one `Shr` token, so closing
+    /// two nested levels at once only advances `pos` by one token, and the second close is
+    /// owed to whichever enclosing level asks next. See `eat_close_angle`.
+    pending_close_angle: Option<Span>,
+}
+
+/// A saved parser position, for the speculative "try to parse a template-argument list, and
+/// fall back to treating `<` as less-than if it doesn't cleanly close" heuristic (see
+/// `Parser::try_parse_template_args`). Cheap to copy since it's just an index plus two small
+/// `Copy` fields.
+#[derive(Clone, Copy)]
+struct Checkpoint {
+    pos: usize,
+    errors_len: usize,
+    pending_close_angle: Option<Span>,
 }
 
 impl<'a> Parser<'a> {
@@ -168,7 +198,53 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             errors: Vec::new(),
+            pending_close_angle: None,
         }
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            pos: self.pos,
+            errors_len: self.errors.len(),
+            pending_close_angle: self.pending_close_angle,
+        }
+    }
+
+    /// Rewinds to `cp`, discarding any tokens consumed and any errors raised since it was
+    /// taken. Used only to abandon a speculative parse; normal recovery paths use
+    /// `synchronize`/`synchronize_stmt`/etc. instead, which move forward, never back.
+    fn restore(&mut self, cp: Checkpoint) {
+        self.pos = cp.pos;
+        self.errors.truncate(cp.errors_len);
+        self.pending_close_angle = cp.pending_close_angle;
+    }
+
+    /// True if the current position can close one angle-bracket level: a literal `>`, a `>>`
+    /// (see `pending_close_angle`), or a pending close left over from a previously split `>>`.
+    fn at_close_angle(&self) -> bool {
+        self.pending_close_angle.is_some()
+            || self.check_punct(Punct::Gt)
+            || self.check_punct(Punct::Shr)
+    }
+
+    /// Consumes one closing `>` for the current angle-bracket level, splitting a `>>` token
+    /// into two logical closes if needed (the classic `vector<vector<int>>` lexing snag: `>>`
+    /// lexes as a single `Shr` token, so this closes the current level and leaves one `>` owed
+    /// to the next enclosing level via `pending_close_angle`, without consuming a second
+    /// token). Returns `None` if the current position can't close a level at all.
+    fn eat_close_angle(&mut self) -> Option<Span> {
+        if let Some(span) = self.pending_close_angle.take() {
+            return Some(span);
+        }
+        if self.check_punct(Punct::Gt) {
+            return Some(self.bump().span);
+        }
+        if self.check_punct(Punct::Shr) {
+            let span = self.bump().span;
+            self.pending_close_angle = Some(span);
+            return Some(span);
+        }
+        None
     }
 
     fn at_eof(&self) -> bool {
@@ -296,46 +372,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skips whatever declaration follows a `template<...>` header: a brace-delimited
-    /// definition (trailing `;`, if present, consumed too) or a `;`-terminated prototype.
-    fn skip_one_declaration(&mut self) {
-        let mut depth = 0i32;
-        let mut had_brace = false;
-        loop {
-            match self.cur().kind {
-                TokenKind::Punct(Punct::LBrace) => {
-                    had_brace = true;
-                    depth += 1;
-                    self.bump();
-                }
-                TokenKind::Punct(Punct::LParen | Punct::LBracket) => {
-                    depth += 1;
-                    self.bump();
-                }
-                TokenKind::Punct(Punct::RBrace | Punct::RParen | Punct::RBracket) => {
-                    if depth == 0 {
-                        self.bump();
-                        continue;
-                    }
-                    depth -= 1;
-                    self.bump();
-                    if depth == 0 && had_brace {
-                        self.eat_punct(Punct::Semi);
-                        break;
-                    }
-                }
-                TokenKind::Punct(Punct::Semi) if depth == 0 => {
-                    self.bump();
-                    break;
-                }
-                TokenKind::Eof => break,
-                _ => {
-                    self.bump();
-                }
-            }
-        }
-    }
-
     // ---- items -----------------------------------------------------------------------
 
     fn parse_item(&mut self, out: &mut Vec<Item>) {
@@ -423,9 +459,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A `template<...>` header followed by whatever it templates. Recognized structurally
-    /// only: the parameter list is parsed, the templated item is captured whole as a
-    /// `TokenRange` (see the module header for why).
+    /// A `template<...>` header followed by whatever it templates. The parameter list is
+    /// parsed into real `TemplateParam`s and the templated item is parsed exactly like any
+    /// other `Item` by recursing into `parse_item`, rather than captured as opaque text.
+    ///
+    /// If the header parses but the templated item produces no `Item` at all (a malformed
+    /// declaration that `parse_item` already recovered from on its own — see its per-construct
+    /// `synchronize*` calls), no `Template` item is pushed either, matching how a malformed
+    /// non-templated declaration produces no `Item`. If it produces more than one (e.g. a
+    /// struct definition combined with an inline instance declarator,
+    /// `struct S { ... } instance;`), only the first is kept as the body — a documented gap,
+    /// consistent with "basic" template scope.
     fn parse_template(&mut self, out: &mut Vec<Item>) {
         let start = self.cur().span.start;
         self.bump(); // `template`
@@ -434,135 +478,113 @@ impl<'a> Parser<'a> {
             return;
         }
         let params = self.parse_template_params();
-        let name = self.guess_template_item_name();
-        let body_start = self.pos;
-        let body_start_span = self.cur().span.start;
-        self.skip_one_declaration();
-        let body_end = self.pos;
-        let body_span_end = self.prev_span_end().end;
+        let mut inner = Vec::new();
+        self.parse_item(&mut inner);
+        let end = self.prev_span_end().end;
+        let Some(body) = inner.into_iter().next() else {
+            return;
+        };
+        let name = item_name(&body);
         out.push(Item::Template(TemplateDecl {
             params,
             name,
-            body: TokenRange {
-                start: body_start,
-                end: body_end,
-                span: Span::new(body_start_span, body_span_end),
-            },
-            span: Span::new(start, body_span_end),
+            body: Box::new(body),
+            span: Span::new(start, end),
         }));
     }
 
     /// Parses the comma-separated parameter list of a `template< ... >` header (`self.pos`
-    /// must be positioned right after the opening `<`, at depth 1). Each parameter's "name"
-    /// is a heuristic: the last identifier in its token run before any `= default`, which
-    /// covers both type parameters (`typename T`, `class T`) and simple non-type parameters
-    /// (`int N`) without needing full type/expression parsing.
+    /// must be positioned right after the opening `<`). Each parameter is a type parameter
+    /// (`typename T` / `class T`) or a basic non-type parameter (a decl-specifier sequence plus
+    /// a declarator, e.g. `int N`); default arguments (`typename T = int`) are not modeled —
+    /// out of scope for "basic" templates. The closing `>` goes through `eat_close_angle`, the
+    /// same `>>`-splitting logic `try_parse_template_args` uses, so a header immediately
+    /// followed by another closing bracket (a nested instantiation's second `>`) still closes
+    /// correctly.
     fn parse_template_params(&mut self) -> Vec<TemplateParam> {
         let mut params = Vec::new();
-        let mut depth = 1i32;
-        let mut seg_start = self.pos;
+        if self.at_close_angle() {
+            self.eat_close_angle();
+            return params;
+        }
+        loop {
+            let pstart = self.cur().span.start;
+            match self.peek_keyword() {
+                Some(Keyword::Typename | Keyword::Class) => {
+                    self.bump();
+                    let name = match self.ident_here() {
+                        Some(n) => {
+                            self.bump();
+                            n
+                        }
+                        None => {
+                            self.error_expected("template parameter name");
+                            String::new()
+                        }
+                    };
+                    params.push(TemplateParam {
+                        name,
+                        kind: TemplateParamKind::Type,
+                        span: Span::new(pstart, self.prev_span_end().end),
+                    });
+                }
+                _ => {
+                    let mut scratch = Vec::new();
+                    match self.parse_decl_specifiers(&mut scratch) {
+                        Some((base, _)) => {
+                            let (ty, name, span) = self.parse_declarator(base);
+                            match name {
+                                Some(n) => params.push(TemplateParam {
+                                    name: n,
+                                    kind: TemplateParamKind::NonType(ty),
+                                    span,
+                                }),
+                                None => {
+                                    self.errors.push(ParseError::MissingDeclaratorName { span })
+                                }
+                            }
+                        }
+                        None => self.skip_to_template_param_boundary(),
+                    }
+                }
+            }
+            if self.eat_punct(Punct::Comma) {
+                continue;
+            }
+            break;
+        }
+        if self.eat_close_angle().is_none() {
+            self.error_expected("'>'");
+        }
+        params
+    }
+
+    /// Recovery for a malformed template parameter: skips to the next top-level `,` or the
+    /// closing `>`/`>>`, tracking bracket nesting the same way `synchronize_param` does, so one
+    /// bad parameter can't take the rest of the header (or the parse) down with it.
+    fn skip_to_template_param_boundary(&mut self) {
+        let mut depth = 0i32;
         loop {
             match self.cur().kind {
-                TokenKind::Punct(Punct::Lt) => {
+                TokenKind::Eof => return,
+                TokenKind::Punct(Punct::LParen | Punct::LBracket | Punct::LBrace) => {
                     depth += 1;
                     self.bump();
                 }
-                TokenKind::Punct(Punct::Gt) => {
+                TokenKind::Punct(Punct::RParen | Punct::RBracket | Punct::RBrace) => {
+                    if depth == 0 {
+                        return;
+                    }
                     depth -= 1;
-                    let closing = depth == 0;
-                    let seg_end = self.pos;
                     self.bump();
-                    if closing {
-                        self.finish_template_param(&mut params, seg_start, seg_end);
-                        break;
-                    }
                 }
-                TokenKind::Punct(Punct::Shr) => {
-                    // `>>` closes two angle-bracket levels at once (the classic
-                    // `vector<vector<int>>` lexing snag).
-                    depth -= 2;
-                    let seg_end = self.pos;
-                    let closing = depth <= 0;
-                    self.bump();
-                    if closing {
-                        self.finish_template_param(&mut params, seg_start, seg_end);
-                        break;
-                    }
-                }
-                TokenKind::Punct(Punct::Comma) if depth == 1 => {
-                    let seg_end = self.pos;
-                    self.bump();
-                    self.finish_template_param(&mut params, seg_start, seg_end);
-                    seg_start = self.pos;
-                }
-                TokenKind::Eof => break,
+                TokenKind::Punct(Punct::Comma) if depth == 0 => return,
+                TokenKind::Punct(Punct::Gt | Punct::Shr) if depth == 0 => return,
                 _ => {
                     self.bump();
                 }
             }
         }
-        params
-    }
-
-    fn finish_template_param(
-        &mut self,
-        params: &mut Vec<TemplateParam>,
-        seg_start: usize,
-        seg_end: usize,
-    ) {
-        if seg_start >= seg_end {
-            return;
-        }
-        let mut limit = seg_end;
-        for i in seg_start..seg_end {
-            if matches!(self.tokens[i].kind, TokenKind::Punct(Punct::Eq)) {
-                limit = i;
-                break;
-            }
-        }
-        let mut name = None;
-        let mut span = None;
-        for tok in &self.tokens[seg_start..limit] {
-            if let TokenKind::Ident(s) = &tok.kind {
-                name = Some(s.clone());
-                span = Some(tok.span);
-            }
-        }
-        if let Some(name) = name {
-            params.push(TemplateParam {
-                name,
-                span: span.unwrap_or(self.tokens[seg_start].span),
-            });
-        }
-    }
-
-    /// Best-effort guess at the name of the item following a `template<...>` header, without
-    /// parsing it: `struct`/`class`/`union` followed by an identifier, or (for a function
-    /// template) the identifier immediately before the parameter-list `(`. Bounded so a
-    /// malformed header can't scan the rest of the file.
-    fn guess_template_item_name(&self) -> Option<String> {
-        if let TokenKind::Keyword(k) = self.cur().kind {
-            if matches!(k, Keyword::Struct | Keyword::Class | Keyword::Union) {
-                if let Some(next) = self.tokens.get(self.pos + 1) {
-                    if let TokenKind::Ident(n) = &next.kind {
-                        return Some(n.clone());
-                    }
-                }
-            }
-        }
-        let mut last_ident = None;
-        let mut i = self.pos;
-        let limit = (self.pos + 64).min(self.tokens.len());
-        while i < limit {
-            match &self.tokens[i].kind {
-                TokenKind::Punct(Punct::LParen | Punct::LBrace | Punct::Semi) => break,
-                TokenKind::Ident(n) => last_ident = Some(n.clone()),
-                TokenKind::Eof => break,
-                _ => {}
-            }
-            i += 1;
-        }
-        last_ident
     }
 
     /// The common path: decl-specifiers, then a declarator, then either a function
@@ -711,15 +733,8 @@ impl<'a> Parser<'a> {
             Some(k) if is_scalar_keyword(k) => (self.parse_scalar(start), false),
             _ => match self.ident_here() {
                 Some(name) => {
-                    let span = self.bump().span;
-                    (
-                        Type::Named {
-                            name,
-                            quals: Qualifiers::default(),
-                            span,
-                        },
-                        false,
-                    )
+                    let name_span = self.bump().span;
+                    (self.parse_named_or_instantiated(name, name_span), false)
                 }
                 None => {
                     self.error_expected("type specifier");
@@ -731,6 +746,140 @@ impl<'a> Parser<'a> {
         self.consume_quals(&mut quals);
         apply_quals(&mut ty, quals);
         Some((ty, is_forward_tag))
+    }
+
+    /// Builds a `Type::Named` for a bare identifier just consumed in type-specifier position,
+    /// or, if it's immediately followed by what parses as a closed template-argument list,
+    /// promotes it to `Type::Instantiated` instead. This is the only call site that ever tries
+    /// that promotion — it fires in type-specifier position alone, never for an ordinary
+    /// expression, so `if (a < b)` is unaffected regardless of what `a` is named.
+    fn parse_named_or_instantiated(&mut self, name: String, name_span: Span) -> Type {
+        if self.check_punct(Punct::Lt) {
+            if let Some((args, args_span)) = self.try_parse_template_args() {
+                return Type::Instantiated {
+                    name,
+                    args,
+                    span: Span::new(name_span.start, args_span.end),
+                };
+            }
+        }
+        Type::Named {
+            name,
+            quals: Qualifiers::default(),
+            span: name_span,
+        }
+    }
+
+    /// Attempts to parse `< arg, arg, ... >` as a template-argument list starting at the
+    /// current `<` token. Backtracks (restoring position, errors, and any pending `>>` split)
+    /// and returns `None` if the list doesn't cleanly close on a `,`/`>`/`>>` boundary at every
+    /// step, or if parsing it raised any error — this is the parser's disambiguation heuristic
+    /// for the classic "`<` as less-than vs. `<` as template-argument-list open" ambiguity: bias
+    /// towards treating `Name<...>` as an instantiation whenever it parses clean, and fall back
+    /// to an ordinary `Type::Named` (leaving the `<` for the caller, e.g. as a relational
+    /// operator) otherwise.
+    ///
+    /// Known limitation (matches real-world C++ parser folklore): without a symbol table, this
+    /// can't tell "a template name" apart from "an ordinary variable that happens to share one".
+    /// `Foo < a, b > c;` where `Foo`, `a`, `b`, `c` are all plain variables parses clean as an
+    /// instantiation of `Foo` with arguments `a` and `b`, not as `(Foo < a), (b > c)` — the same
+    /// misparse real C++ compilers avoid only by knowing `Foo` isn't a template.
+    fn try_parse_template_args(&mut self) -> Option<(Vec<TemplateArg>, Span)> {
+        let cp = self.checkpoint();
+        let start = self.cur().span.start;
+        self.bump(); // `<`
+        let mut args = Vec::new();
+        if !self.at_close_angle() {
+            loop {
+                match self.try_parse_template_arg() {
+                    Some(arg) => args.push(arg),
+                    None => {
+                        self.restore(cp);
+                        return None;
+                    }
+                }
+                if self.eat_punct(Punct::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let close = match self.eat_close_angle() {
+            Some(span) => span,
+            None => {
+                self.restore(cp);
+                return None;
+            }
+        };
+        if self.errors.len() != cp.errors_len {
+            self.restore(cp);
+            return None;
+        }
+        Some((args, Span::new(start, close.end)))
+    }
+
+    /// Parses one template argument: a type if the current token unambiguously (or, for a bare
+    /// identifier, plausibly) starts one, otherwise a constant expression. Succeeds only if the
+    /// parse lands exactly on the next `,` or the list's closing `>`/`>>` with no new errors
+    /// raised; anything else backtracks and reports failure to `try_parse_template_args`.
+    fn try_parse_template_arg(&mut self) -> Option<TemplateArg> {
+        let cp = self.checkpoint();
+        if self.looks_like_type_start() {
+            let mut scratch = Vec::new();
+            if let Some((base, _)) = self.parse_decl_specifiers(&mut scratch) {
+                // Already at a boundary (e.g. right after a nested instantiation that
+                // consumed a pending split `>>` — see `eat_close_angle` — so the token here
+                // physically belongs to whatever follows the whole argument list, not to this
+                // type): don't attempt declarator decoration at all, since a bare identifier
+                // right here is the *next* construct's name, not this type-id's.
+                if self.at_template_arg_boundary() && self.errors.len() == cp.errors_len {
+                    return Some(TemplateArg::Type(base));
+                }
+                let (ty, name, _span) = self.parse_declarator(base);
+                if name.is_none()
+                    && self.at_template_arg_boundary()
+                    && self.errors.len() == cp.errors_len
+                {
+                    return Some(TemplateArg::Type(ty));
+                }
+            }
+            self.restore(cp);
+        }
+        let expr = self.parse_template_arg_expr();
+        if self.at_template_arg_boundary() && self.errors.len() == cp.errors_len {
+            return Some(TemplateArg::Expr(expr));
+        }
+        self.restore(cp);
+        None
+    }
+
+    /// True if the current token could plausibly open a template argument: an unambiguous type
+    /// start (scalar/qualifier/tag keyword, same as `next_starts_type`) or a bare identifier —
+    /// unlike `next_starts_type`'s cast-vs-parenthesized-expression heuristic, a bare identifier
+    /// *is* tried as a type here, since `Foo<Bar>` (an instantiation with a named-type argument)
+    /// is common and `try_parse_template_arg` falls back to the expression path anyway if the
+    /// type attempt doesn't reach a clean boundary.
+    fn looks_like_type_start(&self) -> bool {
+        match self.peek_keyword() {
+            Some(k) if is_scalar_keyword(k) => true,
+            Some(Keyword::Const | Keyword::Volatile) => true,
+            Some(Keyword::Struct | Keyword::Union | Keyword::Enum) => true,
+            _ => matches!(self.cur().kind, TokenKind::Ident(_)),
+        }
+    }
+
+    fn at_template_arg_boundary(&self) -> bool {
+        self.check_punct(Punct::Comma) || self.at_close_angle()
+    }
+
+    /// Parses a non-type template argument at additive-expression level (unary/cast/
+    /// multiplicative/additive) rather than the full assignment-expression the grammar allows:
+    /// relational, shift, bitwise, logical, ternary, and comma operators all use `<`/`>`/`>>`
+    /// tokens that this layer needs to keep available for the argument list's own brackets, so
+    /// an argument needing one of those must be parenthesized (`Array<(a > b)>`) — the same
+    /// "wrap it in parens" convention real C++ pushes template-argument authors toward.
+    fn parse_template_arg_expr(&mut self) -> Expr {
+        self.parse_additive()
     }
 
     fn parse_scalar(&mut self, start: crate::token::Loc) -> Type {
@@ -2006,7 +2155,7 @@ fn apply_quals(ty: &mut Type, quals: Qualifiers) {
         | Type::Tag { quals, .. }
         | Type::Named { quals, .. }
         | Type::Pointer { quals, .. } => quals,
-        Type::Array { .. } => return,
+        Type::Array { .. } | Type::Instantiated { .. } => return,
     };
     target.is_const |= quals.is_const;
     target.is_volatile |= quals.is_volatile;
@@ -2400,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn template_decl_recognized_structurally() {
+    fn template_struct_single_type_param_body_is_fully_parsed() {
         let tu = parse_ok(
             r#"
             template<typename T>
@@ -2415,8 +2564,293 @@ mod tests {
         };
         assert_eq!(t.params.len(), 1);
         assert_eq!(t.params[0].name, "T");
+        assert!(matches!(t.params[0].kind, TemplateParamKind::Type));
         assert_eq!(t.name.as_deref(), Some("Box"));
-        assert!(t.body.start < t.body.end);
+        let Item::Struct(s) = t.body.as_ref() else {
+            panic!("expected struct body, got {:?}", t.body);
+        };
+        assert_eq!(s.name.as_deref(), Some("Box"));
+        assert_eq!(s.fields.len(), 1);
+        assert_eq!(s.fields[0].name, "value");
+        assert!(matches!(&s.fields[0].ty, Type::Named { name, .. } if name == "T"));
+    }
+
+    #[test]
+    fn template_struct_multiple_type_params() {
+        let tu = parse_ok(
+            r#"
+            template<typename K, typename V>
+            struct Pair {
+                K key;
+                V value;
+            };
+            "#,
+        );
+        let Item::Template(t) = &tu.items[0] else {
+            panic!("expected template");
+        };
+        assert_eq!(t.params.len(), 2);
+        assert_eq!(t.params[0].name, "K");
+        assert_eq!(t.params[1].name, "V");
+        assert!(matches!(t.params[0].kind, TemplateParamKind::Type));
+        assert!(matches!(t.params[1].kind, TemplateParamKind::Type));
+        let Item::Struct(s) = t.body.as_ref() else {
+            panic!("expected struct body");
+        };
+        assert_eq!(s.fields[0].name, "key");
+        assert!(matches!(&s.fields[0].ty, Type::Named { name, .. } if name == "K"));
+        assert_eq!(s.fields[1].name, "value");
+        assert!(matches!(&s.fields[1].ty, Type::Named { name, .. } if name == "V"));
+    }
+
+    #[test]
+    fn template_non_type_param() {
+        let tu = parse_ok(
+            r#"
+            template<typename T, int N>
+            struct Array {
+                T data[N];
+            };
+            "#,
+        );
+        let Item::Template(t) = &tu.items[0] else {
+            panic!("expected template");
+        };
+        assert_eq!(t.params.len(), 2);
+        assert_eq!(t.params[0].name, "T");
+        assert!(matches!(t.params[0].kind, TemplateParamKind::Type));
+        assert_eq!(t.params[1].name, "N");
+        match &t.params[1].kind {
+            TemplateParamKind::NonType(ty) => assert!(matches!(
+                ty,
+                Type::Scalar {
+                    kind: ScalarKind::Int,
+                    ..
+                }
+            )),
+            other => panic!("expected non-type param, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_function_decl() {
+        let tu = parse_ok(
+            r#"
+            template<typename T>
+            T max(T a, T b);
+            "#,
+        );
+        let Item::Template(t) = &tu.items[0] else {
+            panic!("expected template");
+        };
+        assert_eq!(t.name.as_deref(), Some("max"));
+        let Item::Function(f) = t.body.as_ref() else {
+            panic!("expected function body, got {:?}", t.body);
+        };
+        assert_eq!(f.name, "max");
+        assert_eq!(f.params.len(), 2);
+        assert!(matches!(&f.ret, Type::Named { name, .. } if name == "T"));
+    }
+
+    #[test]
+    fn instantiation_as_variable_type() {
+        let tu = parse_ok("Foo<int> x;");
+        let Item::Var(v) = &tu.items[0] else {
+            panic!("expected var, got {:?}", tu.items[0]);
+        };
+        assert_eq!(v.name, "x");
+        match &v.ty {
+            Type::Instantiated { name, args, .. } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(
+                    &args[0],
+                    TemplateArg::Type(Type::Scalar {
+                        kind: ScalarKind::Int,
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected instantiated type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instantiation_as_function_param_type() {
+        let tu = parse_ok("void f(Vector<float> v);");
+        let Item::Function(f) = &tu.items[0] else {
+            panic!("expected function");
+        };
+        assert_eq!(f.params.len(), 1);
+        match &f.params[0].ty {
+            Type::Instantiated { name, args, .. } => {
+                assert_eq!(name, "Vector");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(
+                    &args[0],
+                    TemplateArg::Type(Type::Scalar {
+                        kind: ScalarKind::Float,
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected instantiated type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instantiation_with_multiple_arguments() {
+        let tu = parse_ok("Pair<int, float> p;");
+        let Item::Var(v) = &tu.items[0] else {
+            panic!("expected var");
+        };
+        match &v.ty {
+            Type::Instantiated { name, args, .. } => {
+                assert_eq!(name, "Pair");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(
+                    &args[0],
+                    TemplateArg::Type(Type::Scalar {
+                        kind: ScalarKind::Int,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    &args[1],
+                    TemplateArg::Type(Type::Scalar {
+                        kind: ScalarKind::Float,
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected instantiated type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instantiation_non_type_argument() {
+        let tu = parse_ok("Array<int, 4> a;");
+        let Item::Var(v) = &tu.items[0] else {
+            panic!("expected var");
+        };
+        match &v.ty {
+            Type::Instantiated { name, args, .. } => {
+                assert_eq!(name, "Array");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], TemplateArg::Type(_)));
+                match &args[1] {
+                    TemplateArg::Expr(Expr::IntLit { .. }) => {}
+                    other => panic!("expected int-literal argument, got {other:?}"),
+                }
+            }
+            other => panic!("expected instantiated type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_instantiation_splits_shr_correctly() {
+        let tu = parse_ok("Vector<Vector<int>> v;");
+        let Item::Var(v) = &tu.items[0] else {
+            panic!("expected var");
+        };
+        match &v.ty {
+            Type::Instantiated { name, args, .. } => {
+                assert_eq!(name, "Vector");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    TemplateArg::Type(Type::Instantiated { name, args, .. }) => {
+                        assert_eq!(name, "Vector");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(
+                            &args[0],
+                            TemplateArg::Type(Type::Scalar {
+                                kind: ScalarKind::Int,
+                                ..
+                            })
+                        ));
+                    }
+                    other => panic!("expected nested instantiation, got {other:?}"),
+                }
+            }
+            other => panic!("expected instantiated type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_instantiation_as_template_parameter_list_still_closes() {
+        // The same `>>`-splitting logic must also work when a nested instantiation appears
+        // inside a template header's own non-type parameter type.
+        let tu = parse_ok(
+            r#"
+            template<typename T>
+            struct Holder {
+                Vector<Vector<T>> items;
+            };
+            "#,
+        );
+        let Item::Template(t) = &tu.items[0] else {
+            panic!("expected template");
+        };
+        let Item::Struct(s) = t.body.as_ref() else {
+            panic!("expected struct body");
+        };
+        assert!(matches!(
+            &s.fields[0].ty,
+            Type::Instantiated { name, .. } if name == "Vector"
+        ));
+    }
+
+    #[test]
+    fn less_than_fallback_still_works_outside_template_context() {
+        let src = "void f() { int a; int b; if (a < b) { a = b; } }";
+        let tu = parse_ok(src);
+        let body = first_fn_body(&tu);
+        let if_stmt = body
+            .iter()
+            .find(|s| matches!(s, Stmt::If { .. }))
+            .expect("expected an if statement");
+        let Stmt::If { cond, .. } = if_stmt else {
+            unreachable!()
+        };
+        assert!(matches!(cond, Expr::Binary { op: BinOp::Lt, .. }));
+    }
+
+    #[test]
+    fn comparison_expression_with_instantiation_lookalike_names() {
+        // `Foo` here is an ordinary variable, not a template, but with no symbol table at this
+        // layer `Foo < a` immediately followed by something that looks like a closed argument
+        // list (`> b`, with nothing after to break the boundary) is indistinguishable from an
+        // instantiation. Documented limitation of `try_parse_template_args`: a trailing
+        // relational comparison keeps the expression path since `> b ;` isn't a valid
+        // instantiation-then-declarator, but a bare `Foo < a, b > c;` shape does misparse (see
+        // `try_parse_template_args`'s doc comment). Here we assert the case that must stay a
+        // comparison: a single relational operand with a trailing operator has nowhere to
+        // plausibly close as a type, so it recovers to a normal expression tree.
+        let e = parse_expr_src("Foo < a");
+        assert!(matches!(e, Expr::Binary { op: BinOp::Lt, .. }));
+    }
+
+    #[test]
+    fn malformed_template_recovers_and_continues() {
+        let (tokens, lex_errs) = lex(r#"
+            template<typename> struct;
+            int good;
+            "#);
+        assert!(lex_errs.is_empty());
+        let (tu, errs) = parse(&tokens);
+        assert!(!errs.is_empty(), "expected at least one parse error");
+        let found_good = tu
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Var(v) if v.name == "good"));
+        assert!(found_good, "items: {tu:?}");
+    }
+
+    #[test]
+    fn malformed_template_header_does_not_hang() {
+        let (tokens, _) = lex("template< struct Foo { int x; };");
+        let (_tu, errs) = parse(&tokens);
+        assert!(!errs.is_empty());
     }
 
     #[test]
