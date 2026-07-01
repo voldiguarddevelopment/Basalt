@@ -61,6 +61,11 @@ version = "0.0.0"
 [[package]]
 name = "basalt-passes"
 version = "0.0.0"
+dependencies = [
+ "basalt-bir",
+ "basalt-frontend-c",
+ "basalt-sema",
+]
 
 [[package]]
 name = "basalt-ptx"
