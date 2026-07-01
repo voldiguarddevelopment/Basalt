@@ -20,6 +20,8 @@ tensix = []
 basalt-bir = { path = "../basalt-bir" }
 basalt-diag = { path = "../basalt-diag" }
 basalt-backend = { path = "../basalt-backend" }
+basalt-frontend-c = { path = "../basalt-frontend-c" }
+basalt-sema = { path = "../basalt-sema" }
 basalt-llvm = { path = "../basalt-llvm", optional = true }
 basalt-mlir = { path = "../basalt-mlir", optional = true }
 basalt-clif = { path = "../basalt-clif", optional = true }

@@ -27,8 +27,10 @@ dependencies = [
  "basalt-bir",
  "basalt-clif",
  "basalt-diag",
+ "basalt-frontend-c",
  "basalt-llvm",
  "basalt-mlir",
+ "basalt-sema",
 ]
 
 [[package]]
