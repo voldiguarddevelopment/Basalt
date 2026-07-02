@@ -15,17 +15,23 @@
 // `basalt-ptx`'s output straight to real hardware with no offline NVIDIA toolchain in the
 // loop at all.
 //
-// HSA (the ROCm-side loader for AMDGPU) is not implemented yet; see this crate's own
-// module list as it grows.
+// The HSA half (`hsa/`) wraps `libhsa-runtime64.so`, the ROCm-side counterpart to the CUDA
+// Driver API above — see `hsa/mod.rs` for how the two loaders differ and why.
 
 mod context;
 mod dl;
 mod driver;
 mod error;
 mod ffi;
+mod hsa;
 mod module;
 
 pub use context::{CudaContext, DeviceBuffer};
 pub use driver::CudaDriver;
 pub use error::CudaError;
+pub use hsa::{
+    build_kernel_dispatch_header, HsaAgent, HsaAgentInfo, HsaBuffer, HsaDeviceType, HsaError,
+    HsaExecutable, HsaKernel, HsaKernelDispatchPacket, HsaQueue, HsaRegion, HsaRuntime,
+    HSA_PACKET_TYPE_KERNEL_DISPATCH,
+};
 pub use module::{CudaFunction, CudaModule};
