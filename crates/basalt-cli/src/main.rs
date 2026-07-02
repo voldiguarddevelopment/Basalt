@@ -16,7 +16,10 @@
 // that these cleanups are load-bearing infrastructure every target gets for free, not a
 // feature a caller has to remember to ask for. Every other mode flag parses into `Config`
 // cleanly and fails with a diagnostic at dispatch time rather than guessing at output (no
-// silently-wrong behavior).
+// silently-wrong behavior). `--llvm`, combined with `--amdgpu-bin`, routes through
+// `basalt-llvm`'s `TargetMachine`-based AMDGCN object emission instead of a hand-rolled
+// backend (there isn't one yet); every other combination of `--llvm` with a mode is a clean
+// refusal, never a silent fallback to the non-LLVM path.
 //
 // Adding a real backend later is meant to be a small change: one new arm in `run`'s match
 // over `Mode`.
@@ -29,6 +32,8 @@ use basalt_backend::{Backend, EmitOpts, Support};
 use basalt_diag::{Diag, ECode, LangTable};
 use basalt_frontend_c::ast::TranslationUnit;
 use basalt_frontend_c::PpOpts;
+#[cfg(feature = "llvm")]
+use basalt_llvm::LlvmAmdgcn;
 use basalt_ptx::Ptx;
 use basalt_x86::{X86Oracle, X86Regalloc};
 
@@ -85,7 +90,9 @@ impl Mode {
 }
 
 /// Parsed CLI state. `-I`/`-D` feed `run_frontend`'s `PpOpts`; `tdf`/`snap` are collected but
-/// still unused until the corresponding tooling lands.
+/// still unused until the corresponding tooling lands. `llvm` is the `--llvm` modifier: paired
+/// with `Mode::AmdgpuBin` it selects the LLVM-backed AMDGCN object-emission path (see `run`);
+/// paired with anything else, `run` refuses cleanly rather than silently ignoring it.
 #[derive(Debug, Default)]
 struct Config {
     mode: Option<Mode>,
@@ -95,6 +102,7 @@ struct Config {
     defines: Vec<String>,
     tdf: bool,
     snap: bool,
+    llvm: bool,
 }
 
 /// Consumes the argument that follows a value-taking flag, erroring with `E101` if there
@@ -135,6 +143,7 @@ fn parse_args(args: &[String], table: &mut LangTable) -> Result<Config, Diag> {
                 }
                 "--tdf" => cfg.tdf = true,
                 "--snap" => cfg.snap = true,
+                "--llvm" => cfg.llvm = true,
                 _ if arg.starts_with('-') => {
                     return Err(Diag::new(ECode::CliUnknownFlag).with_arg(arg));
                 }
@@ -470,6 +479,58 @@ fn run_nvidia_ptx(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--llvm --amdgpu-bin <file>`: same frontend/sema/lower/optimize pipeline as `--cpu`, handed
+/// to `basalt-llvm`'s `TargetMachine`-based AMDGCN object-emission path (`LlvmAmdgcn`) rather
+/// than a hand-rolled backend — there is no hand-rolled `basalt-amdgpu` backend yet (a later
+/// phase), so this is currently the only way `--amdgpu-bin` produces a real artifact, and only
+/// when paired with `--llvm`. `-o` is mandatory, matching `--cpu`'s own object-file convention.
+#[cfg(feature = "llvm")]
+fn run_llvm_amdgpu_bin(
+    input: &Path,
+    output: Option<&Path>,
+    cfg: &Config,
+    table: &LangTable,
+) -> Result<ExitCode, Diag> {
+    let output = output.ok_or_else(|| Diag::new(ECode::CliMissingArgument).with_arg("-o"))?;
+
+    let module = if is_bir_input(input) {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        basalt_bir::parse(&src)
+            .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        let fe = run_frontend(&src, input, cfg);
+        let sema_diags = basalt_sema::check(&fe.tu);
+        let (module, lower_diags) = basalt_sema::lower(&fe.tu);
+
+        for p in &fe.problems {
+            eprintln!("{p}");
+        }
+        for d in sema_diags.iter().chain(lower_diags.iter()) {
+            eprintln!("{}", d.render(table));
+        }
+
+        if fe.has_problems() || !sema_diags.is_empty() || !lower_diags.is_empty() {
+            return Ok(ExitCode::FAILURE);
+        }
+        module
+    };
+    let module = basalt_passes::optimize(&module);
+
+    let backend = LlvmAmdgcn;
+    match backend.supports(&module) {
+        Support::Supported => {}
+        Support::Unsupported(code) => return Err(Diag::new(code).with_arg(backend.name())),
+    }
+
+    let artifact = backend.emit(&module, &EmitOpts::default())?;
+    let bytes = artifact
+        .as_bytes()
+        .expect("LlvmAmdgcn::emit always produces a Payload::Bytes artifact");
+    fs::write(output, bytes).map_err(|e| io_diag(output, e))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Writes `text` to `output` if given, else stdout — the common tail of every mode that
 /// produces a single text artifact.
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
@@ -494,6 +555,11 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
             .as_deref()
             .ok_or_else(|| Diag::new(ECode::CliMissingArgument).with_arg("input file"))
     };
+    // `--llvm` only has a wired path for `Mode::AmdgpuBin`; paired with any other mode it must
+    // refuse outright rather than silently falling through to that mode's non-LLVM behavior.
+    if cfg.llvm && mode != Mode::AmdgpuBin {
+        return Err(Diag::new(ECode::UnsupportedFeature).with_arg("--llvm"));
+    }
     match mode {
         Mode::Ir => run_ir(input()?, cfg.output.as_deref(), cfg, table),
         Mode::Ast => run_ast(input()?, cfg.output.as_deref(), cfg),
@@ -501,6 +567,10 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
         Mode::Cpu => run_cpu(input()?, cfg.output.as_deref(), cfg, table),
         Mode::CpuRegalloc => run_cpu_regalloc(input()?, cfg.output.as_deref(), cfg, table),
         Mode::NvidiaPtx => run_nvidia_ptx(input()?, cfg.output.as_deref(), cfg, table),
+        #[cfg(feature = "llvm")]
+        Mode::AmdgpuBin if cfg.llvm => {
+            run_llvm_amdgpu_bin(input()?, cfg.output.as_deref(), cfg, table)
+        }
         other => Err(Diag::new(ECode::UnsupportedFeature).with_arg(other.flag())),
     }
 }

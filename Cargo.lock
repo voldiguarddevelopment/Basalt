@@ -40,6 +40,7 @@ dependencies = [
  "basalt-ptx",
  "basalt-sema",
  "basalt-x86",
+ "object",
 ]
 
 [[package]]
@@ -65,7 +66,10 @@ dependencies = [
  "basalt-backend",
  "basalt-bir",
  "basalt-diag",
+ "basalt-frontend-c",
+ "basalt-sema",
  "inkwell",
+ "object",
 ]
 
 [[package]]

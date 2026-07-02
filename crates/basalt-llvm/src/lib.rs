@@ -6,7 +6,13 @@
 // present. With the feature off this crate is empty.
 
 #[cfg(feature = "llvm")]
+mod cpu_flatten;
+#[cfg(feature = "llvm")]
+mod emit;
+#[cfg(feature = "llvm")]
 mod lower;
 
+#[cfg(feature = "llvm")]
+pub use emit::{emit_object, LlvmAmdgcn, LlvmTarget};
 #[cfg(feature = "llvm")]
 pub use lower::{lower_module, GpuDialect};

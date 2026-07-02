@@ -5,11 +5,19 @@
 //
 // # Scope
 //
-// Implemented: `const.i`/`const.f`, `Bin` (signed `div`/`rem`, matching the convention
-// already established by `basalt-x86`'s oracle and `basalt-ptx`'s emitter — BIR's `Bin`
-// carries no signed/unsigned distinction, so this lane makes the same documented choice),
-// `icmp`/`fcmp`, `select`, every `CastOp` variant, `load`/`store`, `phi`, every `Term`
-// variant, and the GPU intrinsic surface described below.
+// Implemented: `const.i`/`const.f` (including `basalt-sema`'s local/param/shared/constant
+// address-synthesis idiom, `const.i ptr.<space> N` — an opaque per-function slot key, not a
+// real address; see `build_local_slots`, which gives each distinct key a real `alloca` in the
+// function's entry block, the same pattern `basalt-x86`'s oracle documents and handles with
+// its own per-function frame. A literal `ptr.global` constant, unusual in practice since real
+// global pointers always arrive as parameters, instead becomes a genuine constant `inttoptr`,
+// since LLVM has no integer-literal pointer constant of its own), `Bin` (signed `div`/`rem`,
+// matching the convention already established by `basalt-x86`'s oracle and `basalt-ptx`'s
+// emitter — BIR's `Bin` carries no signed/unsigned distinction, so this lane makes the same
+// documented choice; `add`/`sub` additionally accept a pointer operand, BIR's own
+// address-arithmetic idiom, via `ptrtoint`/`inttoptr` rather than the typed integer path),
+// `icmp`/`fcmp`, `select`, every `CastOp` variant, `load`/`store`, `phi`, every `Term` variant,
+// and the GPU intrinsic surface described below.
 //
 // Refused with `Err(Diag)` rather than guessed at: `Ty::Vec`.
 //
@@ -91,6 +99,8 @@
 // back-edge phi reference a value defined in a block that had not been visited yet when the
 // phi itself was created.
 
+use std::collections::HashMap;
+
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -99,14 +109,14 @@ use inkwell::module::Module as LlvmModule;
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, IntValue,
-    PhiValue,
+    PhiValue, PointerValue,
 };
 use inkwell::AddressSpace;
 use inkwell::{AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate};
 
 use basalt_bir::{
-    AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, Module, Op, Scalar,
-    ShuffleKind, Term, Ty, ValRef,
+    AddrSpace, AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, Module, Op,
+    Scalar, ShuffleKind, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 
@@ -223,6 +233,62 @@ fn get_val<'ctx>(
     }
 }
 
+/// `basalt-sema`'s own address space tags a slot's identity, not the identity of the
+/// discriminant value — this is only ever used as a `HashMap` key alongside the slot's
+/// integer id, so any injective mapping onto a hashable type works. `AddrSpace` itself does
+/// not derive `Hash`.
+fn space_tag(space: AddrSpace) -> u8 {
+    match space {
+        AddrSpace::Global => 0,
+        AddrSpace::Shared => 1,
+        AddrSpace::Constant => 2,
+        AddrSpace::Local => 3,
+        AddrSpace::Param => 4,
+    }
+}
+
+/// Whether `space` is one of `basalt-sema`'s synthesized address spaces, whose `const.i
+/// ptr.<space> N` values are opaque per-function slot keys rather than real addresses — see
+/// `build_local_slots`. `Global` pointers are real addresses from the moment they arrive (a
+/// function parameter, or arithmetic on one) and never take this path.
+fn is_local_like(space: AddrSpace) -> bool {
+    matches!(
+        space,
+        AddrSpace::Local | AddrSpace::Param | AddrSpace::Shared | AddrSpace::Constant
+    )
+}
+
+/// `basalt-sema`'s lowering has no `alloca`: every local/parameter/shared/constant storage
+/// location is handed a small integer slot id and materialized, wherever BIR needs its
+/// address, as `const.i ptr.<space> (slot_id * 65536)` — an opaque per-`(space, id)` key, not
+/// a real address (`basalt-x86`'s oracle documents and handles the identical pattern in its
+/// own module header). This builds one real `alloca` per distinct key used in `f`, in `f`'s
+/// entry block, so `lower_inst`'s `Op::ConstInt` case has genuine backing storage to hand
+/// back instead of treating the opaque key as a literal pointer value (which is simply wrong
+/// on every target: address `0`, `65536`, `131072`, ... are not valid addresses anywhere).
+/// Every slot is a flat 8 bytes, mirroring the oracle's own "uniformly 8 bytes regardless of
+/// the value's real width" scope limit; a local/shared aggregate larger than that is out of
+/// scope for this lowering, matching the oracle.
+fn build_local_slots<'ctx>(
+    ctx: &'ctx Context,
+    builder: &Builder<'ctx>,
+    f: &Function,
+) -> HashMap<(u8, i64), PointerValue<'ctx>> {
+    let mut slots = HashMap::new();
+    for inst in &f.insts {
+        if let (Op::ConstInt(n), Ty::Ptr(space)) = (&inst.op, inst.ty) {
+            if is_local_like(space) {
+                slots.entry((space_tag(space), *n)).or_insert_with(|| {
+                    builder
+                        .build_alloca(ctx.i64_type(), "")
+                        .expect("valid alloca")
+                });
+            }
+        }
+    }
+    slots
+}
+
 fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag> {
     let LowerCtx {
         ctx,
@@ -254,6 +320,12 @@ fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag
         .map(|i| ctx.append_basic_block(llvm_fn, &format!("bb{i}")))
         .collect();
 
+    // Every local/param/shared/constant slot's `alloca` lives at the top of the entry block,
+    // ahead of that block's own instructions, so it dominates every use regardless of which
+    // block references it later.
+    builder.position_at_end(blocks[0]);
+    let local_slots = build_local_slots(ctx, builder, f);
+
     let mut values: Vec<Option<BasicValueEnum<'ctx>>> = vec![None; f.insts.len()];
     let mut phi_fixups: Vec<(PhiValue<'ctx>, Vec<(BlockId, ValRef)>)> = Vec::new();
 
@@ -261,7 +333,7 @@ fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag
         builder.position_at_end(blocks[bi]);
         for &inst_id in &block.insts {
             let inst = &f.insts[inst_id.0 as usize];
-            let val = lower_inst(cx, &params, &values, inst, &mut phi_fixups)?;
+            let val = lower_inst(cx, &params, &values, inst, &mut phi_fixups, &local_slots)?;
             values[inst_id.0 as usize] = val;
         }
         lower_term(builder, &params, &values, &blocks, &block.term);
@@ -282,12 +354,52 @@ fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag
     Ok(())
 }
 
+/// `a + offset`/`a - offset` where `a` (or, for `Add`, `b`) is a pointer: `basalt-sema`'s own
+/// address computations (`base + byte_offset`, the documented mechanism behind BIR's array
+/// indexing) arrive as an ordinary `Bin::Add`/`Bin::Sub` with a pointer-typed operand — BIR
+/// carries no separate "pointer add" op. LLVM's opaque pointers have no arithmetic
+/// instructions of their own, so this round-trips through `ptrtoint`/`inttoptr` at `i64` (the
+/// same raw-address-arithmetic model `basalt-x86`'s oracle already uses for every value,
+/// pointer or not) rather than the typed integer path below.
+fn lower_ptr_offset<'ctx>(
+    ctx: &'ctx Context,
+    builder: &Builder<'ctx>,
+    op: BinOp,
+    ptr: inkwell::values::PointerValue<'ctx>,
+    offset: IntValue<'ctx>,
+) -> BasicValueEnum<'ctx> {
+    let i64t = ctx.i64_type();
+    let base = builder
+        .build_ptr_to_int(ptr, i64t, "")
+        .expect("valid ptrtoint");
+    let addr = match op {
+        BinOp::Add => builder.build_int_add(base, offset, "").expect("valid add"),
+        BinOp::Sub => builder.build_int_sub(base, offset, "").expect("valid sub"),
+        _ => unreachable!("lower_ptr_offset called with a non add/sub BinOp"),
+    };
+    builder
+        .build_int_to_ptr(addr, ptr.get_type(), "")
+        .expect("valid inttoptr")
+        .into()
+}
+
 fn lower_bin<'ctx>(
+    ctx: &'ctx Context,
     builder: &Builder<'ctx>,
     op: BinOp,
     a: BasicValueEnum<'ctx>,
     b: BasicValueEnum<'ctx>,
 ) -> BasicValueEnum<'ctx> {
+    if matches!(op, BinOp::Add | BinOp::Sub) {
+        if let BasicValueEnum::PointerValue(pv) = a {
+            return lower_ptr_offset(ctx, builder, op, pv, b.into_int_value());
+        }
+        if op == BinOp::Add {
+            if let BasicValueEnum::PointerValue(pv) = b {
+                return lower_ptr_offset(ctx, builder, op, pv, a.into_int_value());
+            }
+        }
+    }
     match op {
         BinOp::Add => builder
             .build_int_add(a.into_int_value(), b.into_int_value(), "")
@@ -752,9 +864,32 @@ fn lower_inst<'ctx>(
     values: &[Option<BasicValueEnum<'ctx>>],
     inst: &Inst,
     phi_fixups: &mut Vec<(PhiValue<'ctx>, Vec<(BlockId, ValRef)>)>,
+    local_slots: &HashMap<(u8, i64), PointerValue<'ctx>>,
 ) -> Result<Option<BasicValueEnum<'ctx>>, Diag> {
     let LowerCtx { ctx, builder, .. } = cx;
     let val = match &inst.op {
+        // `basalt-sema`'s own opaque local/param/shared/constant slot key (see
+        // `build_local_slots`): hand back that slot's real `alloca`, never a literal
+        // `inttoptr` of the key itself.
+        Op::ConstInt(v) if matches!(inst.ty, Ty::Ptr(space) if is_local_like(space)) => {
+            let space = match inst.ty {
+                Ty::Ptr(space) => space,
+                _ => unreachable!("guarded by the match arm above"),
+            };
+            let ptr = *local_slots
+                .get(&(space_tag(space), *v))
+                .expect("build_local_slots pre-scans every local-like slot constant");
+            Some(ptr.into())
+        }
+        // A literal `ptr.global` address: real global pointers always arrive as function
+        // parameters or arithmetic on one (see this file's own header), so this is an
+        // unusual case in practice (e.g. a null pointer), handled with a genuine constant
+        // `inttoptr` since LLVM has no integer-literal pointer constant of its own.
+        Op::ConstInt(v) if matches!(inst.ty, Ty::Ptr(_)) => {
+            let ptrty = basic_ty(ctx, inst.ty)?.into_pointer_type();
+            let iv = ctx.i64_type().const_int(*v as u64, true);
+            Some(iv.const_to_pointer(ptrty).into())
+        }
         Op::ConstInt(v) => {
             let ity = basic_ty(ctx, inst.ty)?.into_int_type();
             Some(ity.const_int(*v as u64, true).into())
@@ -766,7 +901,7 @@ fn lower_inst<'ctx>(
         Op::Bin(op, a, b) => {
             let av = get_val(params, values, *a);
             let bv = get_val(params, values, *b);
-            Some(lower_bin(builder, *op, av, bv))
+            Some(lower_bin(ctx, builder, *op, av, bv))
         }
         Op::ICmp(pred, _ty, a, b) => {
             let av = get_val(params, values, *a).into_int_value();
