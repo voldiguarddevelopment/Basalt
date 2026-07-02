@@ -1,19 +1,76 @@
-// BIR -> LLVM IR lowering: core scalar/memory/control-flow ops only. This builds an
-// in-memory `inkwell::module::Module` and nothing else — no `TargetMachine`, no object/
-// bitcode emission. That is later work layered on top of `lower_module`.
+// BIR -> LLVM IR lowering: core scalar/memory/control-flow ops plus the GPU intrinsic
+// surface. This builds an in-memory `inkwell::module::Module` and nothing else — no
+// `TargetMachine`, no object/bitcode emission. That is later work layered on top of
+// `lower_module`.
 //
 // # Scope
 //
 // Implemented: `const.i`/`const.f`, `Bin` (signed `div`/`rem`, matching the convention
 // already established by `basalt-x86`'s oracle and `basalt-ptx`'s emitter — BIR's `Bin`
 // carries no signed/unsigned distinction, so this lane makes the same documented choice),
-// `icmp`/`fcmp`, `select`, every `CastOp` variant, `load`/`store`, `phi`, and every `Term`
-// variant.
+// `icmp`/`fcmp`, `select`, every `CastOp` variant, `load`/`store`, `phi`, every `Term`
+// variant, and the GPU intrinsic surface described below.
 //
-// Refused with `Err(Diag)` rather than guessed at: the twelve GPU index intrinsics
-// (`tid.x`..`gdim.z`), `barrier`, `shuffle.*`, `ballot`/`vote.*`, `atomic`/`atomic.cas`, and
-// `Ty::Vec`. These need target-specific intrinsic mappings (NVPTX/AMDGCN) that a later task
-// owns.
+// Refused with `Err(Diag)` rather than guessed at: `Ty::Vec`.
+//
+// # GPU dialects
+//
+// `llvm.nvvm.*` and `llvm.amdgcn.*` intrinsics are mutually exclusive within one LLVM
+// module — they are tied to whichever target's `TargetMachine` will eventually compile the
+// IR — so `lower_module` takes a `GpuDialect` selecting which family a module's GPU ops lower
+// into. A module with no GPU ops in it never looks at the dialect at all.
+//
+// Every intrinsic name/signature named below was confirmed against a real LLVM 18 install
+// (`Intrinsic::find` resolving, then inspecting the declared function type) rather than
+// assumed from documentation.
+//
+// Thread/block index (`tid.{x,y,z}`, `bid.{x,y,z}`, `bdim.{x,y,z}`, `gdim.{x,y,z}`):
+//   - Nvptx: `llvm.nvvm.read.ptx.sreg.{tid,ctaid,ntid,nctaid}.{x,y,z}`, all `i32 ()`.
+//   - Amdgpu: `llvm.amdgcn.workitem.id.{x,y,z}` for `tid`, `llvm.amdgcn.workgroup.id.{x,y,z}`
+//     for `bid`, both `i32 ()`. `bdim`/`gdim` (workgroup size / grid size) have **no**
+//     no-argument LLVM 18 intrinsic the way NVPTX does — the only path is loading fixed-offset
+//     fields out of `llvm.amdgcn.dispatch.ptr`'s HSA dispatch packet, and that offset layout is
+//     an ABI-version-specific detail this lane is not confident enough in to hardcode. `bdim`/
+//     `gdim` therefore return `Err(Diag)` for `Amdgpu` only; `Nvptx` fully supports all twelve.
+//
+// `barrier`: `llvm.nvvm.barrier0` (`void ()`) on Nvptx, `llvm.amdgcn.s.barrier` (`void ()`) on
+// Amdgpu. Both dialects supported.
+//
+// `shuffle.*`: Nvptx uses `llvm.nvvm.shfl.sync.{idx,up,down,bfly}.i32(mask, val, b, c)` — a
+// full-warp `mask` of `0xffffffff` (BIR carries no narrower mask, matching `basalt-ptx`'s own
+// documented stance), `b` the lane offset/index (BIR's `amt` operand), and `c` the segment
+// clamp, reusing `basalt-ptx`'s own `0x1f`/`0x0` convention so the two backends agree on what
+// "up" means. Implemented for `i32`- and `f32`-typed shuffles (the latter via a bitcast in and
+// out of `i32`); wider/narrower scalar widths would need the multi-word split `basalt-ptx`
+// does and are left as `Err(Diag)`. Amdgpu has no settled mapping — `llvm.amdgcn.ds.bpermute`/
+// `.ds.permute` move data by byte-addressed lane offset rather than BIR's idx/up/down/xor
+// shuffle kinds, and the up/down clamp behavior differs between wave32 and wave64 parts — so
+// `shuffle.*` is `Err(Diag)` for `Amdgpu`.
+//
+// `ballot`/`vote.any`/`vote.all`: BIR's operand is a truthy int (sema coerces a predicate
+// expression to `int`, not `i1`), so every dialect first derives a real `i1` via `icmp ne 0`
+// (a no-op when the operand is already `i1`). Nvptx: `llvm.nvvm.vote.ballot.sync(mask, pred)`
+// -> `i32`, `llvm.nvvm.vote.{any,all}.sync(mask, pred)` -> `i1` (zero/sign-extended to the
+// instruction's declared result width). Amdgpu: `llvm.amdgcn.ballot` is overloaded on its
+// return width (confirmed both an `i32` and an `i64` lane-mask overload resolve), so `ballot`
+// is implemented for both dialects by declaring it at the instruction's own result type.
+// `vote.any`/`vote.all` have no Amdgpu mapping: without a `TargetMachine`/subtarget this file
+// never learns whether the wavefront is 32 or 64 lanes, and "all lanes voted true" only has a
+// definite answer once that width is known — so both are `Err(Diag)` for `Amdgpu`.
+//
+// `atomic`/`atomic.cas`: dialect-independent — `atomicrmw`/`cmpxchg` are target-agnostic LLVM
+// IR instructions, not intrinsics. `atomic` (read-modify-write) covers `i8`/`i16`/`i32`/`i64`
+// through inkwell's `build_atomicrmw`; `Min`/`Max` map to LLVM's *signed* `Min`/`Max` variants,
+// matching this project's uniform signed-arithmetic convention. Floating-point RMW is `Err
+// (Diag)`: LLVM's `atomicrmw` instruction itself supports `fadd`/`fsub`/`fmax`/`fmin`/`xchg` on
+// float operands, but inkwell 0.9's `build_atomicrmw` wrapper is typed to accept only
+// `IntValue` (its own source comments this as unimplemented), and reaching for `unsafe` FFI
+// around that wrapper is out of scope for this lane. `atomic.cas` covers `i8`/`i16`/`i32`/
+// `i64`/`Ty::Ptr` through `build_cmpxchg`, taking the pre-swap value (`cmpxchg`'s struct field
+// 0) as the op's result, matching `basalt-ptx`'s and `basalt-x86`'s documented "raw bit
+// pattern, not a reinterpreted float" semantics for `atomic.cas`. Every atomic uses sequentially
+// consistent ordering — the simplest ordering that is always correct; relaxing it for
+// performance is later work.
 //
 // # Type mapping
 //
@@ -37,29 +94,63 @@
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module as LlvmModule;
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PhiValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, IntValue,
+    PhiValue,
+};
 use inkwell::AddressSpace;
-use inkwell::{FloatPredicate, IntPredicate};
+use inkwell::{AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate};
 
 use basalt_bir::{
-    BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, Module, Op, Scalar, Term, Ty,
-    ValRef,
+    AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, Module, Op, Scalar,
+    ShuffleKind, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 
+/// Which GPU intrinsic dialect a module's `tid.x`/`barrier`/`shuffle.*`/`ballot`/`vote.*`
+/// ops lower into. `llvm.nvvm.*` and `llvm.amdgcn.*` intrinsics are mutually exclusive within
+/// one LLVM module (they are tied to whichever target machine eventually compiles the IR), so
+/// this is a lowering-time choice, not a per-op one — see the module header for exactly what
+/// each dialect supports. A module with no GPU ops in it ignores this parameter entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDialect {
+    Nvptx,
+    Amdgpu,
+}
+
+/// The `ctx`/`llvm_mod`/`builder`/`dialect` quartet every instruction-lowering function needs
+/// at hand, bundled so passing it around doesn't blow out each function's own argument count.
+/// Plain borrows plus a `Copy` tag, so this is itself `Copy` and passed by value throughout.
+#[derive(Clone, Copy)]
+struct LowerCtx<'ctx, 'a> {
+    ctx: &'ctx Context,
+    llvm_mod: &'a LlvmModule<'ctx>,
+    builder: &'a Builder<'ctx>,
+    dialect: GpuDialect,
+}
+
 /// Builds an `inkwell::module::Module` from a BIR `Module`. Every function's blocks and
 /// instructions lower one to one; anything outside this file's documented scope comes back
-/// as `Err(Diag)` rather than a guess.
+/// as `Err(Diag)` rather than a guess. `dialect` selects which GPU intrinsic family a
+/// module's GPU ops (if any) lower into.
 pub fn lower_module<'ctx>(
     module: &Module,
     llvm_ctx: &'ctx Context,
+    dialect: GpuDialect,
 ) -> Result<LlvmModule<'ctx>, Diag> {
     let llvm_mod = llvm_ctx.create_module("basalt");
     let builder = llvm_ctx.create_builder();
+    let cx = LowerCtx {
+        ctx: llvm_ctx,
+        llvm_mod: &llvm_mod,
+        builder: &builder,
+        dialect,
+    };
     for func in &module.funcs {
-        lower_function(llvm_ctx, &llvm_mod, &builder, func)?;
+        lower_function(cx, func)?;
     }
     Ok(llvm_mod)
 }
@@ -120,33 +211,6 @@ fn fcmp_pred(p: FCmpPred) -> FloatPredicate {
     }
 }
 
-/// Mnemonic for a BIR op this file explicitly refuses to lower — used only to build the
-/// `Diag`'s argument text, never matched on.
-fn refused_op_name(op: &Op) -> &'static str {
-    match op {
-        Op::TidX => "tid.x",
-        Op::TidY => "tid.y",
-        Op::TidZ => "tid.z",
-        Op::BidX => "bid.x",
-        Op::BidY => "bid.y",
-        Op::BidZ => "bid.z",
-        Op::BdimX => "bdim.x",
-        Op::BdimY => "bdim.y",
-        Op::BdimZ => "bdim.z",
-        Op::GdimX => "gdim.x",
-        Op::GdimY => "gdim.y",
-        Op::GdimZ => "gdim.z",
-        Op::Barrier => "barrier",
-        Op::Shuffle(..) => "shuffle",
-        Op::Ballot(_) => "ballot",
-        Op::VoteAny(_) => "vote.any",
-        Op::VoteAll(_) => "vote.all",
-        Op::Atomic(..) => "atomic",
-        Op::AtomicCas(..) => "atomic.cas",
-        _ => "unsupported op",
-    }
-}
-
 fn get_val<'ctx>(
     params: &[BasicValueEnum<'ctx>],
     values: &[Option<BasicValueEnum<'ctx>>],
@@ -159,12 +223,13 @@ fn get_val<'ctx>(
     }
 }
 
-fn lower_function<'ctx>(
-    ctx: &'ctx Context,
-    llvm_mod: &LlvmModule<'ctx>,
-    builder: &Builder<'ctx>,
-    f: &Function,
-) -> Result<(), Diag> {
+fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag> {
+    let LowerCtx {
+        ctx,
+        llvm_mod,
+        builder,
+        dialect: _,
+    } = cx;
     let param_tys: Vec<BasicMetadataTypeEnum> = f
         .params
         .iter()
@@ -196,7 +261,7 @@ fn lower_function<'ctx>(
         builder.position_at_end(blocks[bi]);
         for &inst_id in &block.insts {
             let inst = &f.insts[inst_id.0 as usize];
-            let val = lower_inst(ctx, builder, &params, &values, inst, &mut phi_fixups)?;
+            let val = lower_inst(cx, &params, &values, inst, &mut phi_fixups)?;
             values[inst_id.0 as usize] = val;
         }
         lower_term(builder, &params, &values, &blocks, &block.term);
@@ -354,14 +419,341 @@ fn lower_cast<'ctx>(
     }
 }
 
-fn lower_inst<'ctx>(
-    ctx: &'ctx Context,
+// ---- GPU intrinsics ---------------------------------------------------------------------
+//
+// See the module header for exactly which ops/dialects are supported and why the gaps are
+// gaps. `declare_intrinsic`/`call_intrinsic` do the `Intrinsic::find` + `get_declaration` +
+// `build_call` dance every op below needs; a missing intrinsic there is a mismatch between
+// this file's documented names and the LLVM this crate was built against, not a normal BIR
+// lowering failure, so it panics like this file's other "should never happen given a
+// well-formed module" invariants rather than threading another `Result` layer through.
+
+fn declare_intrinsic<'ctx>(
+    llvm_mod: &LlvmModule<'ctx>,
+    name: &str,
+    overload_tys: &[BasicTypeEnum<'ctx>],
+) -> FunctionValue<'ctx> {
+    Intrinsic::find(name)
+        .and_then(|intr| intr.get_declaration(llvm_mod, overload_tys))
+        .unwrap_or_else(|| panic!("intrinsic `{name}` not available in this LLVM build"))
+}
+
+fn call_intrinsic<'ctx>(
+    llvm_mod: &LlvmModule<'ctx>,
     builder: &Builder<'ctx>,
+    name: &str,
+    overload_tys: &[BasicTypeEnum<'ctx>],
+    args: &[BasicMetadataValueEnum<'ctx>],
+) -> CallSiteValue<'ctx> {
+    let f = declare_intrinsic(llvm_mod, name, overload_tys);
+    builder
+        .build_call(f, args, "")
+        .expect("valid intrinsic call")
+}
+
+fn adapt_int_width<'ctx>(
+    builder: &Builder<'ctx>,
+    v: IntValue<'ctx>,
+    dst: IntType<'ctx>,
+) -> IntValue<'ctx> {
+    let (sw, dw) = (v.get_type().get_bit_width(), dst.get_bit_width());
+    match sw.cmp(&dw) {
+        std::cmp::Ordering::Equal => v,
+        std::cmp::Ordering::Less => builder.build_int_z_extend(v, dst, "").expect("valid zext"),
+        std::cmp::Ordering::Greater => builder.build_int_truncate(v, dst, "").expect("valid trunc"),
+    }
+}
+
+/// Predicate operands to `ballot`/`vote.any`/`vote.all` arrive as a truthy `int` (sema coerces
+/// a boolean expression to `int`, never to a bare `i1`), so every dialect needs a real `i1`
+/// before it can feed a vote/ballot intrinsic. Already-`i1` operands pass through unchanged.
+fn to_i1_pred<'ctx>(builder: &Builder<'ctx>, v: BasicValueEnum<'ctx>) -> IntValue<'ctx> {
+    let iv = v.into_int_value();
+    if iv.get_type().get_bit_width() == 1 {
+        iv
+    } else {
+        let zero = iv.get_type().const_zero();
+        builder
+            .build_int_compare(IntPredicate::NE, iv, zero, "")
+            .expect("valid predicate compare")
+    }
+}
+
+fn lower_gpu_index<'ctx>(cx: LowerCtx<'ctx, '_>, op: &Op) -> Result<BasicValueEnum<'ctx>, Diag> {
+    let LowerCtx {
+        llvm_mod,
+        builder,
+        dialect,
+        ..
+    } = cx;
+    let name = match (dialect, op) {
+        (GpuDialect::Nvptx, Op::TidX) => "llvm.nvvm.read.ptx.sreg.tid.x",
+        (GpuDialect::Nvptx, Op::TidY) => "llvm.nvvm.read.ptx.sreg.tid.y",
+        (GpuDialect::Nvptx, Op::TidZ) => "llvm.nvvm.read.ptx.sreg.tid.z",
+        (GpuDialect::Nvptx, Op::BidX) => "llvm.nvvm.read.ptx.sreg.ctaid.x",
+        (GpuDialect::Nvptx, Op::BidY) => "llvm.nvvm.read.ptx.sreg.ctaid.y",
+        (GpuDialect::Nvptx, Op::BidZ) => "llvm.nvvm.read.ptx.sreg.ctaid.z",
+        (GpuDialect::Nvptx, Op::BdimX) => "llvm.nvvm.read.ptx.sreg.ntid.x",
+        (GpuDialect::Nvptx, Op::BdimY) => "llvm.nvvm.read.ptx.sreg.ntid.y",
+        (GpuDialect::Nvptx, Op::BdimZ) => "llvm.nvvm.read.ptx.sreg.ntid.z",
+        (GpuDialect::Nvptx, Op::GdimX) => "llvm.nvvm.read.ptx.sreg.nctaid.x",
+        (GpuDialect::Nvptx, Op::GdimY) => "llvm.nvvm.read.ptx.sreg.nctaid.y",
+        (GpuDialect::Nvptx, Op::GdimZ) => "llvm.nvvm.read.ptx.sreg.nctaid.z",
+        (GpuDialect::Amdgpu, Op::TidX) => "llvm.amdgcn.workitem.id.x",
+        (GpuDialect::Amdgpu, Op::TidY) => "llvm.amdgcn.workitem.id.y",
+        (GpuDialect::Amdgpu, Op::TidZ) => "llvm.amdgcn.workitem.id.z",
+        (GpuDialect::Amdgpu, Op::BidX) => "llvm.amdgcn.workgroup.id.x",
+        (GpuDialect::Amdgpu, Op::BidY) => "llvm.amdgcn.workgroup.id.y",
+        (GpuDialect::Amdgpu, Op::BidZ) => "llvm.amdgcn.workgroup.id.z",
+        (
+            GpuDialect::Amdgpu,
+            Op::BdimX | Op::BdimY | Op::BdimZ | Op::GdimX | Op::GdimY | Op::GdimZ,
+        ) => {
+            return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                "block/grid dimension on the amdgpu dialect: no no-argument LLVM 18 \
+                 intrinsic exists (would need an HSA-ABI-version-specific field load out of \
+                 llvm.amdgcn.dispatch.ptr, which this lane is not confident enough in to emit)",
+            ));
+        }
+        _ => unreachable!("lower_gpu_index called with a non-index op"),
+    };
+    Ok(call_intrinsic(llvm_mod, builder, name, &[], &[])
+        .try_as_basic_value()
+        .expect_basic("index intrinsic returns i32"))
+}
+
+fn lower_barrier<'ctx>(cx: LowerCtx<'ctx, '_>) {
+    let LowerCtx {
+        llvm_mod,
+        builder,
+        dialect,
+        ..
+    } = cx;
+    let name = match dialect {
+        GpuDialect::Nvptx => "llvm.nvvm.barrier0",
+        GpuDialect::Amdgpu => "llvm.amdgcn.s.barrier",
+    };
+    call_intrinsic(llvm_mod, builder, name, &[], &[]);
+}
+
+fn lower_shuffle<'ctx>(
+    cx: LowerCtx<'ctx, '_>,
+    kind: ShuffleKind,
+    val: BasicValueEnum<'ctx>,
+    amt: BasicValueEnum<'ctx>,
+    ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, Diag> {
+    let LowerCtx {
+        ctx,
+        llvm_mod,
+        builder,
+        dialect,
+    } = cx;
+    if dialect == GpuDialect::Amdgpu {
+        return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+            "shuffle on the amdgpu dialect: ds_bpermute/ds_permute move data by byte-addressed \
+             lane offset rather than BIR's idx/up/down/xor kinds, and up/down clamp behavior \
+             differs between wave32 and wave64 parts, so there is no settled mapping here",
+        ));
+    }
+    let mode_suffix = match kind {
+        ShuffleKind::Idx => "idx",
+        ShuffleKind::Up => "up",
+        ShuffleKind::Down => "down",
+        ShuffleKind::Xor => "bfly",
+    };
+    // Segment mask/clamp operand: `0x1f` is "whole warp"; `up` clamps at the lowest source
+    // lane (`0`) rather than the highest, matching `basalt-ptx`'s own documented convention.
+    let clamp = if kind == ShuffleKind::Up { 0x0 } else { 0x1f };
+    let name = format!("llvm.nvvm.shfl.sync.{mode_suffix}.i32");
+    let i32t = ctx.i32_type();
+    let mask = i32t.const_int(0xffffffff, false);
+    let amt_i32 = amt.into_int_value();
+    let clamp_v = i32t.const_int(clamp, false);
+    let raw_val = match ty {
+        Ty::Scalar(Scalar::I32) => val.into_int_value(),
+        Ty::Scalar(Scalar::F32) => builder
+            .build_bit_cast(val, i32t, "")
+            .expect("valid bitcast")
+            .into_int_value(),
+        _ => {
+            return Err(Diag::new(ECode::UnsupportedType).with_arg(
+                "shuffle on the nvptx dialect is implemented only for 32-bit-wide scalar \
+                 values (i32/f32) in this lane; wider/narrower widths need the multi-word \
+                 split basalt-ptx does, which this lane does not yet replicate",
+            ))
+        }
+    };
+    let args: [BasicMetadataValueEnum; 4] =
+        [mask.into(), raw_val.into(), amt_i32.into(), clamp_v.into()];
+    let result = call_intrinsic(llvm_mod, builder, &name, &[], &args)
+        .try_as_basic_value()
+        .expect_basic("shfl.sync intrinsic returns i32");
+    Ok(match ty {
+        Ty::Scalar(Scalar::F32) => builder
+            .build_bit_cast(result, ctx.f32_type(), "")
+            .expect("valid bitcast"),
+        _ => result,
+    })
+}
+
+fn lower_ballot<'ctx>(
+    cx: LowerCtx<'ctx, '_>,
+    pred: BasicValueEnum<'ctx>,
+    dst_ty: BasicTypeEnum<'ctx>,
+) -> BasicValueEnum<'ctx> {
+    let LowerCtx {
+        ctx,
+        llvm_mod,
+        builder,
+        dialect,
+    } = cx;
+    let p = to_i1_pred(builder, pred);
+    let raw = match dialect {
+        GpuDialect::Nvptx => {
+            let mask = ctx.i32_type().const_int(0xffffffff, false);
+            call_intrinsic(
+                llvm_mod,
+                builder,
+                "llvm.nvvm.vote.ballot.sync",
+                &[],
+                &[mask.into(), p.into()],
+            )
+            .try_as_basic_value()
+            .expect_basic("vote.ballot.sync returns i32")
+            .into_int_value()
+        }
+        GpuDialect::Amdgpu => {
+            // Overloaded on its own return width, so declaring it at `dst_ty` sidesteps the
+            // wave32-vs-wave64 question entirely: the lane mask comes back exactly as wide as
+            // BIR asked for.
+            call_intrinsic(
+                llvm_mod,
+                builder,
+                "llvm.amdgcn.ballot",
+                &[dst_ty],
+                &[p.into()],
+            )
+            .try_as_basic_value()
+            .expect_basic("amdgcn.ballot returns an integer lane mask")
+            .into_int_value()
+        }
+    };
+    adapt_int_width(builder, raw, dst_ty.into_int_type()).into()
+}
+
+fn lower_vote<'ctx>(
+    cx: LowerCtx<'ctx, '_>,
+    all: bool,
+    pred: BasicValueEnum<'ctx>,
+    dst_ty: BasicTypeEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, Diag> {
+    let LowerCtx {
+        ctx,
+        llvm_mod,
+        builder,
+        dialect,
+    } = cx;
+    if dialect == GpuDialect::Amdgpu {
+        let mnemonic = if all { "vote.all" } else { "vote.any" };
+        return Err(Diag::new(ECode::UnsupportedOp).with_arg(format!(
+            "{mnemonic} on the amdgpu dialect: \"every/any lane voted true\" only has a \
+             definite answer once the wavefront width (32 or 64) is known, and this file \
+             builds plain LLVM IR with no TargetMachine/subtarget to learn that from"
+        )));
+    }
+    let p = to_i1_pred(builder, pred);
+    let mask = ctx.i32_type().const_int(0xffffffff, false);
+    let name = if all {
+        "llvm.nvvm.vote.all.sync"
+    } else {
+        "llvm.nvvm.vote.any.sync"
+    };
+    let raw = call_intrinsic(llvm_mod, builder, name, &[], &[mask.into(), p.into()])
+        .try_as_basic_value()
+        .expect_basic("vote.{any,all}.sync returns i1")
+        .into_int_value();
+    Ok(adapt_int_width(builder, raw, dst_ty.into_int_type()).into())
+}
+
+fn atomic_rmw_binop(op: AtomicOp) -> AtomicRMWBinOp {
+    match op {
+        AtomicOp::Add => AtomicRMWBinOp::Add,
+        AtomicOp::Sub => AtomicRMWBinOp::Sub,
+        AtomicOp::Exch => AtomicRMWBinOp::Xchg,
+        // Signed, matching this project's uniform signed-arithmetic convention (see the
+        // module header and `lower_bin`'s `Div`/`Rem`).
+        AtomicOp::Min => AtomicRMWBinOp::Min,
+        AtomicOp::Max => AtomicRMWBinOp::Max,
+        AtomicOp::And => AtomicRMWBinOp::And,
+        AtomicOp::Or => AtomicRMWBinOp::Or,
+        AtomicOp::Xor => AtomicRMWBinOp::Xor,
+    }
+}
+
+fn lower_atomic<'ctx>(
+    builder: &Builder<'ctx>,
+    op: AtomicOp,
+    ptr: BasicValueEnum<'ctx>,
+    val: BasicValueEnum<'ctx>,
+    ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, Diag> {
+    match ty {
+        Ty::Scalar(Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64) => Ok(builder
+            .build_atomicrmw(
+                atomic_rmw_binop(op),
+                ptr.into_pointer_value(),
+                val.into_int_value(),
+                AtomicOrdering::SequentiallyConsistent,
+            )
+            .expect("valid atomicrmw")
+            .into()),
+        _ => Err(Diag::new(ECode::UnsupportedType).with_arg(
+            "atomic rmw on this type: LLVM's atomicrmw instruction itself supports \
+             float operands (fadd/fsub/fmax/fmin/xchg), but inkwell 0.9's build_atomicrmw \
+             wrapper only accepts an IntValue, and this lane does not reach for unsafe FFI \
+             to work around that",
+        )),
+    }
+}
+
+fn lower_atomic_cas<'ctx>(
+    builder: &Builder<'ctx>,
+    ptr: BasicValueEnum<'ctx>,
+    cmp: BasicValueEnum<'ctx>,
+    newv: BasicValueEnum<'ctx>,
+    ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, Diag> {
+    match ty {
+        Ty::Scalar(Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64) | Ty::Ptr(_) => {
+            let swap = builder
+                .build_cmpxchg(
+                    ptr.into_pointer_value(),
+                    cmp,
+                    newv,
+                    AtomicOrdering::SequentiallyConsistent,
+                    AtomicOrdering::SequentiallyConsistent,
+                )
+                .expect("valid cmpxchg");
+            Ok(builder
+                .build_extract_value(swap, 0, "")
+                .expect("cmpxchg's result struct has the pre-swap value at field 0"))
+        }
+        _ => Err(Diag::new(ECode::UnsupportedType).with_arg(
+            "atomic.cas on this type: only integer/pointer compare-and-swap is implemented \
+             in this lane",
+        )),
+    }
+}
+
+fn lower_inst<'ctx>(
+    cx: LowerCtx<'ctx, '_>,
     params: &[BasicValueEnum<'ctx>],
     values: &[Option<BasicValueEnum<'ctx>>],
     inst: &Inst,
     phi_fixups: &mut Vec<(PhiValue<'ctx>, Vec<(BlockId, ValRef)>)>,
 ) -> Result<Option<BasicValueEnum<'ctx>>, Diag> {
+    let LowerCtx { ctx, builder, .. } = cx;
     let val = match &inst.op {
         Op::ConstInt(v) => {
             let ity = basic_ty(ctx, inst.ty)?.into_int_type();
@@ -428,8 +820,52 @@ fn lower_inst<'ctx>(
             phi_fixups.push((phi, incoming.clone()));
             Some(phi.as_basic_value())
         }
-        other => {
-            return Err(Diag::new(ECode::UnsupportedOp).with_arg(refused_op_name(other)));
+        Op::TidX
+        | Op::TidY
+        | Op::TidZ
+        | Op::BidX
+        | Op::BidY
+        | Op::BidZ
+        | Op::BdimX
+        | Op::BdimY
+        | Op::BdimZ
+        | Op::GdimX
+        | Op::GdimY
+        | Op::GdimZ => Some(lower_gpu_index(cx, &inst.op)?),
+        Op::Barrier => {
+            lower_barrier(cx);
+            None
+        }
+        Op::Shuffle(kind, val, amt) => {
+            let vv = get_val(params, values, *val);
+            let av = get_val(params, values, *amt);
+            Some(lower_shuffle(cx, *kind, vv, av, inst.ty)?)
+        }
+        Op::Ballot(v) => {
+            let pv = get_val(params, values, *v);
+            let dst_ty = basic_ty(ctx, inst.ty)?;
+            Some(lower_ballot(cx, pv, dst_ty))
+        }
+        Op::VoteAny(v) => {
+            let pv = get_val(params, values, *v);
+            let dst_ty = basic_ty(ctx, inst.ty)?;
+            Some(lower_vote(cx, false, pv, dst_ty)?)
+        }
+        Op::VoteAll(v) => {
+            let pv = get_val(params, values, *v);
+            let dst_ty = basic_ty(ctx, inst.ty)?;
+            Some(lower_vote(cx, true, pv, dst_ty)?)
+        }
+        Op::Atomic(op, ptr, val, _space) => {
+            let pv = get_val(params, values, *ptr);
+            let vv = get_val(params, values, *val);
+            Some(lower_atomic(builder, *op, pv, vv, inst.ty)?)
+        }
+        Op::AtomicCas(ptr, cmp, newv, _space) => {
+            let pv = get_val(params, values, *ptr);
+            let cv = get_val(params, values, *cmp);
+            let nv = get_val(params, values, *newv);
+            Some(lower_atomic_cas(builder, pv, cv, nv, inst.ty)?)
         }
     };
     Ok(val)

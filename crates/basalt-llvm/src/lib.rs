@@ -9,4 +9,4 @@
 mod lower;
 
 #[cfg(feature = "llvm")]
-pub use lower::lower_module;
+pub use lower::{lower_module, GpuDialect};

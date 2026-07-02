@@ -39,7 +39,7 @@ fn trivial_function_returns_a_constant() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
     let text = llvm_mod.print_to_string().to_string();
     assert!(text.contains("define i32 @answer()"));
@@ -64,7 +64,7 @@ fn arithmetic_and_return() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
     let text = llvm_mod.print_to_string().to_string();
     assert!(text.contains("add i32"));
@@ -95,7 +95,7 @@ fn signed_div_and_rem_use_the_signed_convention() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
     let text = llvm_mod.print_to_string().to_string();
     assert!(text.contains("sdiv i32"));
@@ -167,7 +167,7 @@ fn if_else_with_merge_block_phi() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
     let text = llvm_mod.print_to_string().to_string();
     assert!(text.contains("phi i32"));
@@ -239,7 +239,7 @@ fn every_cast_op_variant_lowers_and_verifies() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
     let text = llvm_mod.print_to_string().to_string();
     for mnemonic in [
@@ -271,7 +271,7 @@ fn bitcast_between_identical_llvm_types_is_a_value_passthrough() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
 }
 
@@ -312,33 +312,11 @@ fn load_and_store_round_trip() {
     };
 
     let ctx = Context::create();
-    let llvm_mod = lower_module(&wrap(f), &ctx).expect("lowering succeeds");
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
     llvm_mod.verify().expect("module verifies");
     let text = llvm_mod.print_to_string().to_string();
     assert!(text.contains("load i32"));
     assert!(text.contains("store i32"));
-}
-
-#[test]
-fn out_of_scope_gpu_index_op_is_a_clean_refusal_not_a_panic() {
-    let i32t = Ty::Scalar(Scalar::I32);
-    let f = Function {
-        name: "usesthreadidx".into(),
-        params: vec![],
-        ret: i32t,
-        insts: vec![Inst {
-            ty: i32t,
-            op: Op::TidX,
-        }],
-        blocks: vec![Block {
-            insts: ids(1),
-            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
-        }],
-    };
-
-    let ctx = Context::create();
-    let err = lower_module(&wrap(f), &ctx).expect_err("tid.x is out of scope for this lane");
-    assert_eq!(err.code, ECode::UnsupportedOp);
 }
 
 #[test]
@@ -356,7 +334,406 @@ fn out_of_scope_vector_type_is_a_clean_refusal_not_a_panic() {
     };
 
     let ctx = Context::create();
-    let err =
-        lower_module(&wrap(f), &ctx).expect_err("vector types are out of scope for this lane");
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx)
+        .expect_err("vector types are out of scope for this lane");
     assert_eq!(err.code, ECode::UnsupportedType);
+}
+
+fn tid_x_fn(i32t: Ty) -> Function {
+    Function {
+        name: "usesthreadidx".into(),
+        params: vec![],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::TidX,
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    }
+}
+
+#[test]
+fn nvptx_tid_x_lowers_to_the_nvvm_sreg_intrinsic() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ctx = Context::create();
+    let llvm_mod =
+        lower_module(&wrap(tid_x_fn(i32t)), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("call i32 @llvm.nvvm.read.ptx.sreg.tid.x()"),
+        "{text}"
+    );
+}
+
+#[test]
+fn amdgpu_tid_x_lowers_to_the_amdgcn_workitem_intrinsic() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ctx = Context::create();
+    let llvm_mod =
+        lower_module(&wrap(tid_x_fn(i32t)), &ctx, GpuDialect::Amdgpu).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("call i32 @llvm.amdgcn.workitem.id.x()"),
+        "{text}"
+    );
+}
+
+#[test]
+fn amdgpu_block_dim_is_a_clean_refusal_not_a_panic() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f = Function {
+        name: "usesblockdim".into(),
+        params: vec![],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::BdimX,
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Amdgpu)
+        .expect_err("bdim.x has no confident amdgpu mapping in this lane");
+    assert_eq!(err.code, ECode::UnsupportedOp);
+}
+
+#[test]
+fn nvptx_barrier_lowers_to_barrier0() {
+    let f = Function {
+        name: "syncs".into(),
+        params: vec![],
+        ret: Ty::Void,
+        insts: vec![Inst {
+            ty: Ty::Void,
+            op: Op::Barrier,
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(None),
+        }],
+    };
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(text.contains("call void @llvm.nvvm.barrier0()"), "{text}");
+}
+
+#[test]
+fn amdgpu_barrier_lowers_to_s_barrier() {
+    let f = Function {
+        name: "syncs".into(),
+        params: vec![],
+        ret: Ty::Void,
+        insts: vec![Inst {
+            ty: Ty::Void,
+            op: Op::Barrier,
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(None),
+        }],
+    };
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Amdgpu).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("call void @llvm.amdgcn.s.barrier()"),
+        "{text}"
+    );
+}
+
+#[test]
+fn nvptx_shuffle_idx_lowers_to_shfl_sync() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f = Function {
+        name: "shuf".into(),
+        params: vec![i32t, i32t],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::Shuffle(ShuffleKind::Idx, ValRef::Param(0), ValRef::Param(1)),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("call i32 @llvm.nvvm.shfl.sync.idx.i32("),
+        "{text}"
+    );
+}
+
+#[test]
+fn amdgpu_shuffle_is_a_clean_refusal_not_a_panic() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f = Function {
+        name: "shuf".into(),
+        params: vec![i32t, i32t],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::Shuffle(ShuffleKind::Xor, ValRef::Param(0), ValRef::Param(1)),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Amdgpu)
+        .expect_err("shuffle has no settled amdgpu mapping in this lane");
+    assert_eq!(err.code, ECode::UnsupportedOp);
+}
+
+fn ballot_fn(i32t: Ty) -> Function {
+    Function {
+        name: "votes".into(),
+        params: vec![i32t],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::Ballot(ValRef::Param(0)),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    }
+}
+
+#[test]
+fn nvptx_ballot_lowers_to_vote_ballot_sync() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ctx = Context::create();
+    let llvm_mod =
+        lower_module(&wrap(ballot_fn(i32t)), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("call i32 @llvm.nvvm.vote.ballot.sync("),
+        "{text}"
+    );
+    // The truthy i32 predicate operand must be turned into a real i1 before the call.
+    assert!(text.contains("icmp ne i32"), "{text}");
+}
+
+#[test]
+fn amdgpu_ballot_lowers_to_amdgcn_ballot_at_the_requested_width() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ctx = Context::create();
+    let llvm_mod =
+        lower_module(&wrap(ballot_fn(i32t)), &ctx, GpuDialect::Amdgpu).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(text.contains("call i32 @llvm.amdgcn.ballot.i32("), "{text}");
+}
+
+#[test]
+fn nvptx_vote_any_and_all_lower_and_verify() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f = Function {
+        name: "votes".into(),
+        params: vec![i32t],
+        ret: i32t,
+        insts: vec![
+            Inst {
+                ty: i32t,
+                op: Op::VoteAny(ValRef::Param(0)),
+            },
+            Inst {
+                ty: i32t,
+                op: Op::VoteAll(ValRef::Param(0)),
+            },
+            Inst {
+                ty: i32t,
+                op: Op::Bin(BinOp::Add, ValRef::Val(InstId(0)), ValRef::Val(InstId(1))),
+            },
+        ],
+        blocks: vec![Block {
+            insts: ids(3),
+            term: Term::Ret(Some(ValRef::Val(InstId(2)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(text.contains("call i1 @llvm.nvvm.vote.any.sync("), "{text}");
+    assert!(text.contains("call i1 @llvm.nvvm.vote.all.sync("), "{text}");
+}
+
+#[test]
+fn amdgpu_vote_any_is_a_clean_refusal_not_a_panic() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f = Function {
+        name: "votes".into(),
+        params: vec![i32t],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::VoteAny(ValRef::Param(0)),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Amdgpu)
+        .expect_err("vote.any has no settled amdgpu mapping in this lane");
+    assert_eq!(err.code, ECode::UnsupportedOp);
+}
+
+/// Atomics lower through target-agnostic `atomicrmw`/`cmpxchg` IR, not intrinsics, so the
+/// same code path must produce valid IR under either `GpuDialect`.
+#[test]
+fn atomic_add_lowers_identically_regardless_of_dialect() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
+    let f = Function {
+        name: "bump".into(),
+        params: vec![ptrt],
+        ret: i32t,
+        insts: vec![
+            Inst {
+                ty: i32t,
+                op: Op::ConstInt(1),
+            },
+            Inst {
+                ty: i32t,
+                op: Op::Atomic(
+                    AtomicOp::Add,
+                    ValRef::Param(0),
+                    ValRef::Val(InstId(0)),
+                    basalt_bir::AddrSpace::Global,
+                ),
+            },
+        ],
+        blocks: vec![Block {
+            insts: ids(2),
+            term: Term::Ret(Some(ValRef::Val(InstId(1)))),
+        }],
+    };
+
+    for dialect in [GpuDialect::Nvptx, GpuDialect::Amdgpu] {
+        let ctx = Context::create();
+        let llvm_mod = lower_module(&wrap(f.clone()), &ctx, dialect).expect("lowering succeeds");
+        llvm_mod.verify().expect("module verifies");
+        let text = llvm_mod.print_to_string().to_string();
+        assert!(text.contains("atomicrmw add ptr"), "{text}");
+    }
+}
+
+#[test]
+fn atomic_min_uses_the_signed_atomicrmw_variant() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
+    let f = Function {
+        name: "clampmin".into(),
+        params: vec![ptrt, i32t],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::Atomic(
+                AtomicOp::Min,
+                ValRef::Param(0),
+                ValRef::Param(1),
+                basalt_bir::AddrSpace::Global,
+            ),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(text.contains("atomicrmw min ptr"), "{text}");
+}
+
+#[test]
+fn atomic_rmw_on_a_float_type_is_a_clean_refusal_not_a_panic() {
+    let f32t = Ty::Scalar(Scalar::F32);
+    let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
+    let f = Function {
+        name: "faddatomic".into(),
+        params: vec![ptrt, f32t],
+        ret: f32t,
+        insts: vec![Inst {
+            ty: f32t,
+            op: Op::Atomic(
+                AtomicOp::Add,
+                ValRef::Param(0),
+                ValRef::Param(1),
+                basalt_bir::AddrSpace::Global,
+            ),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx)
+        .expect_err("float atomicrmw is out of reach of inkwell 0.9's typed wrapper");
+    assert_eq!(err.code, ECode::UnsupportedType);
+}
+
+#[test]
+fn atomic_cas_lowers_to_cmpxchg_and_extracts_the_old_value() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
+    let f = Function {
+        name: "cas".into(),
+        params: vec![ptrt, i32t, i32t],
+        ret: i32t,
+        insts: vec![Inst {
+            ty: i32t,
+            op: Op::AtomicCas(
+                ValRef::Param(0),
+                ValRef::Param(1),
+                ValRef::Param(2),
+                basalt_bir::AddrSpace::Global,
+            ),
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+        }],
+    };
+
+    for dialect in [GpuDialect::Nvptx, GpuDialect::Amdgpu] {
+        let ctx = Context::create();
+        let llvm_mod = lower_module(&wrap(f.clone()), &ctx, dialect).expect("lowering succeeds");
+        llvm_mod.verify().expect("module verifies");
+        let text = llvm_mod.print_to_string().to_string();
+        assert!(text.contains("cmpxchg ptr"), "{text}");
+        assert!(text.contains("extractvalue"), "{text}");
+    }
 }
