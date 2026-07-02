@@ -137,6 +137,13 @@ pub struct HsacoSpec {
     /// `with_kernarg_segment`) turns this on automatically; call sites with a nonstandard
     /// calling convention can still override it directly.
     pub enable_sgpr_kernarg_segment_ptr: bool,
+    /// Whether the kernel body expects its X/Y/Z workgroup (block) index preloaded into the
+    /// next user SGPR(s) after the kernarg pointer (`s2`, `s3`, `s4` in order, skipping any
+    /// axis left disabled — real hardware only reserves an SGPR for an axis actually
+    /// requested). Set via `with_workgroup_ids`.
+    pub enable_sgpr_workgroup_id_x: bool,
+    pub enable_sgpr_workgroup_id_y: bool,
+    pub enable_sgpr_workgroup_id_z: bool,
 }
 
 impl HsacoSpec {
@@ -157,6 +164,9 @@ impl HsacoSpec {
             vgpr_spill_count: 0,
             sgpr_spill_count: 0,
             enable_sgpr_kernarg_segment_ptr: false,
+            enable_sgpr_workgroup_id_x: false,
+            enable_sgpr_workgroup_id_y: false,
+            enable_sgpr_workgroup_id_z: false,
         }
     }
 
@@ -172,6 +182,17 @@ impl HsacoSpec {
     pub fn with_segments(mut self, group_fixed_size: u32, private_fixed_size: u32) -> HsacoSpec {
         self.group_segment_fixed_size = group_fixed_size;
         self.private_segment_fixed_size = private_fixed_size;
+        self
+    }
+
+    /// Requests the workgroup index (x, y, z) be preloaded into a user SGPR per enabled axis,
+    /// in order, right after the kernarg-pointer pair — the real hardware/kernel-descriptor
+    /// mechanism `Op::BidX`/`BidY`/`BidZ` lower against (see `lower.rs`'s own header).
+    #[must_use]
+    pub fn with_workgroup_ids(mut self, x: bool, y: bool, z: bool) -> HsacoSpec {
+        self.enable_sgpr_workgroup_id_x = x;
+        self.enable_sgpr_workgroup_id_y = y;
+        self.enable_sgpr_workgroup_id_z = z;
         self
     }
 
@@ -217,6 +238,15 @@ fn kd_bytes(spec: &HsacoSpec) -> [u8; 64] {
         0
     };
     rsrc2 |= (user_sgpr_count & 0x1f) << 1;
+    if spec.enable_sgpr_workgroup_id_x {
+        rsrc2 |= 1 << 7;
+    }
+    if spec.enable_sgpr_workgroup_id_y {
+        rsrc2 |= 1 << 8;
+    }
+    if spec.enable_sgpr_workgroup_id_z {
+        rsrc2 |= 1 << 9;
+    }
 
     let mut code_properties: u16 = 1 << 10; // ENABLE_WAVEFRONT_SIZE32, always set: wave32-only.
     if spec.enable_sgpr_kernarg_segment_ptr {
@@ -702,5 +732,18 @@ mod tests {
         assert_eq!(code_properties & (1 << 3), 1 << 3);
         let kernarg_size = u32::from_le_bytes([rodata[8], rodata[9], rodata[10], rodata[11]]);
         assert_eq!(kernarg_size, 16);
+    }
+
+    #[test]
+    fn workgroup_ids_set_the_matching_rsrc2_bits() {
+        let spec = HsacoSpec::new(GfxArch::Gfx1100, "with_bid", crate::enc::s_endpgm())
+            .with_workgroup_ids(true, false, true);
+        let bytes = write_hsaco(&spec).unwrap();
+        let file = object::read::File::parse(&*bytes).unwrap();
+        let rodata = file.section_by_name(".rodata").unwrap().data().unwrap();
+        let rsrc2 = u32::from_le_bytes([rodata[52], rodata[53], rodata[54], rodata[55]]);
+        assert_eq!(rsrc2 & (1 << 7), 1 << 7, "workgroup id x enabled");
+        assert_eq!(rsrc2 & (1 << 8), 0, "workgroup id y left disabled");
+        assert_eq!(rsrc2 & (1 << 9), 1 << 9, "workgroup id z enabled");
     }
 }

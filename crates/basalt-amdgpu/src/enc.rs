@@ -436,7 +436,10 @@ pub fn s_cbranch(cc: BrCc, offset_words: i16) -> Vec<u8> {
 //
 // `[31]=0` (fixed) `[30:25]=OP(6)` `[24:17]=VDST(8)` `[16:9]=VSRC1(8, always a VGPR)`
 // `[8:0]=SRC0(9)`. `CndmaskB32` (vector select) reads/writes `vcc_lo` implicitly — it is not
-// an encoded operand, matching hardware — so it fits this same 2-operand shape.
+// an encoded operand, matching hardware — so it fits this same 2-operand shape. `AddCoCiU32`
+// (carry-in *and* carry-out, both implicit through `vcc_lo`, just like `CndmaskB32`'s implicit
+// `vcc_lo` read) is this same shape too: `dst := src0 + vsrc1 + vcc_lo`, `vcc_lo := carry-out`.
+// It is the second half of a 64-bit add (see `vop3_carry`'s own header for the pairing).
 
 #[derive(Clone, Copy)]
 pub enum Vop2Op {
@@ -459,6 +462,7 @@ pub enum Vop2Op {
     XorB32,
     AddNcU32,
     SubNcU32,
+    AddCoCiU32,
 }
 
 impl Vop2Op {
@@ -483,6 +487,7 @@ impl Vop2Op {
             Vop2Op::XorB32 => 29,
             Vop2Op::AddNcU32 => 37,
             Vop2Op::SubNcU32 => 38,
+            Vop2Op::AddCoCiU32 => 32,
         }
     }
 }
@@ -563,9 +568,9 @@ pub fn v_nop() -> Vec<u8> {
 // addressing (VOP2's SRC1 is VGPR-only) plus output modifiers, and the only encoding for
 // genuinely 3-operand ops. Opcodes below are exactly the numbers gfx1100 assembles to — for
 // the ops that also have a VOP2 form the VOP3 opcode happens to equal `256 + the VOP2 opcode`
-// (confirmed per-op below, not assumed), but `FmaF32`/`MulLoU32` have no VOP2 form at all and
-// sit in their own part of the opcode space, which is why every value here is a literal rather
-// than a computed `256 + vop2_op`.
+// (confirmed per-op below, not assumed), but `FmaF32`/`MulLoU32`/`MulHiU32` have no VOP2 form at
+// all and sit in their own part of the opcode space, which is why every value here is a literal
+// rather than a computed `256 + vop2_op`.
 
 #[derive(Clone, Copy)]
 pub enum Vop3Op {
@@ -590,6 +595,7 @@ pub enum Vop3Op {
     SubNcU32,
     FmaF32,
     MulLoU32,
+    MulHiU32,
 }
 
 impl Vop3Op {
@@ -616,6 +622,7 @@ impl Vop3Op {
             Vop3Op::SubNcU32 => 294,
             Vop3Op::FmaF32 => 531,
             Vop3Op::MulLoU32 => 812,
+            Vop3Op::MulHiU32 => 813,
         }
     }
 }
@@ -740,6 +747,60 @@ pub fn vopc_e64(op: VCmpOp, sdst: u8, src0: VSrc, src1: VSrc) -> Vec<u8> {
     let mut code = word0.to_le_bytes().to_vec();
     code.extend_from_slice(&word1.to_le_bytes());
     push_lit(&mut code, lit0.or(lit1));
+    code
+}
+
+// ---- VOP3SD: extended encoding with a scalar-register destination alongside VDST -----------
+//
+// Two dwords, same fixed `[31:26]=0b11_0101` prefix and OP/SRC0/SRC1/SRC2 field positions as
+// plain VOP3 (`vop3` above), but word0's bits `[15:8]` (CLAMP+ABS in a normal VOP3 arithmetic
+// op) are reinterpreted as a second, 8-bit-wide scalar destination (`SDST`) — there is no
+// clamp/abs for these ops, so the ISA reuses the bits. This is the "carry" form of 64-bit
+// integer add: `v_add_co_u32` (`VDST := SRC0 + SRC1`, `SDST := carry-out`, no carry-in — the
+// low word of a 64-bit add) and `v_add_co_ci_u32`'s `_e64` form (`VDST := SRC0 + SRC1 +
+// SRC2-as-carry-in`, `SDST := carry-out` — the same op as `Vop2Op::AddCoCiU32` above but with
+// an arbitrary SGPR carry-in/out instead of always `vcc_lo`; not used by this crate's own
+// lowering, which always chains through `vcc_lo`, but included since it is the same
+// instruction family and free to expose). Confirmed against `llvm-mc-18` (`v_add_co_u32 v0,
+// s0, v1, v2` / `v_add_co_ci_u32_e64 v0, s0, v1, v2, s3`) — see the `tests` module.
+
+#[derive(Clone, Copy)]
+pub enum Vop3CarryOp {
+    AddCoU32,
+    AddCoCiU32,
+}
+
+impl Vop3CarryOp {
+    fn opcode(self) -> u32 {
+        match self {
+            Vop3CarryOp::AddCoU32 => 768,
+            Vop3CarryOp::AddCoCiU32 => 288,
+        }
+    }
+}
+
+/// `sdst` carries the op's carry-out (and, for `AddCoCiU32`, `src2` is the carry-in — pass
+/// `VSrc::Sgpr(0)` for `AddCoU32`, which has no carry-in operand, matching the filler
+/// convention `vop3` itself already uses for an unused source slot).
+pub fn vop3_carry(
+    op: Vop3CarryOp,
+    vdst: u8,
+    sdst: u8,
+    src0: VSrc,
+    src1: VSrc,
+    src2: VSrc,
+) -> Vec<u8> {
+    debug_assert!(sdst <= 127, "VOP3SD's SDST field is 7 bits wide");
+    let (s0, lit0) = encode_vsrc(src0);
+    let (s1, lit1) = encode_vsrc(src1);
+    let (s2, lit2) = encode_vsrc(src2);
+    at_most_one_literal(&[lit0, lit1, lit2]);
+    let word0 =
+        (0b11_0101u32 << 26) | ((op.opcode() & 0x3FF) << 16) | ((sdst as u32) << 8) | vdst as u32;
+    let word1 = ((s2 as u32) << 18) | ((s1 as u32) << 9) | s0 as u32;
+    let mut code = word0.to_le_bytes().to_vec();
+    code.extend_from_slice(&word1.to_le_bytes());
+    push_lit(&mut code, lit0.or(lit1).or(lit2));
     code
 }
 
@@ -1613,6 +1674,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vop2_add_co_ci_u32() {
+        // v_add_co_ci_u32_e32 v0, vcc_lo, v1, v2, vcc_lo ; encoding: [0x01,0x05,0x00,0x40]
+        assert_eq!(
+            vop2(Vop2Op::AddCoCiU32, 0, VSrc::Vgpr(1), 2),
+            [0x01, 0x05, 0x00, 0x40]
+        );
+    }
+
     // ---- VOP1 ----
 
     #[test]
@@ -1826,6 +1896,47 @@ mod tests {
                 m
             ),
             [0x00, 0x00, 0x2c, 0xd7, 0x01, 0x05, 0x02, 0x00]
+        );
+    }
+
+    #[test]
+    fn vop3_mul_hi_u32() {
+        // v_mul_hi_u32 v0, v1, v2 ; encoding: [0x00,0x00,0x2d,0xd7,0x01,0x05,0x02,0x00]
+        // v_mul_hi_u32 v3, s0, v2 ; encoding: [0x03,0x00,0x2d,0xd7,0x00,0x04,0x02,0x00]
+        // v_mul_hi_u32 v0, v9, v2 ; encoding: [0x00,0x00,0x2d,0xd7,0x09,0x05,0x02,0x00]
+        let m = Vop3Mods::default();
+        assert_eq!(
+            vop3(
+                Vop3Op::MulHiU32,
+                0,
+                VSrc::Vgpr(1),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(0),
+                m
+            ),
+            [0x00, 0x00, 0x2d, 0xd7, 0x01, 0x05, 0x02, 0x00]
+        );
+        assert_eq!(
+            vop3(
+                Vop3Op::MulHiU32,
+                3,
+                VSrc::Sgpr(0),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(0),
+                m
+            ),
+            [0x03, 0x00, 0x2d, 0xd7, 0x00, 0x04, 0x02, 0x00]
+        );
+        assert_eq!(
+            vop3(
+                Vop3Op::MulHiU32,
+                0,
+                VSrc::Vgpr(9),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(0),
+                m
+            ),
+            [0x00, 0x00, 0x2d, 0xd7, 0x09, 0x05, 0x02, 0x00]
         );
     }
 
@@ -2152,6 +2263,104 @@ mod tests {
                 m
             ),
             [0x00, 0x00, 0x01, 0xd5, 0x01, 0x05, 0x02, 0x00]
+        );
+    }
+
+    // ---- VOP3SD ----
+
+    #[test]
+    fn vop3_carry_add_co_u32() {
+        // v_add_co_u32 v0, s0, v1, v2 ; encoding: [0x00,0x00,0x00,0xd7,0x01,0x05,0x02,0x00]
+        // v_add_co_u32 v3, s0, v1, v2 ; encoding: [0x03,0x00,0x00,0xd7,0x01,0x05,0x02,0x00]
+        // v_add_co_u32 v0, s4, v1, v2 ; encoding: [0x00,0x04,0x00,0xd7,0x01,0x05,0x02,0x00]
+        // v_add_co_u32 v0, vcc_lo, v1, v2 ; encoding: [0x00,0x6a,0x00,0xd7,0x01,0x05,0x02,0x00]
+        let z = VSrc::Sgpr(0);
+        assert_eq!(
+            vop3_carry(Vop3CarryOp::AddCoU32, 0, 0, VSrc::Vgpr(1), VSrc::Vgpr(2), z),
+            [0x00, 0x00, 0x00, 0xd7, 0x01, 0x05, 0x02, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(Vop3CarryOp::AddCoU32, 3, 0, VSrc::Vgpr(1), VSrc::Vgpr(2), z),
+            [0x03, 0x00, 0x00, 0xd7, 0x01, 0x05, 0x02, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(Vop3CarryOp::AddCoU32, 0, 4, VSrc::Vgpr(1), VSrc::Vgpr(2), z),
+            [0x00, 0x04, 0x00, 0xd7, 0x01, 0x05, 0x02, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(
+                Vop3CarryOp::AddCoU32,
+                0,
+                VCC_LO,
+                VSrc::Vgpr(1),
+                VSrc::Vgpr(2),
+                z
+            ),
+            [0x00, 0x6a, 0x00, 0xd7, 0x01, 0x05, 0x02, 0x00]
+        );
+    }
+
+    #[test]
+    fn vop3_carry_add_co_ci_u32() {
+        // v_add_co_ci_u32_e64 v0, s0, v1, v2, s3       ; encoding: [0x00,0x00,0x20,0xd5,0x01,0x05,0x0e,0x00]
+        // v_add_co_ci_u32_e64 v0, s4, v1, v2, s3        ; encoding: [0x00,0x04,0x20,0xd5,0x01,0x05,0x0e,0x00]
+        // v_add_co_ci_u32_e64 v7, s0, v1, v2, s3        ; encoding: [0x07,0x00,0x20,0xd5,0x01,0x05,0x0e,0x00]
+        // v_add_co_ci_u32_e64 v0, s0, v9, v2, s3        ; encoding: [0x00,0x00,0x20,0xd5,0x09,0x05,0x0e,0x00]
+        // v_add_co_ci_u32_e64 v0, s0, v1, v2, vcc_lo    ; encoding: [0x00,0x00,0x20,0xd5,0x01,0x05,0xaa,0x01]
+        assert_eq!(
+            vop3_carry(
+                Vop3CarryOp::AddCoCiU32,
+                0,
+                0,
+                VSrc::Vgpr(1),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(3)
+            ),
+            [0x00, 0x00, 0x20, 0xd5, 0x01, 0x05, 0x0e, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(
+                Vop3CarryOp::AddCoCiU32,
+                0,
+                4,
+                VSrc::Vgpr(1),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(3)
+            ),
+            [0x00, 0x04, 0x20, 0xd5, 0x01, 0x05, 0x0e, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(
+                Vop3CarryOp::AddCoCiU32,
+                7,
+                0,
+                VSrc::Vgpr(1),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(3)
+            ),
+            [0x07, 0x00, 0x20, 0xd5, 0x01, 0x05, 0x0e, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(
+                Vop3CarryOp::AddCoCiU32,
+                0,
+                0,
+                VSrc::Vgpr(9),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(3)
+            ),
+            [0x00, 0x00, 0x20, 0xd5, 0x09, 0x05, 0x0e, 0x00]
+        );
+        assert_eq!(
+            vop3_carry(
+                Vop3CarryOp::AddCoCiU32,
+                0,
+                0,
+                VSrc::Vgpr(1),
+                VSrc::Vgpr(2),
+                VSrc::Sgpr(VCC_LO)
+            ),
+            [0x00, 0x00, 0x20, 0xd5, 0x01, 0x05, 0xaa, 0x01]
         );
     }
 
