@@ -73,6 +73,14 @@ dependencies = [
 [[package]]
 name = "basalt-ptx"
 version = "0.0.0"
+dependencies = [
+ "basalt-backend",
+ "basalt-bir",
+ "basalt-diag",
+ "basalt-frontend-c",
+ "basalt-passes",
+ "basalt-sema",
+]
 
 [[package]]
 name = "basalt-runtime"
