@@ -30,6 +30,7 @@ dependencies = [
  "basalt-frontend-c",
  "basalt-llvm",
  "basalt-mlir",
+ "basalt-passes",
  "basalt-sema",
  "basalt-x86",
 ]

@@ -1,0 +1,2 @@
+exit=0
+PASS: mymathhomework produced 20

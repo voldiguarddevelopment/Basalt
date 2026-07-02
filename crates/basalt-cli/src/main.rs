@@ -3,11 +3,18 @@
 // `--ast`, `--sema`, and `--ir` are wired to the real frontend/sema pipeline: `--ast` dumps
 // the parsed AST, `--sema` runs the type checker, and `--ir` lowers all the way to BIR and
 // prints it (or, given a `.bir` file directly, parses and re-prints it, exercising the
-// printer/parser round-trip as before). `--cpu` runs that same pipeline and hands the result
-// to the x86-64 oracle backend, writing an object file to `-o`. `--cpu-regalloc` runs the same
-// pipeline against the x86-64 regalloc backend instead (the CPU performance path). Every other
-// mode flag parses into `Config` cleanly and fails with a diagnostic at dispatch time rather
-// than guessing at output (no silently-wrong behavior).
+// printer/parser round-trip as before). `--ir` deliberately prints the raw output of
+// `basalt-sema`'s lowering, unoptimized: its job is to show exactly what the lowering pass
+// produced, for inspection and for the round-trip check, not what a backend will actually
+// build from. `--cpu` runs that same frontend/sema pipeline, then `basalt_passes::optimize`,
+// and hands the result to the x86-64 oracle backend, writing an object file to `-o`.
+// `--cpu-regalloc` does the same against the x86-64 regalloc backend instead (the CPU
+// performance path). Every backend that emits real machine code is handed the optimized
+// module, unconditionally — there is no flag to opt out, since the whole point is that these
+// cleanups are load-bearing infrastructure every target gets for free, not a feature a caller
+// has to remember to ask for. Every other mode flag parses into `Config` cleanly and fails
+// with a diagnostic at dispatch time rather than guessing at output (no silently-wrong
+// behavior).
 //
 // Adding a real backend later is meant to be a small change: one new arm in `run`'s match
 // over `Mode`.
@@ -307,14 +314,14 @@ fn run_sema(input: &Path, cfg: &Config, table: &LangTable) -> Result<ExitCode, D
     })
 }
 
-/// `--cpu <file>`: runs the same pipeline as `--ir` (lex/preprocess/parse, check, lower for
-/// C/CUDA source; parse directly for a `.bir` file), then hands the resulting module to the
-/// x86-64 oracle backend and writes the emitted object bytes to `-o`. Unlike `--ir`, this mode
-/// never emits a best-effort artifact: an object file is either right or not written at all, so
-/// any frontend/sema/lowering problem exits non-zero without touching `-o`. `-o` itself is
-/// mandatory here (`E101`) — a raw object is not something to dump to a terminal — and a module
-/// this backend cannot lower is refused with its own `Diag`, rendered the same way every other
-/// error in this file is.
+/// `--cpu <file>`: runs the same frontend/sema pipeline as `--ir` (lex/preprocess/parse, check,
+/// lower for C/CUDA source; parse directly for a `.bir` file), then runs `basalt_passes::optimize`
+/// over the resulting module before handing it to the x86-64 oracle backend and writing the
+/// emitted object bytes to `-o`. Unlike `--ir`, this mode never emits a best-effort artifact: an
+/// object file is either right or not written at all, so any frontend/sema/lowering problem
+/// exits non-zero without touching `-o`. `-o` itself is mandatory here (`E101`) — a raw object is
+/// not something to dump to a terminal — and a module this backend cannot lower is refused with
+/// its own `Diag`, rendered the same way every other error in this file is.
 fn run_cpu(
     input: &Path,
     output: Option<&Path>,
@@ -345,6 +352,7 @@ fn run_cpu(
         }
         module
     };
+    let module = basalt_passes::optimize(&module);
 
     let backend = X86Oracle;
     match backend.supports(&module) {
@@ -394,6 +402,7 @@ fn run_cpu_regalloc(
         }
         module
     };
+    let module = basalt_passes::optimize(&module);
 
     let backend = X86Regalloc;
     match backend.supports(&module) {

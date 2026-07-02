@@ -33,6 +33,7 @@ kernel_dir="$root/tests/kernels"
 KERNELS=(
   "vector_add.cu:examples/cpu_launch_vadd.c"
   "stress.cu:examples/cpu_launch_stress.c"
+  "mymathhomework.cu:examples/cpu_launch_mymathhomework.c"
 )
 
 if [ "${#KERNELS[@]}" -eq 0 ]; then

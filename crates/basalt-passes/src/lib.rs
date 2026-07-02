@@ -21,12 +21,17 @@
 // across a warp/block; it has no consumer yet in this tree — it exists for a later
 // divergence-aware GPU register allocator to use. See each module's header for exactly what
 // it covers and what it deliberately doesn't.
+//
+// `pipeline::optimize` chains `construct_ssa`, `constant_fold`, `eliminate_dead_code`, and
+// `licm` into the one standard sequence every backend is handed by default; see that module's
+// header for the exact order and why it's ordered that way.
 
 mod constfold;
 mod dce;
 mod divergence;
 mod dom;
 mod licm;
+mod pipeline;
 mod regalloc;
 mod ssa;
 
@@ -35,5 +40,6 @@ pub use dce::eliminate_dead_code;
 pub use divergence::{analyze_divergence, Divergence, DivergenceInfo};
 pub use dom::{detect_loops, Dominators, NaturalLoop};
 pub use licm::licm;
+pub use pipeline::optimize;
 pub use regalloc::{allocate, Allocation, Location, RegClass, ValueId};
 pub use ssa::construct_ssa;
