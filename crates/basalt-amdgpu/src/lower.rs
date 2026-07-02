@@ -46,41 +46,143 @@
 //   - More than one function per module is refused (`E093`): `hsaco::HsacoSpec` is one kernel
 //     per object (see that module's header), matching this same simplification.
 //
-// # Register model
+// # Register model — divergence-aware since this task
 //
-// Every SSA value gets a VGPR home picked by a simple liveness-based linear scan (see
-// `RegAlloc`/`Pools`/`compute_last_use`'s own header just above their definitions for the full
-// reasoning) — *not* the divergence-aware allocator a later, dedicated task will build, and
-// *not* a real spiller: it has no notion of a value being uniform vs. divergent and no
-// exec-mask interaction, it just frees a register the instant its value's last real use has
-// passed and hands it to the next value needing the same width. A register is still never
-// shared by two *simultaneously live* values, so (matching `basalt-ptx`'s own documented
-// reasoning for its own, permanent-only, register scheme) phi resolution still needs no staging
-// dance: an unconditional register-to-register copy per incoming edge is always correct.
+// Every SSA value's home is either a VGPR (one physical copy per lane) or an SGPR (one copy
+// for the whole wave), decided from `basalt_passes::analyze_divergence`'s classification of
+// that value plus whether a genuine scalar-ALU (or scalar-memory) form of its defining op
+// actually exists in `enc.rs`'s repertoire — `Divergence::Uniform` is necessary but not
+// sufficient, since some Uniform values have no hardware path to an SGPR destination at all
+// (see "what does and doesn't get scalarized" below). Both homes are picked by the same kind
+// of simple liveness-based linear scan (see `RegAlloc`/`Pools`/`SgprPools`/`compute_last_use`'s
+// own headers just above their definitions), one independent pool per register file. A
+// register is still never shared by two *simultaneously live* values of the same file, so
+// (matching `basalt-ptx`'s own documented reasoning for its own, permanent-only, register
+// scheme) phi resolution still needs no staging dance: an unconditional register-to-register
+// copy per incoming edge is always correct, it just picks `v_mov_b32`/`s_mov_b32`/`s_mov_b64`
+// depending on which file the source and destination actually live in.
+//
+// This is *not* a real spiller (still no notion of running out of registers other than a
+// clean `E093` refusal, see `Pools::alloc`/`SgprPools::alloc`) and it is *not* full divergence-
+// aware codegen: `Term::CondBr`'s exec-mask handling is still exactly as narrow as before (see
+// "Control flow and divergence" below, unchanged from before this task) — only the *register
+// homes* are now divergence-aware, not general divergent control flow.
+//
+// ## What does and doesn't get scalarized
+//
+// A value is only ever given an SGPR home when `analyze_divergence` classifies it Uniform
+// *and* its defining op is one this backend knows a real scalar-ALU/scalar-memory form for,
+// with every operand that form would need to read directly *also* already SGPR-homed
+// (`op_scalarizable`, checked in one forward pass over `RegAlloc::build`'s program-order scan —
+// safe without a fixed point since this backend's declared scope has no loop, so a phi's
+// incoming values are always earlier in the arena, matching `compute_last_use`'s own
+// reasoning). Concretely:
+//
+//   - Every function **parameter** is SGPR-homed: `analyze_divergence` always classifies
+//     parameters Uniform, and a kernarg value can be read by `s_load_bN` straight into a
+//     permanent SGPR home (see "Kernarg segment layout" below) — no VGPR broadcast needed at
+//     all unless something later actually needs it in the vector file.
+//   - **`Op::BidX/Y/Z`** are SGPR-homed at the exact fixed SGPR hardware already preloads for
+//     that axis (see "Thread/block index" below) — not from the general pool, never freed,
+//     and genuinely free: `lower_inst` emits *zero* instructions for it, the value already
+//     lives where it's read from.
+//   - **`Op::ConstInt`/`Op::ConstFloat`** are SGPR-homed via `s_mov_b32` (two, for a 64-bit
+//     constant) when Uniform — always, since a constant is always Uniform and materializing
+//     one scalar-side is strictly simpler than vector-side.
+//   - A narrow (32-bit) **`Op::Bin`** — `Add`/`Sub`/`And`/`Or`/`Xor`/`Mul`/`Shl`/`Lshr`/`Ashr`,
+//     never a float op or a 64-bit one, see below — is SGPR-homed via `SOP2` when both
+//     operands are already SGPR-homed.
+//   - **`Op::ICmp`** is SGPR-homed via `SOPC` (sets `SCC`) followed by `s_cselect_b32 dst, 1,
+//     0` (materializes `SCC` into the same `0`/`1` VGPR-`i1` convention every consumer expects)
+//     when both operands are already SGPR-homed. `Op::FCmp` is **never** SGPR-homed: this
+//     ISA subset's `SOPC` has no floating-point compare, only integer ones.
+//   - **`Op::Select`** is SGPR-homed via `s_cmp_lg_u32 cond, 0` then `s_cselect_b32` per word
+//     when the condition and both results are already SGPR-homed.
+//   - **`Op::Cast`** is SGPR-homed via the matching `SOP1`/`SOP2` sequence
+//     (`Trunc`/`Zext`/`Sext`/`Bitcast` all have one; see `lower_cast_scalar`) when its one
+//     operand is already SGPR-homed. `FpToSi`/`FpToUi`/`SiToFp`/`UiToFp` are **never**
+//     SGPR-homed: no scalar-ALU float/int conversion exists in this ISA subset either.
+//   - **`Op::Phi`** is SGPR-homed when every incoming value is already SGPR-homed *and*
+//     `analyze_divergence` classifies it Uniform (which also rules out a phi downstream of a
+//     divergent branch, tainted per that pass's own Part 2 — see its header).
+//   - A **64-bit (`is_wide`) `Op::Bin`** (`Add`/`Mul`, the only wide ops this backend lowers at
+//     all) is **never** SGPR-homed, Uniform or not: `enc.rs`'s scalar ALU has no 64-bit
+//     arithmetic, only `s_mov_b64` for a plain copy. This is the clearest instance of "Uniform
+//     but no scalar form exists" — a Uniform 64-bit pointer computation (e.g. a uniform base
+//     plus a uniform constant offset) still lowers on the vector unit exactly as before, with
+//     any SGPR-homed operand it happens to read materialized into a scratch VGPR first (see
+//     "scratch VGPRs" below).
+//   - **`Op::Load`/`Op::Store`/`Op::Atomic`** results/addresses/data are **never** SGPR-homed:
+//     `enc.rs`'s FLAT/DS forms hard-code their address/data fields as plain VGPR register
+//     numbers (no `VSrc`/`Src` general operand there at all), so a load's result always lives
+//     in a VGPR regardless of how uniform the loaded address was, and a store's address/value
+//     are materialized into a scratch VGPR first if they happen to be SGPR-homed.
+//   - **`Op::TidX/Y/Z`**, `Op::Barrier`, and every op `analyze_divergence` fixes Divergent
+//     regardless of operands (`Shuffle`/`Ballot`/`Vote*`/`Atomic`/`AtomicCas`) are never
+//     candidates (the first two have no operands to be Uniform from; the rest are refused
+//     before codegen anyway, see the scope list above).
+//
+// A **hardware constraint this design leans on throughout**: real VOP1/VOP2/VOP3/VOPC
+// instructions allow at most one *genuinely read* SGPR (or literal-constant) source operand —
+// `enc.rs` does not enforce this (only its "at most one literal" asserts are load-bearing at
+// the encoder level, see `at_most_one_literal`), so every lowering site above that can read a
+// mix of SGPR- and VGPR-homed operands respects it by construction rather than by an assert:
+//   - Any 2-operand `Op::Bin`/`Op::ICmp`/`Op::FCmp` whose *result* is Divergent has at most one
+//     Uniform (hence at most one SGPR-homed) operand — a direct consequence of
+//     `analyze_divergence`'s own propagation rule (Divergent iff *any* operand is Divergent),
+//     so these sites never need to fall back to a scratch VGPR for correctness, only to work
+//     around `VOP2`'s asymmetric encoding (`SRC1` is VGPR-only; see `enc.rs`'s own header) via
+//     an operand swap (commutative ops) or predicate flip (compares) — never via materializing
+//     a value that was already safe to read directly.
+//   - `Op::Select`'s vector-path `v_cndmask_b32` already spends the single allowed scalar slot
+//     on `vcc_lo` (a genuine, always-read operand, not an unused filler), so its two result
+//     operands are *always* materialized into scratch VGPRs first when SGPR-homed, regardless
+//     of how many of them are — this is the "op has no all-scalar form for a Divergent result"
+//     case, not a swap/flip case.
+//   - A 64-bit `Op::Bin`'s vector carry-chain sequence works the same way: it may see both
+//     operands (all four words) SGPR-homed at once (a Uniform 64-bit value that simply has no
+//     scalar form), so both are unconditionally materialized into scratch VGPRs first.
+//
+// A **filler operand that is genuinely never read by the opcode's execution unit** (e.g.
+// `VSrc::Sgpr(0)`/`VCC_LO` in an unused `VOP3`/carry slot — see `enc.rs`'s own comment on this)
+// does not count against the one-real-SGPR-operand budget above: the hardware simply never
+// wires that field to anything for those opcodes.
+//
+// ## Scratch VGPRs
+//
+// `v1`-`v4` are a fixed, permanently reserved scratch range (never assigned to an SSA value,
+// exactly like `v0`) used to materialize an SGPR-homed value into the vector file wherever a
+// site above needs one: `v1`/`v2` for a "first operand" (a pointer/value's low/high word), `v3`/
+// `v4` for a "second". Reusing the same fixed pair everywhere is safe because a materialization
+// is always consumed by the very next instruction emitted, never held live across another
+// materialization into the same slot (this is the same "safe because strictly sequential"
+// reasoning the old `STAGE_SGPR` scratch pair relied on, which this task's new direct-to-home
+// parameter loading has made unnecessary — see "Kernarg segment layout" below).
 //
 // VGPRs: `v0` is permanently reserved as the untouched hardware-preloaded packed
-// thread-index register (see "thread/block index" below) and is never assigned to an SSA
-// value; every SSA value's VGPR home is numbered starting at `v1`. A value's width in VGPRs
-// follows its `Ty`: `i1`/`i32`/`f32`/a `Shared`/`Local` pointer (a 32-bit LDS offset, not a
-// full address) take one VGPR; `i64`/a `Global`/`Constant`/`Param` pointer (a full 64-bit
-// address) take two *consecutive* VGPRs, low word first — required by `enc.rs`'s FLAT/GLOBAL
-// forms, which address a 64-bit pointer as one VGPR pair. Running past `v255` (with every
-// already-dead register recycled) is a clean `E093` refusal (see `Pools::alloc`), not silent
-// wraparound. Every value — including `i1` — lives in the vector file; this backend does not
-// attempt the scalar/vector uniformity split a real divergence-aware allocator would use, so
-// `Op::BidX` deliberately reads its hardware SGPR straight into a VGPR rather than keeping it
-// scalar — simpler, always correct, just not using the scalar unit optimally.
+// thread-index register (see "thread/block index" below), `v1`-`v4` are the scratch range just
+// above, and every SSA value actually given a VGPR home is numbered starting at `v5`. A value's
+// width in VGPRs follows its `Ty`: `i1`/`i32`/`f32`/a `Shared`/`Local` pointer (a 32-bit LDS
+// offset, not a full address) take one VGPR; `i64`/a `Global`/`Constant`/`Param` pointer (a
+// full 64-bit address) take two *consecutive* VGPRs, low word first — required by `enc.rs`'s
+// FLAT/GLOBAL forms, which address a 64-bit pointer as one VGPR pair. Running past `v255` (with
+// every already-dead register recycled) is a clean `E093` refusal (see `Pools::alloc`), not
+// silent wraparound.
 //
 // SGPRs: `s[0:1]` is the kernarg segment base pointer (hardware-preloaded whenever the kernel
 // takes at least one parameter — see `HsacoSpec::with_kernarg_segment`); `s2`, then `s3`, then
 // `s4` are the workgroup (block) id x/y/z components, preloaded only for the axes this
 // function's body actually reads, packed contiguously starting at `s2` in x-then-y-then-z
 // order and skipping any unused axis — a real hardware/kernel-descriptor packing rule, not a
-// convention this backend invented (see `hsaco::HsacoSpec::with_workgroup_ids`). `s16`/`s17`
-// are a fixed scratch pair reused, one parameter at a time, to stage each kernarg value between
-// its SMEM load and the `v_mov_b32` that broadcasts it into the parameter's own VGPR home —
-// safe to reuse because parameter loads happen strictly in sequence at kernel entry, before
-// anything else runs.
+// convention this backend invented (see `hsaco::HsacoSpec::with_workgroup_ids`). Every other
+// SGPR-homed value (every parameter, plus whatever `Op::Bin`/`Op::ICmp`/`Op::Select`/
+// `Op::Cast`/`Op::Phi`/`Op::ConstInt`/`Op::ConstFloat` end up eligible per the rules above)
+// comes from a bump-allocated pool starting right after the last workgroup-id SGPR this
+// function actually reserved (see `SgprPools`/`BidUsage::sgpr_assignment`), wide (64-bit)
+// homes always taken at an even-aligned pair — not asserted anywhere as a real ISA requirement
+// in this file's own reference material, but a conservative, low-cost hedge in the absence of
+// one. Running past `s105` (see `enc.rs`'s own "SGPRs are numbered 0-105 directly") is a clean
+// `E093` refusal (see `SgprPools::alloc`), not silent wraparound.
 //
 // # `i1` representation
 //
@@ -114,20 +216,27 @@
 //
 // # Control flow and divergence — a documented, deliberate scope limit
 //
-// `Term::CondBr` lowers as a genuine data-dependent branch: the `i1` condition is re-derived
-// into `vcc_lo` (`v_cmp_ne_u32 vcc_lo, 0, cond`) and then `s_cbranch_vccnz`/an unconditional
-// fallback `s_branch` pick the taken block, with a small trampoline sequence on each edge that
-// carries that edge's own phi copies before jumping to the real target block (always emitted,
-// whether or not that edge actually has any phi to copy — trading a handful of trivial bytes
-// for having exactly one code shape to reason about). This is **correct whenever every active
-// lane in the wave agrees on the branch outcome** — true by construction for a single-lane wave
-// (the shape this phase's own proof kernel is driven with) and true for any genuinely uniform
-// branch, but **not** a general divergent-control-flow implementation: `vcc_lo`'s zero-ness
+// `Term::CondBr` lowers as a genuine data-dependent branch. When the condition is SGPR-homed
+// (`analyze_divergence` proved it Uniform, per the register-model rules above), the branch is
+// a real scalar one: `s_cmp_lg_u32 cond, 0` then `s_cbranch_scc1` — a plain, always-correct
+// optimization, since every lane necessarily agrees on a Uniform value's outcome, with no
+// exec-mask reasoning involved at all. Otherwise the condition is re-derived into `vcc_lo`
+// (`v_cmp_ne_u32 vcc_lo, 0, cond`) and `s_cbranch_vccnz` used instead. Either way, an
+// unconditional fallback `s_branch` picks the other block, with a small trampoline sequence on
+// each edge that carries that edge's own phi copies before jumping to the real target block
+// (always emitted, whether or not that edge actually has any phi to copy — trading a handful of
+// trivial bytes for having exactly one code shape to reason about). The `vcc_lo` form is
+// **correct whenever every active lane in the wave agrees on the branch outcome** — true by
+// construction for a single-lane wave (the shape this phase's own proof kernel is driven with)
+// and true for any genuinely uniform branch (which now takes the scalar form above instead
+// anyway), but **not** a general divergent-control-flow implementation: `vcc_lo`'s zero-ness
 // only reflects "does some lane disagree," not "which," and this pass never saves/masks/
 // restores `exec` the way real divergent control flow requires. That is real hardware SIMT's
 // hardest remaining problem and is explicitly left to a later, dedicated task — this pass's job
 // is a correct-first slice, not full generality, exactly like the CPU oracle's own register
-// allocator started narrow before a later phase added real allocation.
+// allocator started narrow before a later phase added real allocation. Divergence-aware
+// register homes (this task) and divergence-aware control flow (exec-mask save/restore) are
+// two separate, independently-landable pieces of work; only the first is done here.
 //
 // # Memory and synchronization
 //
@@ -135,7 +244,10 @@
 // `flat_atomic` with `Seg::Global`, a full 64-bit VGPR-pair address (no `saddr`, matching that
 // module's own "the form this crate always uses" note) and no synthesized loop — the load
 // genuinely reads whatever lane's own address is in its own VGPR pair, real per-lane hardware
-// addressing. `Shared`/`Local` go through `enc::ds_load`/`ds_store` (a 32-bit LDS offset in one
+// addressing. Every address/data operand is materialized into a scratch VGPR first if it
+// happens to be SGPR-homed (see "scratch VGPRs" above) — these encoders take a plain register
+// number, never a general `VSrc`/`Src` operand, so they can only ever address the vector file.
+// `Shared`/`Local` go through `enc::ds_load`/`ds_store` (a 32-bit LDS offset in one
 // VGPR). Every load and every atomic is followed by a blanket `s_waitcnt(0, 0, 0)` before its
 // result is used — always waiting on every counter (vector-memory, export, LDS/constant/scalar)
 // rather than tracking exactly which one applies is a deliberately conservative, always-correct
@@ -156,6 +268,16 @@
 // precedes every scalar parameter in the function's signature — true of every kernel this
 // project's frontend currently produces (see that script's own header) and checked here
 // (`E093`) rather than silently mismatching a param a real launcher would place elsewhere.
+//
+// Since every parameter is SGPR-homed (see the register model above), the prologue reads each
+// one straight from the kernarg segment into its own permanent SGPR home via a single
+// `s_load_bN`, with one blanket `s_waitcnt(0, 0, 0)` after the whole batch rather than one per
+// load — the loads are mutually independent (nothing in the prologue reads a param's value
+// before the wait), so there is no need to drain the scalar-memory counter between them. This
+// is simpler than an earlier version of this backend, which had to stage every kernarg value
+// through a scratch SGPR pair before broadcasting it into a VGPR home with `v_mov_b32`: that
+// broadcast is now only ever emitted on demand, wherever a specific consumer actually needs the
+// value in the vector file (see "scratch VGPRs" above), not unconditionally for every parameter.
 
 use std::collections::HashMap;
 
@@ -165,25 +287,32 @@ use basalt_bir::{
     Scalar, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
-use basalt_passes::construct_ssa;
+use basalt_passes::{analyze_divergence, construct_ssa, Divergence, DivergenceInfo};
 
 use crate::enc::{
-    self, BrCc, DsLoadOp, DsStoreOp, FlatOp, Imm, Seg, SmemOp, VCmpOp, VSrc, Vop1Op, Vop2Op,
-    Vop3CarryOp, Vop3Mods, Vop3Op, VCC_LO,
+    self, BrCc, DsLoadOp, DsStoreOp, FlatOp, Imm, Seg, SmemOp, Sop1Op, Sop2Op, SopcOp, Src, VCmpOp,
+    VSrc, Vop1Op, Vop2Op, Vop3CarryOp, Vop3Mods, Vop3Op, VCC_LO,
 };
 use crate::hsaco::{write_hsaco, GfxArch, HsacoSpec};
 
-/// `v0` is the hardware-preloaded packed thread index; SSA values start at `v1`.
-const FIRST_FREE_VGPR: u16 = 1;
+/// `v0` is the hardware-preloaded packed thread index; `v1`-`v4` are the fixed scratch range
+/// (see the module header's "scratch VGPRs" section); SSA values given a VGPR home start at
+/// `v5`.
+const FIRST_FREE_VGPR: u16 = 5;
 /// The highest legal VGPR number (`enc.rs`'s own field width: VGPRs are numbered 0-255).
 const MAX_VGPR: u16 = 255;
+/// Fixed scratch pair for materializing an SGPR-homed "first operand" into the vector file
+/// (see the module header's "scratch VGPRs" section).
+const SCRATCH_A: [u8; 2] = [1, 2];
+/// Same, for a "second operand".
+const SCRATCH_B: [u8; 2] = [3, 4];
 /// `s[0:1]`: the kernarg segment base pointer, whenever the kernel takes any parameter.
 const KERNARG_SGPR: u8 = 0;
 /// `s2` is the first SGPR a workgroup-id axis can occupy (right after the kernarg pointer
 /// pair); see the module header's packing rule.
 const BID_SGPR_BASE: u8 = 2;
-/// Fixed scratch pair for staging one kernarg value at a time during the prologue.
-const STAGE_SGPR: u8 = 16;
+/// The highest legal SGPR number (`enc.rs`'s own header: "SGPRs are numbered 0-105 directly").
+const MAX_SGPR: u8 = 105;
 
 fn e_type() -> Diag {
     Diag::new(ECode::UnsupportedType)
@@ -234,7 +363,7 @@ fn valref_ty(f: &Function, v: ValRef) -> Ty {
     }
 }
 
-// ---- register allocation: liveness-based reuse, still no divergence awareness --------------
+// ---- register allocation: liveness-based reuse, now divergence-aware -----------------------
 //
 // A pure "one permanent VGPR per SSA value, forever" scheme (this backend's first cut) cannot
 // fit `stress.cu` — its own comment explains it is deliberately built to exceed a small fixed
@@ -245,11 +374,11 @@ fn valref_ty(f: &Function, v: ValRef) -> Ty {
 // looping construct, see the module header), a simple linear-scan reuse is both simpler to get
 // right than real spill-code and enough to fit every kernel in scope: a register becomes
 // reusable the instant its value's last real use has been passed, and is handed to the next
-// value that needs a register of the same width from then on. This is *not* the
-// divergence-aware allocator a later, dedicated task will build (see the module header) — it
-// has no notion of a value being uniform vs. divergent, no exec-mask interaction, and no
-// spilling; it is exactly the amount of liveness tracking needed to fit a straight-line
-// (or simply-branching) kernel's honest register pressure into a real, finite VGPR file.
+// value that needs a register of the same width from then on. This is still *not* a real
+// spiller (see the module header) — it is exactly the amount of liveness tracking needed to fit
+// a straight-line (or simply-branching) kernel's honest register pressure into a real, finite
+// register file, applied independently to each of the two files (`Pools` for VGPRs,
+// `SgprPools` for SGPRs) a value can now be homed in.
 //
 // Correctness of the reuse rests on one fact: `Function::insts`, after `construct_ssa`, is laid
 // out in the exact per-block program order it will be lowered in (see `basalt-bir`'s own module
@@ -403,58 +532,255 @@ impl Pools {
     }
 }
 
+/// The SGPR mirror of `Pools`, bump-allocating from `start` (right after the kernarg pointer
+/// and whatever workgroup-id axes this function actually reserved — see
+/// `BidUsage::sgpr_assignment`) up to `MAX_SGPR`. A wide (2-SGPR) allocation always starts at an
+/// even register number: not a requirement this file has empirical evidence for (unlike
+/// `enc::smem_load`'s `SBASE` alignment assert), but a conservative, low-cost hedge in the
+/// absence of one (see the module header). An odd slot skipped to keep that alignment is not
+/// wasted — it goes back onto the narrow free list, since it is still a perfectly valid home for
+/// the next narrow value.
+struct SgprPools {
+    next_free_sgpr: u8,
+    narrow_free: Vec<u8>,
+    wide_free: Vec<u8>,
+}
+
+impl SgprPools {
+    fn new(start: u8) -> SgprPools {
+        SgprPools {
+            next_free_sgpr: start,
+            narrow_free: Vec::new(),
+            wide_free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, width: u8) -> Result<Vec<u8>, Diag> {
+        match width {
+            0 => Ok(Vec::new()),
+            1 => {
+                if let Some(r) = self.narrow_free.pop() {
+                    return Ok(vec![r]);
+                }
+                let r = self.next_free_sgpr;
+                if r > MAX_SGPR {
+                    return Err(e_feature());
+                }
+                self.next_free_sgpr += 1;
+                Ok(vec![r])
+            }
+            2 => {
+                if let Some(base) = self.wide_free.pop() {
+                    return Ok(vec![base, base + 1]);
+                }
+                if !self.next_free_sgpr.is_multiple_of(2) {
+                    self.narrow_free.push(self.next_free_sgpr);
+                    self.next_free_sgpr += 1;
+                }
+                let base = self.next_free_sgpr;
+                if base + 1 > MAX_SGPR {
+                    return Err(e_feature());
+                }
+                self.next_free_sgpr += 2;
+                Ok(vec![base, base + 1])
+            }
+            _ => unreachable!("vgpr_width only ever returns 0, 1, or 2"),
+        }
+    }
+
+    fn free(&mut self, regs: &[u8]) {
+        match regs.len() {
+            0 => {}
+            1 => self.narrow_free.push(regs[0]),
+            2 => self.wide_free.push(regs[0]),
+            _ => unreachable!("vgpr_width only ever returns 0, 1, or 2"),
+        }
+    }
+}
+
+/// Which register file a value's home lives in — see the module header's "what does and
+/// doesn't get scalarized" section for exactly how this is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Home {
+    Vgpr,
+    Sgpr,
+}
+
+fn vsrc_of(home: Home, reg: u8) -> VSrc {
+    match home {
+        Home::Vgpr => VSrc::Vgpr(reg),
+        Home::Sgpr => VSrc::Sgpr(reg),
+    }
+}
+
+fn home_of(v: ValRef, param_home: &[Home], inst_home: &[Home]) -> Home {
+    match v {
+        ValRef::Param(i) => param_home[i as usize],
+        ValRef::Val(id) => inst_home[id.0 as usize],
+    }
+}
+
+/// Whether `cop`'s `sty -> dty` pairing (already validated by `check_cast`) has a scalar-ALU
+/// equivalent this backend implements (`lower_cast_scalar`) — see the module header.
+fn cast_scalarizable(cop: CastOp) -> bool {
+    matches!(
+        cop,
+        CastOp::Trunc | CastOp::Zext | CastOp::Sext | CastOp::Bitcast
+    )
+}
+
+/// Whether `inst`'s op, given that `analyze_divergence` already classified its result Uniform,
+/// can actually be computed on the scalar unit and homed in an SGPR — the operand-eligibility
+/// half of the module header's "what does and doesn't get scalarized" rules. `param_home`/
+/// `inst_home` only need entries for indices strictly earlier than `inst` itself, which is
+/// always the case here: `RegAlloc::build` calls this in the same single forward pass that
+/// fills those arrays in, and (per the module header) this backend's declared scope has no
+/// loop, so every operand of every non-phi op is earlier in the arena, and every phi's incoming
+/// values are too (no loop means no back edge).
+fn op_scalarizable(op: &Op, ty: Ty, param_home: &[Home], inst_home: &[Home]) -> bool {
+    let sgpr = |v: ValRef| home_of(v, param_home, inst_home) == Home::Sgpr;
+    match op {
+        Op::ConstInt(_) | Op::ConstFloat(_) => true,
+        Op::Bin(bop, a, b) => {
+            use BinOp::*;
+            matches!(bop, Add | Sub | And | Or | Xor | Mul | Shl | Lshr | Ashr)
+                && !is_wide(ty)
+                && sgpr(*a)
+                && sgpr(*b)
+        }
+        Op::ICmp(_, _, a, b) => sgpr(*a) && sgpr(*b),
+        Op::Select(c, a, b) => sgpr(*c) && sgpr(*a) && sgpr(*b),
+        Op::Cast(cop, _sty, v) => cast_scalarizable(*cop) && sgpr(*v),
+        Op::Phi(preds) => preds.iter().all(|&(_, v)| sgpr(v)),
+        // `Load`/`Store`/`Atomic`/`Barrier`/`Tid*` never produce an Sgpr-eligible result (see
+        // the module header); everything else that could reach here (`Shuffle`/`Ballot`/
+        // `Vote*`/`AtomicCas`/`Mma`/`Bdim*`/`Gdim*`) is refused by `check_module` before this
+        // ever runs, and `FCmp` has no scalar-ALU compare in this ISA subset.
+        _ => false,
+    }
+}
+
 struct RegAlloc {
-    param_vgpr: Vec<Vec<u8>>,
-    inst_vgpr: Vec<Vec<u8>>,
+    param_home: Vec<Home>,
+    param_reg: Vec<Vec<u8>>,
+    inst_home: Vec<Home>,
+    inst_reg: Vec<Vec<u8>>,
 }
 
 impl RegAlloc {
-    fn build(f: &Function) -> Result<RegAlloc, Diag> {
+    fn build(
+        f: &Function,
+        div: &DivergenceInfo,
+        bid_sgpr: (Option<u8>, Option<u8>, Option<u8>),
+        sgpr_pool_start: u8,
+    ) -> Result<RegAlloc, Diag> {
         let (param_last, inst_last) = compute_last_use(f);
-        let mut pools = Pools::new();
-        let mut active: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut vpools = Pools::new();
+        let mut spools = SgprPools::new(sgpr_pool_start);
+        let mut active_v: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut active_s: Vec<(Vec<u8>, i64)> = Vec::new();
 
-        let mut param_vgpr = Vec::with_capacity(f.params.len());
+        // Every parameter is always Uniform (`analyze_divergence`'s own base case) and always
+        // has a real scalar-memory home (a kernarg value read straight into an SGPR pair via
+        // `s_load_bN`), so every parameter is unconditionally SGPR-homed.
+        let mut param_home = Vec::with_capacity(f.params.len());
+        let mut param_reg = Vec::with_capacity(f.params.len());
         for (i, &ty) in f.params.iter().enumerate() {
             let width = vgpr_width(ty).ok_or_else(e_type)?;
-            let regs = pools.alloc(width)?;
+            let regs = spools.alloc(width)?;
             if width > 0 {
-                active.push((regs.clone(), param_last[i]));
+                active_s.push((regs.clone(), param_last[i]));
             }
-            param_vgpr.push(regs);
+            param_home.push(Home::Sgpr);
+            param_reg.push(regs);
         }
 
-        let mut inst_vgpr = Vec::with_capacity(f.insts.len());
+        let mut inst_home = vec![Home::Vgpr; f.insts.len()];
+        let mut inst_reg = Vec::with_capacity(f.insts.len());
         for (idx, inst) in f.insts.iter().enumerate() {
             let point = idx as i64;
-            active.retain(|(regs, last_use)| {
+            active_v.retain(|(regs, last_use)| {
                 if *last_use < point {
-                    pools.free(regs);
+                    vpools.free(regs);
                     false
                 } else {
                     true
                 }
             });
+            active_s.retain(|(regs, last_use)| {
+                if *last_use < point {
+                    spools.free(regs);
+                    false
+                } else {
+                    true
+                }
+            });
+
             let width = vgpr_width(inst.ty).ok_or_else(e_type)?;
-            let regs = pools.alloc(width)?;
-            if width > 0 {
-                active.push((regs.clone(), inst_last[idx]));
+
+            // `Op::BidX/Y/Z`: the value already lives at the fixed SGPR hardware preloads for
+            // that axis (see the module header) — not from the pool, never freed.
+            let fixed_bid = match inst.op {
+                Op::BidX => Some(bid_sgpr.0.expect("BidUsage reserves this axis's SGPR")),
+                Op::BidY => Some(bid_sgpr.1.expect("BidUsage reserves this axis's SGPR")),
+                Op::BidZ => Some(bid_sgpr.2.expect("BidUsage reserves this axis's SGPR")),
+                _ => None,
+            };
+            if let Some(reg) = fixed_bid {
+                inst_home[idx] = Home::Sgpr;
+                inst_reg.push(vec![reg]);
+                continue;
             }
-            inst_vgpr.push(regs);
+
+            let uniform = div.of(ValRef::Val(InstId(idx as u32))) == Divergence::Uniform;
+            let scalarizable =
+                uniform && op_scalarizable(&inst.op, inst.ty, &param_home, &inst_home);
+            if scalarizable {
+                let regs = spools.alloc(width)?;
+                if width > 0 {
+                    active_s.push((regs.clone(), inst_last[idx]));
+                }
+                inst_home[idx] = Home::Sgpr;
+                inst_reg.push(regs);
+            } else {
+                let regs = vpools.alloc(width)?;
+                if width > 0 {
+                    active_v.push((regs.clone(), inst_last[idx]));
+                }
+                inst_home[idx] = Home::Vgpr;
+                inst_reg.push(regs);
+            }
         }
 
         Ok(RegAlloc {
-            param_vgpr,
-            inst_vgpr,
+            param_home,
+            param_reg,
+            inst_home,
+            inst_reg,
         })
+    }
+
+    fn home(&self, v: ValRef) -> Home {
+        home_of(v, &self.param_home, &self.inst_home)
     }
 
     fn val(&self, v: ValRef) -> &[u8] {
         match v {
-            ValRef::Param(i) => &self.param_vgpr[i as usize],
-            ValRef::Val(id) => &self.inst_vgpr[id.0 as usize],
+            ValRef::Param(i) => &self.param_reg[i as usize],
+            ValRef::Val(id) => &self.inst_reg[id.0 as usize],
         }
     }
+}
+
+/// Runs `analyze_divergence`/`BidUsage::scan` and builds the resulting `RegAlloc` — the one
+/// place both `check_function` (validating that registers don't overflow) and `lower_function`
+/// (actually emitting code) derive it from, so the two can never disagree about how a value is
+/// homed.
+fn build_regalloc(f: &Function) -> Result<RegAlloc, Diag> {
+    let div = analyze_divergence(f);
+    let bid = BidUsage::scan(f);
+    let (bx, by, bz, sgpr_pool_start) = bid.sgpr_assignment();
+    RegAlloc::build(f, &div, (bx, by, bz), sgpr_pool_start)
 }
 
 // ---- kernarg segment layout -----------------------------------------------------------------
@@ -514,9 +840,11 @@ impl BidUsage {
     }
 
     /// The SGPR number for each requested axis, packed contiguously from `BID_SGPR_BASE` in
-    /// x-then-y-then-z order, skipping any axis this function never reads — the same packing
-    /// real hardware (and this project's own kernel descriptor) applies.
-    fn sgprs(self) -> (Option<u8>, Option<u8>, Option<u8>) {
+    /// x-then-y-then-z order, skipping any axis this function never reads (the same packing
+    /// real hardware, and this project's own kernel descriptor, applies), plus the first SGPR
+    /// number left free after that packing — where the general SGPR pool (`SgprPools`) starts
+    /// bump-allocating from.
+    fn sgpr_assignment(self) -> (Option<u8>, Option<u8>, Option<u8>, u8) {
         let mut next = BID_SGPR_BASE;
         let take = |want: bool, next: &mut u8| -> Option<u8> {
             if want {
@@ -530,7 +858,7 @@ impl BidUsage {
         let x = take(self.x, &mut next);
         let y = take(self.y, &mut next);
         let z = take(self.z, &mut next);
-        (x, y, z)
+        (x, y, z, next)
     }
 }
 
@@ -682,7 +1010,7 @@ fn check_function(f: &Function) -> Result<(), Diag> {
             Term::Switch(..) => return Err(e_feature()),
         }
     }
-    RegAlloc::build(f).map(|_| ())?;
+    build_regalloc(f).map(|_| ())?;
     kernarg_layout(f).map(|_| ())?;
     Ok(())
 }
@@ -726,6 +1054,58 @@ fn fcmp_vcmp(pred: FCmpPred) -> VCmpOp {
     }
 }
 
+/// The `SOPC` (scalar compare, sets `SCC`) mirror of `icmp_vcmp`, for `lower_icmp_scalar`.
+fn icmp_sopc(pred: ICmpPred) -> SopcOp {
+    use ICmpPred::*;
+    match pred {
+        Eq => SopcOp::EqI32,
+        Ne => SopcOp::LgI32,
+        Slt => SopcOp::LtI32,
+        Sle => SopcOp::LeI32,
+        Sgt => SopcOp::GtI32,
+        Sge => SopcOp::GeI32,
+        Ult => SopcOp::LtU32,
+        Ule => SopcOp::LeU32,
+        Ugt => SopcOp::GtU32,
+        Uge => SopcOp::GeU32,
+    }
+}
+
+/// `a <pred> b` swapped to `b <flip_icmp(pred)> a` — always equivalent, used by
+/// `lower_icmp`'s vector path to move an Sgpr-homed `b` into `VOPC`'s general operand slot
+/// (`VSRC1` is VGPR-only; see `enc.rs`'s own header).
+fn flip_icmp(pred: ICmpPred) -> ICmpPred {
+    use ICmpPred::*;
+    match pred {
+        Eq => Eq,
+        Ne => Ne,
+        Slt => Sgt,
+        Sgt => Slt,
+        Sle => Sge,
+        Sge => Sle,
+        Ult => Ugt,
+        Ugt => Ult,
+        Ule => Uge,
+        Uge => Ule,
+    }
+}
+
+/// Same idea as `flip_icmp`, for `FCmpPred`. `Ord`/`Uno` don't depend on operand order at all
+/// (either operand being NaN decides them).
+fn flip_fcmp(pred: FCmpPred) -> FCmpPred {
+    use FCmpPred::*;
+    match pred {
+        Oeq => Oeq,
+        One => One,
+        Ord => Ord,
+        Uno => Uno,
+        Olt => Ogt,
+        Ogt => Olt,
+        Ole => Oge,
+        Oge => Ole,
+    }
+}
+
 fn atomic_flatop(op: AtomicOp) -> FlatOp {
     match op {
         AtomicOp::Add => FlatOp::AtomicAddU32,
@@ -747,7 +1127,6 @@ struct CodeGen<'a> {
     f: &'a Function,
     alloc: RegAlloc,
     phi_copies: PhiCopies,
-    bid_sgpr: (Option<u8>, Option<u8>, Option<u8>),
     code: Vec<u8>,
     block_start: HashMap<u32, usize>,
     pending: Vec<(usize, BranchTarget)>,
@@ -786,11 +1165,19 @@ impl<'a> CodeGen<'a> {
     }
 
     fn dst(&self, id: InstId) -> &[u8] {
-        &self.alloc.inst_vgpr[id.0 as usize]
+        &self.alloc.inst_reg[id.0 as usize]
     }
 
     fn val(&self, v: ValRef) -> &[u8] {
         self.alloc.val(v)
+    }
+
+    fn home(&self, v: ValRef) -> Home {
+        self.alloc.home(v)
+    }
+
+    fn is_sgpr(&self, id: InstId) -> bool {
+        self.alloc.inst_home[id.0 as usize] == Home::Sgpr
     }
 
     fn mov(&mut self, dst: u8, src: u8) {
@@ -803,8 +1190,34 @@ impl<'a> CodeGen<'a> {
         self.push(enc::vop1(Vop1Op::MovB32, dst, VSrc::Imm(imm)));
     }
 
+    /// The `SOP1` mirror of `mov`, for an SGPR-to-SGPR copy.
+    fn smov(&mut self, dst: u8, src: u8) {
+        if dst != src {
+            self.push(enc::sop1(Sop1Op::MovB32, dst, Src::Sgpr(src)));
+        }
+    }
+
     fn waitcnt_all(&mut self) {
         self.push(enc::s_waitcnt(0, 0, 0));
+    }
+
+    /// Returns `v`'s value as real VGPR register numbers, copying it out of its SGPR home into
+    /// `scratch` first if that's where it actually lives (see the module header's "scratch
+    /// VGPRs" section) — for the call sites (FLAT/DS address or data, a `v_cndmask_b32`/carry-
+    /// chain operand already spending the one allowed scalar slot elsewhere) that structurally
+    /// need a plain VGPR regardless of how uniform the value is. A value already VGPR-homed is
+    /// returned unchanged, with no instruction emitted.
+    fn materialize(&mut self, v: ValRef, scratch: &[u8; 2]) -> Vec<u8> {
+        let regs = self.val(v).to_vec();
+        match self.home(v) {
+            Home::Vgpr => regs,
+            Home::Sgpr => {
+                for (i, &r) in regs.iter().enumerate() {
+                    self.push(enc::vop1(Vop1Op::MovB32, scratch[i], VSrc::Sgpr(r)));
+                }
+                scratch[..regs.len()].to_vec()
+            }
+        }
     }
 
     fn materialize_bool(&mut self, dst: u8) {
@@ -824,8 +1237,11 @@ impl<'a> CodeGen<'a> {
         if total_size == 0 {
             return;
         }
+        // Every parameter is SGPR-homed (see the module header), so each kernarg value is read
+        // straight into its own permanent home — no staging register, no broadcast. The loads
+        // are mutually independent, so one blanket wait after the whole batch is enough.
         for (i, &(offset, size)) in offsets.iter().enumerate() {
-            let dst_regs = self.alloc.param_vgpr[i].clone();
+            let dst_regs = self.alloc.param_reg[i].clone();
             let op = if size == 4 {
                 SmemOp::LoadB32
             } else {
@@ -833,22 +1249,15 @@ impl<'a> CodeGen<'a> {
             };
             self.push(enc::smem_load(
                 op,
-                STAGE_SGPR,
+                dst_regs[0],
                 KERNARG_SGPR,
                 offset as i32,
                 None,
                 false,
                 false,
             ));
-            self.waitcnt_all();
-            for (j, &r) in dst_regs.iter().enumerate() {
-                self.push(enc::vop1(
-                    Vop1Op::MovB32,
-                    r,
-                    VSrc::Sgpr(STAGE_SGPR + j as u8),
-                ));
-            }
         }
+        self.waitcnt_all();
     }
 
     // ---- instruction dispatch ---------------------------------------------------------------
@@ -858,8 +1267,20 @@ impl<'a> CodeGen<'a> {
         let inst = &f.insts[id.0 as usize];
         let ty = inst.ty;
         match &inst.op {
-            Op::ConstInt(n) => self.lower_const_int(id, *n, ty),
-            Op::ConstFloat(v) => self.lower_const_float(id, *v, ty),
+            Op::ConstInt(n) => {
+                if self.is_sgpr(id) {
+                    self.lower_const_int_scalar(id, *n, ty);
+                } else {
+                    self.lower_const_int(id, *n, ty);
+                }
+            }
+            Op::ConstFloat(v) => {
+                if self.is_sgpr(id) {
+                    self.lower_const_float_scalar(id, *v, ty);
+                } else {
+                    self.lower_const_float(id, *v, ty);
+                }
+            }
             Op::Bin(op, a, b) => self.lower_bin(id, *op, *a, *b, ty),
             Op::ICmp(pred, _cty, a, b) => self.lower_icmp(id, *pred, *a, *b),
             Op::FCmp(pred, _cty, a, b) => self.lower_fcmp(id, *pred, *a, *b),
@@ -880,17 +1301,10 @@ impl<'a> CodeGen<'a> {
             Op::TidX => self.lower_tid(id, 0),
             Op::TidY => self.lower_tid(id, 10),
             Op::TidZ => self.lower_tid(id, 20),
-            Op::BidX => {
-                let s = self.bid_sgpr.0;
-                self.lower_bid(id, s);
-            }
-            Op::BidY => {
-                let s = self.bid_sgpr.1;
-                self.lower_bid(id, s);
-            }
-            Op::BidZ => {
-                let s = self.bid_sgpr.2;
-                self.lower_bid(id, s);
+            Op::BidX | Op::BidY | Op::BidZ => {
+                // `RegAlloc::build` already homes this value at the fixed SGPR hardware
+                // preloads for the axis (see the module header) — the value already lives
+                // there, nothing to emit.
             }
             Op::Barrier => {
                 self.waitcnt_all();
@@ -935,11 +1349,68 @@ impl<'a> CodeGen<'a> {
         }
     }
 
+    fn lower_const_int_scalar(&mut self, id: InstId, n: i64, ty: Ty) {
+        let regs = self.dst(id).to_vec();
+        match ty {
+            Ty::Scalar(Scalar::I1) => {
+                self.push(enc::sop1(
+                    Sop1Op::MovB32,
+                    regs[0],
+                    Src::Imm(Imm::Int((n & 1) as i32)),
+                ));
+            }
+            Ty::Scalar(Scalar::I32) => {
+                self.push(enc::sop1(
+                    Sop1Op::MovB32,
+                    regs[0],
+                    Src::Imm(Imm::Int(n as i32)),
+                ));
+            }
+            Ty::Scalar(Scalar::I64) => {
+                self.push(enc::sop1(
+                    Sop1Op::MovB32,
+                    regs[0],
+                    Src::Imm(Imm::Raw(n as u32)),
+                ));
+                self.push(enc::sop1(
+                    Sop1Op::MovB32,
+                    regs[1],
+                    Src::Imm(Imm::Raw((n >> 32) as u32)),
+                ));
+            }
+            _ => unreachable!("check_module restricts ConstInt to i1/i32/i64"),
+        }
+    }
+
+    fn lower_const_float_scalar(&mut self, id: InstId, v: f64, ty: Ty) {
+        let regs = self.dst(id).to_vec();
+        match ty {
+            Ty::Scalar(Scalar::F32) => {
+                self.push(enc::sop1(
+                    Sop1Op::MovB32,
+                    regs[0],
+                    Src::Imm(Imm::F32(v as f32)),
+                ));
+            }
+            _ => unreachable!("check_module restricts ConstFloat to f32"),
+        }
+    }
+
     fn lower_bin(&mut self, id: InstId, op: BinOp, a: ValRef, b: ValRef, ty: Ty) {
+        if self.is_sgpr(id) {
+            // `op_scalarizable` never selects a wide `Bin` for an Sgpr home (no scalar-ALU
+            // 64-bit arithmetic exists), so this is always the narrow, both-operands-Sgpr case.
+            self.lower_bin_scalar(id, op, a, b);
+            return;
+        }
         let dst = self.dst(id).to_vec();
-        let a_regs = self.val(a).to_vec();
-        let b_regs = self.val(b).to_vec();
         if is_wide(ty) {
+            // A wide `Bin` is never Sgpr-homed itself (see the module header), but its
+            // operands might individually be — a Uniform 64-bit value with simply no scalar
+            // form. Materialize unconditionally; a value already Vgpr-homed passes through
+            // with no instruction emitted.
+            let a_regs = self.materialize(a, &SCRATCH_A);
+            let b_regs = self.materialize(b, &SCRATCH_B);
             match op {
                 BinOp::Add => {
                     self.push(enc::vop3_carry(
@@ -961,8 +1432,32 @@ impl<'a> CodeGen<'a> {
                 _ => unreachable!("check_module restricts wide Bin to Add/Mul"),
             }
         } else {
-            self.lower_narrow_bin(dst[0], op, a_regs[0], b_regs[0]);
+            self.lower_narrow_bin(dst[0], op, a, b);
         }
+    }
+
+    /// The scalar-ALU (`SOP2`) form of a narrow `Op::Bin`, used when `op_scalarizable` already
+    /// confirmed both operands are Sgpr-homed and the result is too.
+    fn lower_bin_scalar(&mut self, id: InstId, op: BinOp, a: ValRef, b: ValRef) {
+        use BinOp::*;
+        let dst = self.dst(id)[0];
+        let a_r = self.val(a)[0];
+        let b_r = self.val(b)[0];
+        let sop = match op {
+            Add => Sop2Op::AddU32,
+            Sub => Sop2Op::SubU32,
+            And => Sop2Op::AndB32,
+            Or => Sop2Op::OrB32,
+            Xor => Sop2Op::XorB32,
+            Mul => Sop2Op::MulI32,
+            Shl => Sop2Op::LshlB32,
+            Lshr => Sop2Op::LshrB32,
+            Ashr => Sop2Op::AshrI32,
+            FAdd | FSub | FMul | Div | Rem | FDiv | FRem => unreachable!(
+                "op_scalarizable never selects a float or div/rem Bin for an Sgpr home"
+            ),
+        };
+        self.push(enc::sop2(sop, dst, Src::Sgpr(a_r), Src::Sgpr(b_r)));
     }
 
     /// 64-bit `a * b`, truncated to 64 bits (matching `BinOp::Mul`'s wraparound semantics):
@@ -1012,28 +1507,83 @@ impl<'a> CodeGen<'a> {
         mullo(self, dst[0], a_lo, b_lo); // dst[0] = the real low word, computed last
     }
 
-    fn lower_narrow_bin(&mut self, dst: u8, op: BinOp, a: u8, b: u8) {
+    /// A narrow (32-bit) `Op::Bin` whose result is Vgpr-homed. At most one of `a`/`b` can be
+    /// Sgpr-homed here: `analyze_divergence` only calls the result Divergent (which is what put
+    /// it on this path rather than `lower_bin_scalar`) if at least one operand is Divergent, so
+    /// at most one is Uniform (hence Sgpr-homed). See the module header's "hardware constraint"
+    /// paragraph for why that fact is exactly what keeps every case below legal.
+    fn lower_narrow_bin(&mut self, dst: u8, op: BinOp, a: ValRef, b: ValRef) {
         use BinOp::*;
+        let a_home = self.home(a);
+        let b_home = self.home(b);
+        let a_r = self.val(a)[0];
+        let b_r = self.val(b)[0];
         match op {
-            Add => self.push(enc::vop2(Vop2Op::AddNcU32, dst, VSrc::Vgpr(a), b)),
-            Sub => self.push(enc::vop2(Vop2Op::SubNcU32, dst, VSrc::Vgpr(a), b)),
-            And => self.push(enc::vop2(Vop2Op::AndB32, dst, VSrc::Vgpr(a), b)),
-            Or => self.push(enc::vop2(Vop2Op::OrB32, dst, VSrc::Vgpr(a), b)),
-            Xor => self.push(enc::vop2(Vop2Op::XorB32, dst, VSrc::Vgpr(a), b)),
-            Shl => self.push(enc::vop2(Vop2Op::LshlrevB32, dst, VSrc::Vgpr(b), a)),
-            Lshr => self.push(enc::vop2(Vop2Op::LshrrevB32, dst, VSrc::Vgpr(b), a)),
-            Ashr => self.push(enc::vop2(Vop2Op::AshrrevI32, dst, VSrc::Vgpr(b), a)),
+            // Commutative, VOP2-encoded: `a` already sits in the general (Sgpr-capable) slot
+            // and `b` in the fixed-VGPR slot, so swap when `b` is the Sgpr-homed one.
+            Add | And | Or | Xor | FAdd | FMul => {
+                let vop = match op {
+                    Add => Vop2Op::AddNcU32,
+                    And => Vop2Op::AndB32,
+                    Or => Vop2Op::OrB32,
+                    Xor => Vop2Op::XorB32,
+                    FAdd => Vop2Op::AddF32,
+                    FMul => Vop2Op::MulF32,
+                    _ => unreachable!(),
+                };
+                let (src0, vsrc1) = if b_home == Home::Sgpr {
+                    (VSrc::Sgpr(b_r), a_r)
+                } else {
+                    (vsrc_of(a_home, a_r), b_r)
+                };
+                self.push(enc::vop2(vop, dst, src0, vsrc1));
+            }
+            // VOP3-encoded (no VOP2 form exists): every slot is general, so both operands can
+            // be passed directly regardless of which one (if either) is Sgpr-homed.
             Mul => self.push(enc::vop3(
                 Vop3Op::MulLoU32,
                 dst,
-                VSrc::Vgpr(a),
-                VSrc::Vgpr(b),
+                vsrc_of(a_home, a_r),
+                vsrc_of(b_home, b_r),
                 VSrc::Sgpr(0),
                 Vop3Mods::default(),
             )),
-            FAdd => self.push(enc::vop2(Vop2Op::AddF32, dst, VSrc::Vgpr(a), b)),
-            FSub => self.push(enc::vop2(Vop2Op::SubF32, dst, VSrc::Vgpr(a), b)),
-            FMul => self.push(enc::vop2(Vop2Op::MulF32, dst, VSrc::Vgpr(a), b)),
+            // Non-commutative, VOP2-encoded, no reverse form for integers: if `b` needs the
+            // general slot, materialize it into a scratch VGPR instead of inventing one.
+            Sub => {
+                if b_home == Home::Sgpr {
+                    let b_v = self.materialize(b, &SCRATCH_B)[0];
+                    self.push(enc::vop2(Vop2Op::SubNcU32, dst, vsrc_of(a_home, a_r), b_v));
+                } else {
+                    self.push(enc::vop2(Vop2Op::SubNcU32, dst, vsrc_of(a_home, a_r), b_r));
+                }
+            }
+            // `a - b` with `b` needing the general slot: `SubrevF32` computes `vsrc1 - src0`,
+            // so passing `(src0=b, vsrc1=a)` yields exactly `a - b` with no fallback needed.
+            FSub => {
+                if b_home == Home::Sgpr {
+                    self.push(enc::vop2(Vop2Op::SubrevF32, dst, VSrc::Sgpr(b_r), a_r));
+                } else {
+                    self.push(enc::vop2(Vop2Op::SubF32, dst, vsrc_of(a_home, a_r), b_r));
+                }
+            }
+            // "rev" encoding: the shift amount (`b`) already sits in the general slot, the
+            // value (`a`) in the fixed-VGPR slot. If `a` needs that slot, materialize it —
+            // there is no algebraic trick for the value operand the way `SubrevF32` gives Sub.
+            Shl | Lshr | Ashr => {
+                let vop = match op {
+                    Shl => Vop2Op::LshlrevB32,
+                    Lshr => Vop2Op::LshrrevB32,
+                    Ashr => Vop2Op::AshrrevI32,
+                    _ => unreachable!(),
+                };
+                if a_home == Home::Sgpr {
+                    let a_v = self.materialize(a, &SCRATCH_A)[0];
+                    self.push(enc::vop2(vop, dst, vsrc_of(b_home, b_r), a_v));
+                } else {
+                    self.push(enc::vop2(vop, dst, vsrc_of(b_home, b_r), a_r));
+                }
+            }
             Div | Rem | FDiv | FRem => {
                 unreachable!("check_module refuses div/rem before codegen starts")
             }
@@ -1041,42 +1591,114 @@ impl<'a> CodeGen<'a> {
     }
 
     fn lower_icmp(&mut self, id: InstId, pred: ICmpPred, a: ValRef, b: ValRef) {
+        if self.is_sgpr(id) {
+            self.lower_icmp_scalar(id, pred, a, b);
+            return;
+        }
         let dst = self.dst(id)[0];
+        let a_home = self.home(a);
+        let b_home = self.home(b);
         let a_r = self.val(a)[0];
         let b_r = self.val(b)[0];
-        self.push(enc::vopc_e32(icmp_vcmp(pred), VSrc::Vgpr(a_r), b_r));
+        // At most one of `a`/`b` can be Sgpr-homed (see `lower_narrow_bin`'s own comment for
+        // why); swap operands and flip the predicate rather than materialize when it's `b`,
+        // since `VOPC`'s `VSRC1` slot is VGPR-only.
+        let (pred, src0, vsrc1) = if b_home == Home::Sgpr {
+            (flip_icmp(pred), VSrc::Sgpr(b_r), a_r)
+        } else {
+            (pred, vsrc_of(a_home, a_r), b_r)
+        };
+        self.push(enc::vopc_e32(icmp_vcmp(pred), src0, vsrc1));
         self.materialize_bool(dst);
     }
 
     fn lower_fcmp(&mut self, id: InstId, pred: FCmpPred, a: ValRef, b: ValRef) {
+        // `op_scalarizable` never gives `FCmp` an Sgpr home (no scalar-ALU float compare in
+        // this ISA subset), so this is always the vector path.
         let dst = self.dst(id)[0];
+        let a_home = self.home(a);
+        let b_home = self.home(b);
         let a_r = self.val(a)[0];
         let b_r = self.val(b)[0];
-        self.push(enc::vopc_e32(fcmp_vcmp(pred), VSrc::Vgpr(a_r), b_r));
+        let (pred, src0, vsrc1) = if b_home == Home::Sgpr {
+            (flip_fcmp(pred), VSrc::Sgpr(b_r), a_r)
+        } else {
+            (pred, vsrc_of(a_home, a_r), b_r)
+        };
+        self.push(enc::vopc_e32(fcmp_vcmp(pred), src0, vsrc1));
         self.materialize_bool(dst);
     }
 
+    fn lower_icmp_scalar(&mut self, id: InstId, pred: ICmpPred, a: ValRef, b: ValRef) {
+        let dst = self.dst(id)[0];
+        let a_r = self.val(a)[0];
+        let b_r = self.val(b)[0];
+        self.push(enc::sopc(icmp_sopc(pred), Src::Sgpr(a_r), Src::Sgpr(b_r)));
+        self.push(enc::sop2(
+            Sop2Op::CselectB32,
+            dst,
+            Src::Imm(Imm::Int(1)),
+            Src::Imm(Imm::Int(0)),
+        ));
+    }
+
     fn lower_select(&mut self, id: InstId, c: ValRef, a: ValRef, b: ValRef) {
-        let cond = self.val(c)[0];
-        self.push(enc::vopc_e32(VCmpOp::NeI32, VSrc::Imm(Imm::Int(0)), cond));
+        if self.is_sgpr(id) {
+            self.lower_select_scalar(id, c, a, b);
+            return;
+        }
+        // `v_cndmask_b32` already spends the one allowed scalar operand on `vcc_lo` (a real,
+        // always-read operand, not a filler), so `a`/`b` are unconditionally materialized into
+        // scratch VGPRs when Sgpr-homed, regardless of how many of them are — see the module
+        // header's "hardware constraint" paragraph. `c` gets the same treatment, since
+        // `vopc_e32`'s own `VSRC1` slot is VGPR-only.
+        let c_v = self.materialize(c, &SCRATCH_A)[0];
+        self.push(enc::vopc_e32(VCmpOp::NeI32, VSrc::Imm(Imm::Int(0)), c_v));
         let dst = self.dst(id).to_vec();
-        let a_r = self.val(a).to_vec();
-        let b_r = self.val(b).to_vec();
+        let a_regs = self.materialize(a, &SCRATCH_A);
+        let b_regs = self.materialize(b, &SCRATCH_B);
         for i in 0..dst.len() {
             self.push(enc::vop3(
                 Vop3Op::CndmaskB32,
                 dst[i],
-                VSrc::Vgpr(b_r[i]),
-                VSrc::Vgpr(a_r[i]),
+                VSrc::Vgpr(b_regs[i]),
+                VSrc::Vgpr(a_regs[i]),
                 VSrc::Sgpr(VCC_LO),
                 Vop3Mods::default(),
             ));
         }
     }
 
+    /// The scalar-ALU form of `Op::Select`, used when `op_scalarizable` already confirmed the
+    /// condition and both results are Sgpr-homed.
+    fn lower_select_scalar(&mut self, id: InstId, c: ValRef, a: ValRef, b: ValRef) {
+        let dst = self.dst(id).to_vec();
+        let c_r = self.val(c)[0];
+        let a_regs = self.val(a).to_vec();
+        let b_regs = self.val(b).to_vec();
+        self.push(enc::sopc(
+            SopcOp::LgU32,
+            Src::Sgpr(c_r),
+            Src::Imm(Imm::Int(0)),
+        ));
+        for i in 0..dst.len() {
+            self.push(enc::sop2(
+                Sop2Op::CselectB32,
+                dst[i],
+                Src::Sgpr(a_regs[i]),
+                Src::Sgpr(b_regs[i]),
+            ));
+        }
+    }
+
     fn lower_cast(&mut self, id: InstId, cop: CastOp, sty: Ty, v: ValRef, dty: Ty) {
+        if self.is_sgpr(id) {
+            self.lower_cast_scalar(id, cop, sty, v, dty);
+            return;
+        }
         let dst = self.dst(id).to_vec();
         let src = self.val(v).to_vec();
+        let src_home = self.home(v);
         let i1 = Ty::Scalar(Scalar::I1);
         let i32_ = Ty::Scalar(Scalar::I32);
         let i64_ = Ty::Scalar(Scalar::I64);
@@ -1132,10 +1754,30 @@ impl<'a> CodeGen<'a> {
                     unreachable!("check_cast restricts Sext to i1->i32 or i32->i64");
                 }
             }
-            CastOp::FpToSi => self.push(enc::vop1(Vop1Op::CvtI32F32, dst[0], VSrc::Vgpr(src[0]))),
-            CastOp::FpToUi => self.push(enc::vop1(Vop1Op::CvtU32F32, dst[0], VSrc::Vgpr(src[0]))),
-            CastOp::SiToFp => self.push(enc::vop1(Vop1Op::CvtF32I32, dst[0], VSrc::Vgpr(src[0]))),
-            CastOp::UiToFp => self.push(enc::vop1(Vop1Op::CvtF32U32, dst[0], VSrc::Vgpr(src[0]))),
+            // These four have no scalar-ALU conversion in this ISA subset (see the module
+            // header), so their source can genuinely be Sgpr-homed while the destination
+            // stays Vgpr — `Vop1`'s single operand slot is general, so no materialization is
+            // needed either way.
+            CastOp::FpToSi => self.push(enc::vop1(
+                Vop1Op::CvtI32F32,
+                dst[0],
+                vsrc_of(src_home, src[0]),
+            )),
+            CastOp::FpToUi => self.push(enc::vop1(
+                Vop1Op::CvtU32F32,
+                dst[0],
+                vsrc_of(src_home, src[0]),
+            )),
+            CastOp::SiToFp => self.push(enc::vop1(
+                Vop1Op::CvtF32I32,
+                dst[0],
+                vsrc_of(src_home, src[0]),
+            )),
+            CastOp::UiToFp => self.push(enc::vop1(
+                Vop1Op::CvtF32U32,
+                dst[0],
+                vsrc_of(src_home, src[0]),
+            )),
             CastOp::Bitcast => {
                 for i in 0..dst.len() {
                     self.mov(dst[i], src[i]);
@@ -1146,6 +1788,84 @@ impl<'a> CodeGen<'a> {
             }
         }
         let _ = f32_;
+    }
+
+    /// The scalar-ALU form of `Op::Cast`, used when `op_scalarizable` already confirmed the
+    /// source is Sgpr-homed and `cast_scalarizable` confirmed `cop` has a scalar equivalent
+    /// (`Trunc`/`Zext`/`Sext`/`Bitcast` — never a float<->int conversion, see the module
+    /// header). Mirrors `lower_cast`'s vector-path arithmetic exactly, `SOP1`/`SOP2` in place
+    /// of `VOP1`/`VOP2`.
+    fn lower_cast_scalar(&mut self, id: InstId, cop: CastOp, sty: Ty, v: ValRef, dty: Ty) {
+        let dst = self.dst(id).to_vec();
+        let src = self.val(v).to_vec();
+        let i1 = Ty::Scalar(Scalar::I1);
+        let i32_ = Ty::Scalar(Scalar::I32);
+        let i64_ = Ty::Scalar(Scalar::I64);
+        match cop {
+            CastOp::Trunc => {
+                if (sty, dty) == (i32_, i1) {
+                    self.push(enc::sop2(
+                        Sop2Op::AndB32,
+                        dst[0],
+                        Src::Sgpr(src[0]),
+                        Src::Imm(Imm::Int(1)),
+                    ));
+                } else if (sty, dty) == (i64_, i32_) {
+                    self.smov(dst[0], src[0]);
+                } else {
+                    unreachable!("check_cast restricts Trunc to i32->i1 or i64->i32");
+                }
+            }
+            CastOp::Zext => {
+                if (sty, dty) == (i1, i32_) {
+                    self.smov(dst[0], src[0]);
+                } else if (sty, dty) == (i32_, i64_) {
+                    self.smov(dst[0], src[0]);
+                    self.push(enc::sop1(Sop1Op::MovB32, dst[1], Src::Imm(Imm::Int(0))));
+                } else {
+                    unreachable!("check_cast restricts Zext to i1->i32 or i32->i64");
+                }
+            }
+            CastOp::Sext => {
+                if (sty, dty) == (i1, i32_) {
+                    self.push(enc::sop2(
+                        Sop2Op::LshlB32,
+                        dst[0],
+                        Src::Sgpr(src[0]),
+                        Src::Imm(Imm::Int(31)),
+                    ));
+                    self.push(enc::sop2(
+                        Sop2Op::AshrI32,
+                        dst[0],
+                        Src::Sgpr(dst[0]),
+                        Src::Imm(Imm::Int(31)),
+                    ));
+                } else if (sty, dty) == (i32_, i64_) {
+                    self.smov(dst[0], src[0]);
+                    self.push(enc::sop2(
+                        Sop2Op::AshrI32,
+                        dst[1],
+                        Src::Sgpr(dst[0]),
+                        Src::Imm(Imm::Int(31)),
+                    ));
+                } else {
+                    unreachable!("check_cast restricts Sext to i1->i32 or i32->i64");
+                }
+            }
+            CastOp::Bitcast => {
+                for i in 0..dst.len() {
+                    self.smov(dst[i], src[i]);
+                }
+            }
+            CastOp::FpToSi
+            | CastOp::FpToUi
+            | CastOp::SiToFp
+            | CastOp::UiToFp
+            | CastOp::FpTrunc
+            | CastOp::FpExt => unreachable!(
+                "cast_scalarizable never marks a float<->int or f64 cast Sgpr-eligible"
+            ),
+        }
     }
 
     fn width_load_store(ty: Ty) -> (bool, u32) {
@@ -1162,7 +1882,11 @@ impl<'a> CodeGen<'a> {
     }
 
     fn lower_load(&mut self, id: InstId, ptr: ValRef, space: AddrSpace, ty: Ty) {
-        let addr = self.val(ptr).to_vec();
+        // `enc::ds_load`/`flat_load` take a plain VGPR register number, never a general
+        // operand, so the address is materialized first if it happens to be Sgpr-homed (see
+        // the module header); the loaded value itself is always Vgpr-homed regardless
+        // (`op_scalarizable` never marks a `Load` result Sgpr-eligible).
+        let addr = self.materialize(ptr, &SCRATCH_A);
         let dst = self.dst(id).to_vec();
         let (wide, bytes) = Self::width_load_store(ty);
         if is_ds_space(space) {
@@ -1193,8 +1917,10 @@ impl<'a> CodeGen<'a> {
     }
 
     fn lower_store(&mut self, ptr: ValRef, val: ValRef, space: AddrSpace, ty: Ty) {
-        let addr = self.val(ptr).to_vec();
-        let data = self.val(val).to_vec();
+        // Same reasoning as `lower_load`: both the address and the stored value must be plain
+        // VGPRs, so each is materialized first if Sgpr-homed.
+        let addr = self.materialize(ptr, &SCRATCH_A);
+        let data = self.materialize(val, &SCRATCH_B);
         let (wide, bytes) = Self::width_load_store(ty);
         if is_ds_space(space) {
             let op = match bytes {
@@ -1247,16 +1973,10 @@ impl<'a> CodeGen<'a> {
         }
     }
 
-    fn lower_bid(&mut self, id: InstId, sgpr: Option<u8>) {
-        let dst = self.dst(id)[0];
-        let s = sgpr.expect("BidUsage::scan found this axis used, so its SGPR must be assigned");
-        self.push(enc::vop1(Vop1Op::MovB32, dst, VSrc::Sgpr(s)));
-    }
-
     fn lower_atomic(&mut self, id: InstId, aop: AtomicOp, ptr: ValRef, val: ValRef) {
         let dst = self.dst(id)[0];
-        let addr = self.val(ptr)[0];
-        let data = self.val(val)[0];
+        let addr = self.materialize(ptr, &SCRATCH_A)[0];
+        let data = self.materialize(val, &SCRATCH_B)[0];
         self.push(enc::flat_atomic(
             Seg::Global,
             atomic_flatop(aop),
@@ -1277,9 +1997,21 @@ impl<'a> CodeGen<'a> {
         };
         for (phi_id, val) in copies {
             let dst = self.dst(phi_id).to_vec();
+            let dst_home = self.alloc.inst_home[phi_id.0 as usize];
             let src = self.val(val).to_vec();
+            let src_home = self.home(val);
             for i in 0..dst.len() {
-                self.mov(dst[i], src[i]);
+                match (dst_home, src_home) {
+                    (Home::Vgpr, Home::Vgpr) => self.mov(dst[i], src[i]),
+                    (Home::Vgpr, Home::Sgpr) => {
+                        self.push(enc::vop1(Vop1Op::MovB32, dst[i], VSrc::Sgpr(src[i])));
+                    }
+                    (Home::Sgpr, Home::Sgpr) => self.smov(dst[i], src[i]),
+                    (Home::Sgpr, Home::Vgpr) => unreachable!(
+                        "op_scalarizable's Phi rule requires every incoming value to already \
+                         be Sgpr-homed before the phi itself is given an Sgpr home"
+                    ),
+                }
             }
         }
     }
@@ -1291,10 +2023,28 @@ impl<'a> CodeGen<'a> {
                 self.push_branch_to_block(enc::s_branch(0), *target);
             }
             Term::CondBr(cond, t, f) => {
-                let c = self.val(*cond)[0];
-                self.push(enc::vopc_e32(VCmpOp::NeI32, VSrc::Imm(Imm::Int(0)), c));
+                // A Uniform (Sgpr-homed) condition gets a real scalar branch: every lane
+                // necessarily agrees on its outcome, so no `vcc`/exec-mask reasoning is needed
+                // at all (see the module header). Otherwise, unchanged: the condition is
+                // re-derived into `vcc_lo` and a vector-compare-driven branch used instead.
+                let cbranch_bytes = match self.home(*cond) {
+                    Home::Sgpr => {
+                        let c = self.val(*cond)[0];
+                        self.push(enc::sopc(
+                            SopcOp::LgU32,
+                            Src::Sgpr(c),
+                            Src::Imm(Imm::Int(0)),
+                        ));
+                        enc::s_cbranch(BrCc::Scc1, 0)
+                    }
+                    Home::Vgpr => {
+                        let c = self.val(*cond)[0];
+                        self.push(enc::vopc_e32(VCmpOp::NeI32, VSrc::Imm(Imm::Int(0)), c));
+                        enc::s_cbranch(BrCc::Vccnz, 0)
+                    }
+                };
                 let cbranch_pos = self.code.len();
-                self.push(enc::s_cbranch(BrCc::Vccnz, 0));
+                self.push(cbranch_bytes);
                 let fallback_pos = self.code.len();
                 self.push(enc::s_branch(0));
                 self.patch_to_current(cbranch_pos);
@@ -1344,16 +2094,14 @@ impl Backend for Amdgcn {
 }
 
 fn lower_function(f: &Function) -> Result<Vec<u8>, Diag> {
-    let alloc = RegAlloc::build(f)?;
+    let alloc = build_regalloc(f)?;
     let (offsets, total_size) = kernarg_layout(f)?;
     let bid = BidUsage::scan(f);
-    let bid_sgpr = bid.sgprs();
     let phi_copies = build_phi_copies(f);
     let mut cg = CodeGen {
         f,
         alloc,
         phi_copies,
-        bid_sgpr,
         code: Vec::new(),
         block_start: HashMap::new(),
         pending: Vec::new(),
@@ -1368,20 +2116,44 @@ fn lower_function(f: &Function) -> Result<Vec<u8>, Diag> {
     }
     cg.resolve_pending();
 
+    let homed_regs = || {
+        cg.alloc
+            .param_home
+            .iter()
+            .zip(cg.alloc.param_reg.iter())
+            .chain(cg.alloc.inst_home.iter().zip(cg.alloc.inst_reg.iter()))
+    };
     let vgpr_count = {
         let mut top: u16 = FIRST_FREE_VGPR;
-        for regs in cg.alloc.param_vgpr.iter().chain(cg.alloc.inst_vgpr.iter()) {
-            if let Some(&last) = regs.last() {
-                top = top.max(last as u16 + 1);
+        for (&home, regs) in homed_regs() {
+            if home == Home::Vgpr {
+                if let Some(&last) = regs.last() {
+                    top = top.max(last as u16 + 1);
+                }
             }
         }
         top as u32
+    };
+    // Purely descriptive metadata (`hsaco.rs`'s own header notes `compute_pgm_rsrc1`'s SGPR
+    // field is unused on GFX10+ — real hardware no longer tracks per-wave SGPR allocation
+    // there), so this doesn't gate correctness the way `vgpr_count` does, but it is still
+    // computed honestly rather than left at some placeholder constant.
+    let sgpr_count = {
+        let mut top: u32 = if total_size > 0 { 2 } else { 0 };
+        for (&home, regs) in homed_regs() {
+            if home == Home::Sgpr {
+                if let Some(&last) = regs.last() {
+                    top = top.max(last as u32 + 1);
+                }
+            }
+        }
+        top
     };
 
     let spec = HsacoSpec::new(GfxArch::Gfx1100, f.name.clone(), cg.code)
         .with_kernarg_segment(total_size, 8)
         .with_workgroup_ids(bid.x, bid.y, bid.z)
-        .with_register_counts(vgpr_count, 32, 0, 0);
+        .with_register_counts(vgpr_count, sgpr_count, 0, 0);
     write_hsaco(&spec)
 }
 
@@ -1787,5 +2559,314 @@ mod tests {
         let a = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
         let b = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
         assert_eq!(a, b);
+    }
+
+    // ---- divergence-aware register homes ---------------------------------------------------
+
+    /// `%0 = tid.x; %1 = add i32 %0, %arg0`: a parameter (always Uniform) and a value derived
+    /// from `tid.x` (always Divergent) both live at once — the base case this task exists for.
+    #[test]
+    fn uniform_param_gets_sgpr_home_and_divergent_tid_gets_vgpr_home() {
+        let f = Function {
+            name: "mix".into(),
+            params: vec![Ty::Scalar(Scalar::I32)],
+            ret: Ty::Void,
+            insts: vec![
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::TidX,
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::Bin(BinOp::Add, ValRef::Val(InstId(0)), ValRef::Param(0)),
+                },
+            ],
+            blocks: vec![Block {
+                insts: vec![InstId(0), InstId(1)],
+                term: Term::Ret(None),
+            }],
+        };
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(
+            alloc.param_home[0],
+            Home::Sgpr,
+            "every parameter is always Uniform"
+        );
+        assert_eq!(alloc.inst_home[0], Home::Vgpr, "tid.x is always Divergent");
+        assert_eq!(
+            alloc.inst_home[1],
+            Home::Vgpr,
+            "an add reading a Divergent operand stays Divergent"
+        );
+    }
+
+    /// `%0 = add i32 %arg0, %arg1`: both operands Uniform, so the add itself is Uniform and
+    /// has a real `SOP2` form — it should be given an Sgpr home, not a Vgpr one.
+    #[test]
+    fn uniform_bin_of_two_uniform_params_gets_sgpr_home_and_lowers_deterministically() {
+        let f = Function {
+            name: "uniform_add".into(),
+            params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::Bin(BinOp::Add, ValRef::Param(0), ValRef::Param(1)),
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+            }],
+        };
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(alloc.inst_home[0], Home::Sgpr);
+
+        let module = wrap(f);
+        assert_eq!(Amdgcn.supports(&module), Support::Supported);
+        let a = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        let b = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// A 64-bit `Bin` of two Uniform `i64` params (`func_wide_mul`) is still never Sgpr-homed:
+    /// this ISA subset's scalar ALU has no 64-bit arithmetic, so "Uniform" alone isn't enough —
+    /// see the module header's "what does and doesn't get scalarized" section.
+    #[test]
+    fn wide_uniform_bin_never_gets_sgpr_home() {
+        let f = func_wide_mul();
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(alloc.param_home[0], Home::Sgpr);
+        assert_eq!(alloc.param_home[1], Home::Sgpr);
+        assert_eq!(
+            alloc.inst_home[0],
+            Home::Vgpr,
+            "a wide Bin has no scalar-ALU form, even though both operands are Uniform"
+        );
+    }
+
+    /// `Op::BidX` is homed at the exact fixed SGPR the kernel descriptor preloads it into —
+    /// not allocated from the general pool.
+    #[test]
+    fn bidx_is_homed_at_its_fixed_preloaded_sgpr() {
+        let f = Function {
+            name: "bidx".into(),
+            params: vec![],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::BidX,
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+            }],
+        };
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(alloc.inst_home[0], Home::Sgpr);
+        assert_eq!(alloc.inst_reg[0], vec![BID_SGPR_BASE]);
+    }
+
+    /// `func_branch_with_phi`'s phi merges two Uniform constants downstream of a branch on a
+    /// Divergent condition (`tid.x < %arg1`); `analyze_divergence`'s own control-flow taint
+    /// (Part 2 of its header) forces the phi Divergent regardless, so it must stay Vgpr-homed
+    /// even though both incoming constants are individually Sgpr-homed.
+    #[test]
+    fn phi_after_divergent_branch_stays_vgpr_even_with_uniform_incoming_consts() {
+        let f = func_branch_with_phi();
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(alloc.inst_home[2], Home::Sgpr, "const 1 is Uniform");
+        assert_eq!(alloc.inst_home[3], Home::Sgpr, "const 2 is Uniform");
+        assert_eq!(
+            alloc.inst_home[4],
+            Home::Vgpr,
+            "control-flow taint forces the phi Divergent despite both incomings being Uniform"
+        );
+    }
+
+    /// `if (%arg1 < 5) {...} else {...}`: the branch condition is Uniform (a parameter compared
+    /// against a constant), so the phi merging two Uniform constants downstream of it is
+    /// **not** tainted, and both the condition and the phi should end up Sgpr-homed — driving
+    /// `Term::CondBr`'s scalar-branch form (`s_cmp`/`s_cbranch_scc1`) instead of the `vcc` one.
+    fn func_uniform_branch_with_phi() -> Function {
+        Function {
+            name: "uniform_branch".into(),
+            params: vec![Ty::Ptr(AddrSpace::Global), Ty::Scalar(Scalar::I32)],
+            ret: Ty::Void,
+            insts: vec![
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::ConstInt(5),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::I1),
+                    op: Op::ICmp(
+                        ICmpPred::Slt,
+                        Ty::Scalar(Scalar::I32),
+                        ValRef::Param(1),
+                        ValRef::Val(InstId(0)),
+                    ),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::ConstInt(1),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::ConstInt(2),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::Phi(vec![
+                        (BlockId(1), ValRef::Val(InstId(2))),
+                        (BlockId(2), ValRef::Val(InstId(3))),
+                    ]),
+                },
+                Inst {
+                    ty: Ty::Void,
+                    op: Op::Store {
+                        ptr: ValRef::Param(0),
+                        val: ValRef::Val(InstId(4)),
+                        ty: Ty::Scalar(Scalar::I32),
+                        space: AddrSpace::Global,
+                        align: 4,
+                        volatile: false,
+                    },
+                },
+            ],
+            blocks: vec![
+                Block {
+                    insts: vec![InstId(0), InstId(1)],
+                    term: Term::CondBr(ValRef::Val(InstId(1)), BlockId(1), BlockId(2)),
+                },
+                Block {
+                    insts: vec![InstId(2)],
+                    term: Term::Br(BlockId(3)),
+                },
+                Block {
+                    insts: vec![InstId(3)],
+                    term: Term::Br(BlockId(3)),
+                },
+                Block {
+                    insts: vec![InstId(4), InstId(5)],
+                    term: Term::Ret(None),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn uniform_condbr_condition_and_phi_are_sgpr_homed_and_emit_deterministically() {
+        let f = func_uniform_branch_with_phi();
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(
+            alloc.inst_home[1],
+            Home::Sgpr,
+            "icmp of a parameter against a constant is Uniform"
+        );
+        assert_eq!(
+            alloc.inst_home[4],
+            Home::Sgpr,
+            "a phi downstream of a Uniform branch, with Uniform incoming values, stays Uniform"
+        );
+
+        let module = wrap(f);
+        assert_eq!(Amdgcn.supports(&module), Support::Supported);
+        let a = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        let b = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        assert_eq!(a, b, "same module in must produce byte-identical bytes out");
+    }
+
+    /// `select(icmp slt tid.x, %arg1, 10.0, 20.0)`: the condition is Divergent (derived from
+    /// `tid.x`), but both results are Uniform float constants — the fallback case described in
+    /// the module header, where `v_cndmask_b32` already spends the one allowed scalar operand
+    /// on `vcc_lo`, so both results are materialized into scratch VGPRs regardless of how many
+    /// of them are Sgpr-homed.
+    fn func_select_divergent_cond_uniform_results() -> Function {
+        Function {
+            name: "select_fallback".into(),
+            params: vec![Ty::Ptr(AddrSpace::Global), Ty::Scalar(Scalar::I32)],
+            ret: Ty::Void,
+            insts: vec![
+                Inst {
+                    ty: Ty::Scalar(Scalar::I32),
+                    op: Op::TidX,
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::I1),
+                    op: Op::ICmp(
+                        ICmpPred::Slt,
+                        Ty::Scalar(Scalar::I32),
+                        ValRef::Val(InstId(0)),
+                        ValRef::Param(1),
+                    ),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::F32),
+                    op: Op::ConstFloat(10.0),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::F32),
+                    op: Op::ConstFloat(20.0),
+                },
+                Inst {
+                    ty: Ty::Scalar(Scalar::F32),
+                    op: Op::Select(
+                        ValRef::Val(InstId(1)),
+                        ValRef::Val(InstId(2)),
+                        ValRef::Val(InstId(3)),
+                    ),
+                },
+                Inst {
+                    ty: Ty::Void,
+                    op: Op::Store {
+                        ptr: ValRef::Param(0),
+                        val: ValRef::Val(InstId(4)),
+                        ty: Ty::Scalar(Scalar::F32),
+                        space: AddrSpace::Global,
+                        align: 4,
+                        volatile: false,
+                    },
+                },
+            ],
+            blocks: vec![Block {
+                insts: vec![
+                    InstId(0),
+                    InstId(1),
+                    InstId(2),
+                    InstId(3),
+                    InstId(4),
+                    InstId(5),
+                ],
+                term: Term::Ret(None),
+            }],
+        }
+    }
+
+    #[test]
+    fn select_with_divergent_cond_and_uniform_results_falls_back_correctly() {
+        let f = func_select_divergent_cond_uniform_results();
+        let alloc = build_regalloc(&f).unwrap();
+        assert_eq!(
+            alloc.inst_home[1],
+            Home::Vgpr,
+            "icmp on a value derived from tid.x stays Divergent"
+        );
+        assert_eq!(
+            alloc.inst_home[2],
+            Home::Sgpr,
+            "a uniform float constant is Sgpr-homed"
+        );
+        assert_eq!(alloc.inst_home[3], Home::Sgpr);
+        assert_eq!(
+            alloc.inst_home[4],
+            Home::Vgpr,
+            "select's own result is Divergent (the condition is), even though both results \
+             individually are Uniform"
+        );
+
+        let module = wrap(f);
+        assert_eq!(Amdgcn.supports(&module), Support::Supported);
+        let a = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        let b = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        assert_eq!(a, b, "same module in must produce byte-identical bytes out");
     }
 }
