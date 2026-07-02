@@ -1,4 +1,4 @@
-// The Phase 5 proof: a real CUDA-C kernel, compiled through this project's own frontend/sema/
+// The real GPU proof: a real CUDA-C kernel, compiled through this project's own frontend/sema/
 // passes/PTX backend, JIT-loaded and launched on real hardware via the real CUDA Driver API,
 // with the result checked byte-for-byte against a host-computed answer. This is the GPU
 // counterpart to `basalt-x86`'s `link_and_run.rs`: that test proves the oracle's object code

@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+basalt-bir = { path = "../basalt-bir" }
+basalt-backend = { path = "../basalt-backend" }
+basalt-diag = { path = "../basalt-diag" }
+inkwell = { version = "0.9.0", features = ["llvm18-1"], optional = true }
+
+[features]
+llvm = ["dep:inkwell"]

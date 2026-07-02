@@ -8,7 +8,7 @@ name = "basalt"
 path = "src/main.rs"
 
 [features]
-llvm = ["dep:basalt-llvm"]
+llvm = ["dep:basalt-llvm", "basalt-llvm/llvm"]
 mlir = ["dep:basalt-mlir"]
 clif = ["dep:basalt-clif"]
 ptx = []
