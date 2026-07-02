@@ -11,9 +11,21 @@
 // `regalloc::allocate` consumes SSA-form BIR (typically `construct_ssa`'s output) and assigns
 // every value a fixed register or spill-slot location via linear scan; see that module's
 // header for the algorithm and its documented simplifications.
+//
+// `dom::Dominators`/`dom::detect_loops` compute a function's dominator relation and natural
+// loops from its own control flow (source-level `for`/`while`/`do-while`, not the sequential
+// per-thread loop a CPU backend synthesizes at emission time, which BIR has no visibility
+// into). `constfold::constant_fold` and `dce::eliminate_dead_code` are straightforward BIR to
+// BIR cleanups; see each module's header for what they cover and what they deliberately don't.
 
+mod constfold;
+mod dce;
+mod dom;
 mod regalloc;
 mod ssa;
 
+pub use constfold::constant_fold;
+pub use dce::eliminate_dead_code;
+pub use dom::{detect_loops, Dominators, NaturalLoop};
 pub use regalloc::{allocate, Allocation, Location, RegClass, ValueId};
 pub use ssa::construct_ssa;
