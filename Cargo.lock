@@ -67,6 +67,7 @@ dependencies = [
  "basalt-bir",
  "basalt-diag",
  "basalt-frontend-c",
+ "basalt-runtime",
  "basalt-sema",
  "inkwell",
  "object",

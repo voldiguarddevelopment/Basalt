@@ -12,6 +12,7 @@ inkwell = { version = "0.9.0", features = ["llvm18-1"], optional = true }
 [dev-dependencies]
 object = { version = "0.39", default-features = false, features = ["read", "elf"] }
 basalt-frontend-c = { path = "../basalt-frontend-c" }
+basalt-runtime = { path = "../basalt-runtime" }
 basalt-sema = { path = "../basalt-sema" }
 
 [features]

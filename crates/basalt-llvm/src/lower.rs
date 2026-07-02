@@ -352,6 +352,22 @@ fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag
     if dialect == GpuDialect::Amdgpu && f.ret == Ty::Void {
         llvm_fn.set_call_conventions(AMDGPU_KERNEL_CALL_CONV);
     }
+    // Nvptx's counterpart to the above: the NVPTX backend only emits `.visible .entry` (a
+    // dispatchable kernel a host can `cuModuleGetFunction`/`cuLaunchKernel`) for a function
+    // named in a module-level `!nvvm.annotations` node tagged `"kernel"`; anything else prints
+    // as an ordinary `.visible .func` device subroutine, confirmed empirically against a real
+    // LLVM 18 NVPTX `TargetMachine`. There is no calling-convention equivalent on this dialect.
+    if dialect == GpuDialect::Nvptx && f.ret == Ty::Void {
+        let kernel_flag = ctx.i32_type().const_int(1, false);
+        let annotation = ctx.metadata_node(&[
+            llvm_fn.as_global_value().as_pointer_value().into(),
+            ctx.metadata_string("kernel").into(),
+            kernel_flag.into(),
+        ]);
+        llvm_mod
+            .add_global_metadata("nvvm.annotations", &annotation)
+            .expect("appending a well-formed node to a fresh named metadata list");
+    }
 
     let params: Vec<BasicValueEnum<'ctx>> = (0..f.params.len() as u32)
         .map(|i| {

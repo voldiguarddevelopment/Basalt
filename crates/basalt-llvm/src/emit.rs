@@ -28,11 +28,13 @@
 // of this type" error, a clean `LLVMString` `emit_object` turns into an ordinary `Err(Diag)`,
 // not a crash and not a silent fallback to another format. This is confirmed empirically, not
 // assumed (see `emit/tests.rs`): the identical `TargetMachine` asked for `FileType::Assembly`
-// instead succeeds and prints ordinary PTX text (`.version 6.0`, `.target sm_70`, `.visible
-// .func ...` — LLVM 18's NVPTX backend defaults to PTX ISA 6.0 when none is requested, older
-// than the `.version 8.0` `basalt-ptx` emits by hand). So `emit_object(..., LlvmTarget::Nvptx)`
-// always returns `Err(UnsupportedFeature)` today; the NVPTX backend itself works fine, only
-// its object-file path is missing in this LLVM build.
+// instead succeeds and prints ordinary PTX text (`.version 6.0`, `.target sm_70`, a
+// `.visible .entry` per void-returning kernel function — LLVM 18's NVPTX backend defaults to
+// PTX ISA 6.0 when none is requested, older than the `.version 8.0` `basalt-ptx` emits by
+// hand). So `emit_object(..., LlvmTarget::Nvptx)` always returns `Err(UnsupportedFeature)`
+// today; the NVPTX backend itself works fine, only its object-file path is missing in this
+// LLVM build. `emit_assembly` (below) is the real path to that PTX text for any caller that
+// needs it (e.g. a JIT loader, which only ever wants text, never an object).
 //
 // # X86 and BIR's GPU index ops
 //
@@ -178,6 +180,51 @@ pub fn emit_object(
                 .with_arg(format!("LLVM object emission failed: {e}"))
         })?;
     Ok(buf.as_slice().to_vec())
+}
+
+/// Same pipeline as `emit_object` but asks `TargetMachine` for `FileType::Assembly` instead of
+/// `FileType::Object`, returning the printed text rather than object bytes. This is the only
+/// path to real PTX text out of this crate for `Nvptx`: see the module header for why
+/// `FileType::Object` always fails on that target (no NVPTX object-file writer in this LLVM
+/// build) while `FileType::Assembly` succeeds and prints ordinary `.version`/`.target`/`.visible
+/// .entry` PTX.
+pub fn emit_assembly(
+    module: &Module,
+    llvm_ctx: &Context,
+    target: LlvmTarget,
+) -> Result<String, Diag> {
+    let flattened;
+    let module = if target == LlvmTarget::X86 && crate::cpu_flatten::uses_gpu_index_ops(module) {
+        flattened = crate::cpu_flatten::flatten_to_native_cpu_loop(module)?;
+        &flattened
+    } else {
+        module
+    };
+
+    let llvm_mod = lower_module(module, llvm_ctx, target.dialect())?;
+    llvm_mod
+        .verify()
+        .expect("this crate's own lowering always produces valid LLVM IR");
+
+    let (tm, triple) = target_machine(target)?;
+    llvm_mod.set_triple(&triple);
+    llvm_mod.set_data_layout(&tm.get_target_data().get_data_layout());
+
+    let buf = tm
+        .write_to_memory_buffer(&llvm_mod, FileType::Assembly)
+        .map_err(|e| {
+            Diag::new(ECode::UnsupportedFeature)
+                .with_arg(format!("LLVM assembly emission failed: {e}"))
+        })?;
+    // `write_to_memory_buffer` hands back a C-string-convention buffer with a trailing NUL
+    // this crate's callers never want (e.g. `cuModuleLoadData` via `basalt-runtime`, which
+    // NUL-terminates the text itself and rejects an interior/trailing NUL of its own).
+    let bytes = buf.as_slice();
+    let text_bytes = match bytes.last() {
+        Some(0) => &bytes[..bytes.len() - 1],
+        _ => bytes,
+    };
+    Ok(String::from_utf8_lossy(text_bytes).into_owned())
 }
 
 /// The AMDGCN target-machine object-emission path, wrapped as an ordinary `Backend` so the

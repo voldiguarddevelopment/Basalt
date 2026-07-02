@@ -13,6 +13,6 @@ mod emit;
 mod lower;
 
 #[cfg(feature = "llvm")]
-pub use emit::{emit_object, LlvmAmdgcn, LlvmTarget};
+pub use emit::{emit_assembly, emit_object, LlvmAmdgcn, LlvmTarget};
 #[cfg(feature = "llvm")]
 pub use lower::{lower_module, GpuDialect};
