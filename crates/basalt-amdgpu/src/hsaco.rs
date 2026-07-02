@@ -87,28 +87,76 @@ const STV_PROTECTED: u8 = 3;
 const R_AMDGPU_REL64: u32 = 5;
 const NT_AMDGPU_METADATA: u32 = 32;
 
-/// The GFX architecture a HSACO targets. One variant for now — this project's AMDGPU backend
-/// only handles `gfx1100` (RDNA3, wave32; see `enc.rs`'s own module header) — kept as an
-/// explicit field rather than a hardcoded literal so a second target is a variant away, not a
-/// rewrite.
+/// The GFX architecture a HSACO targets: the six RDNA3/GFX11 variants confirmed, empirically,
+/// to assemble this backend's own instruction encoder (`enc.rs`) identically to `gfx1100` (see
+/// `GfxArch::parse`'s own doc comment for the verification method). GFX10, GFX12, and CDNA are
+/// deliberately not variants here — each is a real, confirmed ISA-level break with this
+/// encoder (different memory-op mnemonics on GFX10, a different atomic/SMEM cache-policy-bit
+/// layout on GFX12, near-total incompatibility on CDNA; see `lower.rs`'s own module header) —
+/// so a caller asking for one of those gets a clean refusal (`GfxArch::parse` returns `None`)
+/// rather than a `GfxArch` that would misrepresent it as "just another GFX11 flavor."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GfxArch {
     Gfx1100,
+    Gfx1101,
+    Gfx1102,
+    Gfx1103,
+    Gfx1150,
+    Gfx1151,
 }
 
 impl GfxArch {
-    /// `EF_AMDGPU_MACH_AMDGCN_GFX1100`. The whole `e_flags` value for this target: no
-    /// XNACK/SRAMECC feature bits are set because RDNA3 supports neither, matching the
-    /// reference exactly (`e_flags == 0x41`, no bits outside the 8-bit mach-code field).
+    /// Parses a `--target-variant`-style GFX name (e.g. `"gfx1101"`) into a `GfxArch`.
+    /// Recognizes exactly the six names below — no fuzzy matching, no case-insensitivity —
+    /// each confirmed real and byte-compatible with every one of this backend's ~250
+    /// instruction forms via `llvm-mc-18 -triple=amdgcn-amd-amdhsa -mcpu=<name>
+    /// -show-encoding` (every distinct mnemonic `enc.rs` emits, checked against every
+    /// variant) plus `llvm-mc-18 ... -filetype=obj` piped through `readelf -h` (the resulting
+    /// `e_flags`, cross-checked against `mach_code()` below). Anything else — including a real
+    /// GFX10/GFX12/CDNA name confirmed *incompatible* by that same method (see `lower.rs`'s
+    /// own module header) and plain nonsense — returns `None`; callers turn that into a clean
+    /// `E093` refusal, never a guess. `gfx1152` is real silicon but is deliberately not a
+    /// variant here: LLVM 18 (the only toolchain available anywhere in this project) does not
+    /// recognize it as a processor at all ("not a recognized processor for this target"), so it
+    /// cannot be verified, and this project's own doctrine is to never claim an unverifiable
+    /// target.
+    pub fn parse(name: &str) -> Option<GfxArch> {
+        match name {
+            "gfx1100" => Some(GfxArch::Gfx1100),
+            "gfx1101" => Some(GfxArch::Gfx1101),
+            "gfx1102" => Some(GfxArch::Gfx1102),
+            "gfx1103" => Some(GfxArch::Gfx1103),
+            "gfx1150" => Some(GfxArch::Gfx1150),
+            "gfx1151" => Some(GfxArch::Gfx1151),
+            _ => None,
+        }
+    }
+
+    /// `EF_AMDGPU_MACH_AMDGCN_GFX*`. The whole `e_flags` value for this target: no
+    /// XNACK/SRAMECC feature bits are set for any of the six (RDNA3 supports neither),
+    /// matching the reference exactly for `gfx1100` (`e_flags == 0x41`, no bits outside the
+    /// 8-bit mach-code field) and confirmed the same way for the other five (`llvm-mc-18
+    /// -mcpu=<name> -filetype=obj` + `readelf -h`): `gfx1101` = `0x46`, `gfx1102` = `0x47`,
+    /// `gfx1103` = `0x44`, `gfx1150` = `0x43`, `gfx1151` = `0x4a`.
     fn mach_code(self) -> u32 {
         match self {
             GfxArch::Gfx1100 => 0x41,
+            GfxArch::Gfx1101 => 0x46,
+            GfxArch::Gfx1102 => 0x47,
+            GfxArch::Gfx1103 => 0x44,
+            GfxArch::Gfx1150 => 0x43,
+            GfxArch::Gfx1151 => 0x4a,
         }
     }
 
     fn target_triple(self) -> &'static str {
         match self {
             GfxArch::Gfx1100 => "amdgcn-amd-amdhsa--gfx1100",
+            GfxArch::Gfx1101 => "amdgcn-amd-amdhsa--gfx1101",
+            GfxArch::Gfx1102 => "amdgcn-amd-amdhsa--gfx1102",
+            GfxArch::Gfx1103 => "amdgcn-amd-amdhsa--gfx1103",
+            GfxArch::Gfx1150 => "amdgcn-amd-amdhsa--gfx1150",
+            GfxArch::Gfx1151 => "amdgcn-amd-amdhsa--gfx1151",
         }
     }
 }
@@ -635,6 +683,29 @@ mod tests {
     fn endpgm_spec() -> HsacoSpec {
         // s_endpgm; encoding: [0x00,0x00,0xb0,0xbf] (see enc.rs's own sopp_fixed_form_opcodes)
         HsacoSpec::new(GfxArch::Gfx1100, "endpgm_test", crate::enc::s_endpgm())
+    }
+
+    #[test]
+    fn parse_round_trips_every_real_variant_to_its_verified_mach_code() {
+        let cases = [
+            ("gfx1100", GfxArch::Gfx1100, 0x41),
+            ("gfx1101", GfxArch::Gfx1101, 0x46),
+            ("gfx1102", GfxArch::Gfx1102, 0x47),
+            ("gfx1103", GfxArch::Gfx1103, 0x44),
+            ("gfx1150", GfxArch::Gfx1150, 0x43),
+            ("gfx1151", GfxArch::Gfx1151, 0x4a),
+        ];
+        for (name, arch, mach_code) in cases {
+            assert_eq!(GfxArch::parse(name), Some(arch), "{name}");
+            assert_eq!(arch.mach_code(), mach_code, "{name}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_confirmed_incompatible_and_nonsense_names() {
+        for name in ["gfx1030", "gfx1200", "gfx942", "not-a-target"] {
+            assert_eq!(GfxArch::parse(name), None, "{name}");
+        }
     }
 
     #[test]

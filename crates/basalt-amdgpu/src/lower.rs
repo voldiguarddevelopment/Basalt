@@ -1,8 +1,49 @@
-// BIR-to-AMDGCN (gfx1100) lowering: the `Backend` impl (`Amdgcn`) that turns a BIR `Module`
+// BIR-to-AMDGCN (RDNA3/GFX11) lowering: the `Backend` impl (`Amdgcn`) that turns a BIR `Module`
 // into a real HSACO object, built directly on `enc`'s instruction encoders and `hsaco`'s
 // container writer. This is the project's first hand-rolled backend that targets genuine
 // concurrent SIMT hardware (shared property with `basalt-ptx`, see that crate's own header) —
 // there is no synthesized per-thread loop anywhere in this file.
+//
+// # Target selection
+//
+// `emit`'s `EmitOpts::target_variant` picks which real GFX target the emitted HSACO's
+// `e_flags`/metadata target string report: `None` defaults to `gfx1100` (RDNA3, wave32, this
+// backend's original and still-default target), `Some(name)` selects among the five other
+// variants `GfxArch::parse` recognizes (`gfx1101`/`gfx1102`/`gfx1103`/`gfx1150`/`gfx1151`; see
+// `hsaco.rs`'s own header for the verification method and exact citations). All six are
+// confirmed, empirically, to assemble every one of this backend's ~250 instruction forms
+// identically — the only thing that changes per variant is `hsaco::HsacoSpec`'s own `gfx_arch`
+// field (`e_flags`, `amdhsa.target`), never a single byte of `.text`. Any other string —
+// including a real GFX10/GFX12/CDNA name (`GfxArch::parse` deliberately does not recognize
+// them, see below) or plain nonsense — is refused with `E093` at `emit` before any lowering
+// happens, never silently downgraded to `gfx1100`.
+//
+// Three real target families are refused rather than added as variants, each for a confirmed
+// (not merely unverified) reason:
+//   - **GFX10.x** (`gfx1010`/`gfx1012`/`gfx1030`/`gfx1031`/`gfx1032`, and by strong inference
+//     the rest of the family): uses an entirely different memory-instruction mnemonic/opcode
+//     scheme (`s_load_dword`/`global_load_dword`-style naming) than the `_b32`/`_b64`-suffixed
+//     GFX11 forms this encoder was built against — every SMEM/DS/FLAT/GLOBAL form this backend
+//     emits (56 of ~250 distinct instruction forms) fails to assemble under GFX10 at all. This
+//     is a real ISA generation break in exactly the op family this backend leans on hardest,
+//     not a cosmetic difference; supporting it for real needs a whole separate memory-op
+//     encoding table, out of scope here.
+//   - **GFX12.x/RDNA4** (`gfx1200`/`gfx1201`, and by strong inference the rest): the ALU
+//     (SOP*/VOP*) set assembles identically to GFX11, but RDNA4 restructured the GLC/SLC/DLC
+//     cache-policy bits into a different field layout, and the two forms this backend's own
+//     lowering actually emits with those bits set — `global_atomic_*_u32 ..., off glc` (every
+//     `Op::Atomic` lowering requests `glc`, see `lower_atomic`/`enc::flat_atomic`'s
+//     `glc = vdst.is_some()`) and `s_load_b32 ..., 0x0 glc dlc` (the kernarg prologue) — fail
+//     to assemble ("invalid operand for instruction"). Since both are load-bearing for a kernel
+//     this backend can actually produce, this is a real incompatibility, not theoretical; fixing
+//     it needs real GFX12 cache-policy-field verification first, out of scope here.
+//   - **CDNA** (`gfx90a`/`gfx942`): a different architecture family entirely (wave64, largely
+//     no direct RDNA3 VOP3/VALU equivalence) — overwhelmingly incompatible, not remotely close.
+//
+// All three refusals above, and `GfxArch::parse`'s exact recognized-name list, were verified
+// with `llvm-mc-18` against every distinct instruction mnemonic this file's own `enc.rs`
+// emits — see `hsaco.rs`'s `GfxArch` doc comments for the precise commands and per-variant
+// results.
 //
 // # Scope: one validated kernel first, not universal BIR coverage
 //
@@ -2066,9 +2107,11 @@ impl<'a> CodeGen<'a> {
     }
 }
 
-/// The hand-rolled RDNA3 (gfx1100) backend. `name()` returns `"amdgpu"` — a stable identifier a
+/// The hand-rolled RDNA3/GFX11 backend. `name()` returns `"amdgpu"` — a stable identifier a
 /// later CLI wire-up would register under `--amdgpu` (that wiring is not this task's job; see
-/// the module header's scope note).
+/// the module header's scope note). `gfx1100` is the default target (`EmitOpts::target_variant
+/// == None`); see the module header's "Target selection" section for the other variants
+/// `supports`/`emit` accept and what they refuse.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Amdgcn;
 
@@ -2078,22 +2121,40 @@ impl Backend for Amdgcn {
     }
 
     fn supports(&self, module: &Module) -> Support {
+        // `Support::supports` has no `EmitOpts` of its own to read (the trait signature is
+        // shared by every backend, see `basalt-backend`), so it only ever checks module-level
+        // BIR coverage; target-variant validity is checked in `emit`, which does receive
+        // `EmitOpts` — see `resolve_gfx_arch`.
         match check_module(module) {
             Ok(()) => Support::Supported,
             Err(diag) => Support::Unsupported(diag.code),
         }
     }
 
-    fn emit(&self, module: &Module, _opts: &EmitOpts) -> Result<Artifact, Diag> {
+    fn emit(&self, module: &Module, opts: &EmitOpts) -> Result<Artifact, Diag> {
         check_module(module)?;
+        let gfx_arch = resolve_gfx_arch(opts)?;
         let ssa_module = construct_ssa(module);
         let f = &ssa_module.funcs[0];
-        let bytes = lower_function(f)?;
+        let bytes = lower_function(f, gfx_arch)?;
         Ok(Artifact::bytes(ArtifactKind::Object, bytes))
     }
 }
 
-fn lower_function(f: &Function) -> Result<Vec<u8>, Diag> {
+/// Reads `EmitOpts::target_variant` and resolves it to a real, verified `GfxArch` — `None`
+/// defaults to `gfx1100` (this backend's original, still-default target); `Some(name)` where
+/// `GfxArch::parse` recognizes `name` selects that variant; any other string (a real
+/// GFX10/GFX12/CDNA name confirmed incompatible with this encoder, or plain nonsense) is a
+/// clean `E093` refusal, never a silent fallback to `gfx1100` (see the module header's "Target
+/// selection" section).
+fn resolve_gfx_arch(opts: &EmitOpts) -> Result<GfxArch, Diag> {
+    match &opts.target_variant {
+        None => Ok(GfxArch::Gfx1100),
+        Some(name) => GfxArch::parse(name).ok_or_else(e_feature),
+    }
+}
+
+fn lower_function(f: &Function, gfx_arch: GfxArch) -> Result<Vec<u8>, Diag> {
     let alloc = build_regalloc(f)?;
     let (offsets, total_size) = kernarg_layout(f)?;
     let bid = BidUsage::scan(f);
@@ -2150,7 +2211,7 @@ fn lower_function(f: &Function) -> Result<Vec<u8>, Diag> {
         top
     };
 
-    let spec = HsacoSpec::new(GfxArch::Gfx1100, f.name.clone(), cg.code)
+    let spec = HsacoSpec::new(gfx_arch, f.name.clone(), cg.code)
         .with_kernarg_segment(total_size, 8)
         .with_workgroup_ids(bid.x, bid.y, bid.z)
         .with_register_counts(vgpr_count, sgpr_count, 0, 0);
@@ -2161,6 +2222,7 @@ fn lower_function(f: &Function) -> Result<Vec<u8>, Diag> {
 mod tests {
     use super::*;
     use basalt_bir::{Block, Inst};
+    use object::read::{Object as ReadObject, ObjectSection};
 
     fn wrap(f: Function) -> Module {
         Module {
@@ -2299,6 +2361,90 @@ mod tests {
         let a = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
         let b = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
         assert_eq!(a, b);
+    }
+
+    fn with_target_variant(name: &str) -> EmitOpts {
+        EmitOpts {
+            target_variant: Some(name.into()),
+            ..EmitOpts::default()
+        }
+    }
+
+    #[test]
+    fn target_variant_none_behaves_exactly_like_the_default_gfx1100_path() {
+        let module = wrap(func_store_const());
+        let default = Amdgcn.emit(&module, &EmitOpts::default()).unwrap();
+        let explicit = Amdgcn
+            .emit(&module, &with_target_variant("gfx1100"))
+            .unwrap();
+        assert_eq!(
+            default, explicit,
+            "target_variant: None must be identical to an explicit gfx1100"
+        );
+    }
+
+    #[test]
+    fn target_variant_selects_a_real_non_default_gfx11_variant() {
+        let module = wrap(func_store_const());
+        let default_bytes = Amdgcn
+            .emit(&module, &EmitOpts::default())
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .to_vec();
+        let variant_bytes = Amdgcn
+            .emit(&module, &with_target_variant("gfx1101"))
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .to_vec();
+
+        // e_flags lives at ELF header offset 48..52 (see hsaco.rs::write_hsaco).
+        let e_flags = |b: &[u8]| u32::from_le_bytes([b[48], b[49], b[50], b[51]]);
+        assert_eq!(e_flags(&default_bytes), 0x41, "gfx1100's verified e_flags");
+        assert_eq!(e_flags(&variant_bytes), 0x46, "gfx1101's verified e_flags");
+        assert_ne!(
+            default_bytes, variant_bytes,
+            "e_flags/metadata must differ per selected target"
+        );
+
+        // Every one of the six GFX11 variants assembles this backend's instruction subset
+        // identically (see the module header's "Target selection" section) — only the
+        // HSACO's own e_flags/metadata change, never a byte of .text.
+        let file_default = object::read::File::parse(&*default_bytes).unwrap();
+        let file_variant = object::read::File::parse(&*variant_bytes).unwrap();
+        let text_default = file_default
+            .section_by_name(".text")
+            .unwrap()
+            .data()
+            .unwrap();
+        let text_variant = file_variant
+            .section_by_name(".text")
+            .unwrap()
+            .data()
+            .unwrap();
+        assert_eq!(
+            text_default, text_variant,
+            ".text payload must not depend on the selected gfx target"
+        );
+    }
+
+    #[test]
+    fn target_variant_refuses_a_confirmed_incompatible_target() {
+        let module = wrap(func_store_const());
+        let err = Amdgcn
+            .emit(&module, &with_target_variant("gfx1030"))
+            .unwrap_err();
+        assert_eq!(err.code, ECode::UnsupportedFeature);
+    }
+
+    #[test]
+    fn target_variant_refuses_an_unrecognized_string() {
+        let module = wrap(func_store_const());
+        let err = Amdgcn
+            .emit(&module, &with_target_variant("not-a-real-target"))
+            .unwrap_err();
+        assert_eq!(err.code, ECode::UnsupportedFeature);
     }
 
     #[test]
