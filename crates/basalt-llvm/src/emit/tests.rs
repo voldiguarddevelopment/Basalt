@@ -11,7 +11,8 @@
 
 use super::*;
 use basalt_bir::{
-    BinOp, Block, Function, Inst, InstId, LaunchBounds, Op, Scalar, Term, Ty, ValRef,
+    AddrSpace, BinOp, Block, Function, Inst, InstId, LaunchBounds, MmaLayout, Op, Scalar, Term, Ty,
+    ValRef,
 };
 use inkwell::context::Context;
 use inkwell::targets::{InitializationConfig, Target, TargetTriple};
@@ -134,6 +135,45 @@ fn llvm_amdgcn_backend_supports_and_emits_a_trivial_module() {
 
     let file = object::read::File::parse(bytes).expect("parses as a real object file");
     assert_eq!(file.format(), object::BinaryFormat::Elf);
+}
+
+#[test]
+fn llvm_amdgcn_backend_refuses_mma_cleanly() {
+    let ptr_global = Ty::Ptr(AddrSpace::Global);
+    let module = wrap(Function {
+        name: "usesmma".into(),
+        params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
+        ret: Ty::Void,
+        insts: vec![Inst {
+            ty: Ty::Void,
+            op: Op::Mma {
+                a: ValRef::Param(0),
+                b: ValRef::Param(1),
+                c: ValRef::Param(2),
+                d: ValRef::Param(3),
+                m: 2,
+                n: 2,
+                k: 2,
+                in_dtype: Scalar::F32,
+                acc_dtype: Scalar::F32,
+                layout_a: MmaLayout::RowMajor,
+                layout_b: MmaLayout::RowMajor,
+            },
+        }],
+        blocks: vec![Block {
+            insts: vec![InstId(0)],
+            term: Term::Ret(None),
+        }],
+    });
+    let backend = LlvmAmdgcn;
+    assert_eq!(
+        backend.supports(&module),
+        Support::Unsupported(ECode::UnsupportedOp)
+    );
+    let err = backend
+        .emit(&module, &EmitOpts::default())
+        .expect_err("emit must refuse what supports() refuses, not guess");
+    assert_eq!(err.code, ECode::UnsupportedOp);
 }
 
 /// Confirms `emit.rs`'s own header claim precisely: it is `FileType::Object` that is missing

@@ -10,8 +10,9 @@
 //      are "necessarily live" roots because they have an effect beyond their own SSA result
 //      (or, for `load`, because a `volatile` one's effect *is* the read itself, e.g. a
 //      hardware register, which must never be assumed elidable just because nothing
-//      consumes the loaded value): `store`, `barrier`, `atomic`/`atomic.cas`, and any
-//      `volatile` `load`. A block's own `Term` operand (a `condbr` condition, a `switch`
+//      consumes the loaded value): `store`, `barrier`, `atomic`/`atomic.cas`, `mma` (it
+//      writes through its `d` operand and produces no SSA result of its own to be "unused"),
+//      and any `volatile` `load`. A block's own `Term` operand (a `condbr` condition, a `switch`
 //      scrutinee, a `ret` value) is live for the same reason — control flow and the
 //      function's result are always observed. Liveness then propagates backward from every
 //      root through its own operands, transitively, via a worklist, until nothing new is
@@ -100,6 +101,7 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         Op::Ballot(a) | Op::VoteAny(a) | Op::VoteAll(a) => vec![*a],
         Op::Atomic(_, ptr, v, _) => vec![*ptr, *v],
         Op::AtomicCas(ptr, cmp, new, _) => vec![*ptr, *cmp, *new],
+        Op::Mma { a, b, c, d, .. } => vec![*a, *b, *c, *d],
     }
 }
 
@@ -176,6 +178,31 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
         Op::VoteAll(a) => Op::VoteAll(f(*a)),
         Op::Atomic(o, ptr, v, s) => Op::Atomic(*o, f(*ptr), f(*v), *s),
         Op::AtomicCas(ptr, cmp, new, s) => Op::AtomicCas(f(*ptr), f(*cmp), f(*new), *s),
+        Op::Mma {
+            a,
+            b,
+            c,
+            d,
+            m,
+            n,
+            k,
+            in_dtype,
+            acc_dtype,
+            layout_a,
+            layout_b,
+        } => Op::Mma {
+            a: f(*a),
+            b: f(*b),
+            c: f(*c),
+            d: f(*d),
+            m: *m,
+            n: *n,
+            k: *k,
+            in_dtype: *in_dtype,
+            acc_dtype: *acc_dtype,
+            layout_a: *layout_a,
+            layout_b: *layout_b,
+        },
     }
 }
 
@@ -184,7 +211,9 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
 /// that effect (a `volatile` `load`'s read must never be assumed droppable).
 fn is_root(op: &Op) -> bool {
     match op {
-        Op::Store { .. } | Op::Barrier | Op::Atomic(..) | Op::AtomicCas(..) => true,
+        Op::Store { .. } | Op::Barrier | Op::Atomic(..) | Op::AtomicCas(..) | Op::Mma { .. } => {
+            true
+        }
         Op::Load { volatile, .. } => *volatile,
         _ => false,
     }

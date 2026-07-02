@@ -4,8 +4,8 @@
 // live/dead or reachable/unreachable shape.
 
 use basalt_bir::{
-    AddrSpace, AtomicOp, BinOp, Block, BlockId, Function, Inst, InstId, Module, Op, Scalar, Term,
-    Ty, ValRef,
+    AddrSpace, AtomicOp, BinOp, Block, BlockId, Function, Inst, InstId, MmaLayout, Module, Op,
+    Scalar, Term, Ty, ValRef,
 };
 use basalt_passes::eliminate_dead_code;
 
@@ -199,6 +199,47 @@ fn side_effecting_ops_survive_with_unused_results() {
         .insts
         .iter()
         .any(|i| matches!(i.op, Op::Load { volatile: true, .. })));
+    assert_roundtrip(&out);
+}
+
+#[test]
+fn mma_survives_dce_despite_unused_result() {
+    // `mma` is `Ty::Void` (it has no SSA result at all, live or otherwise) but writes
+    // through its `d` pointer, so it must survive as a root exactly like `store`.
+    let mut b = FnB::new();
+    let a = ValRef::Param(0);
+    let bref = ValRef::Param(1);
+    let c = ValRef::Param(2);
+    let d = ValRef::Param(3);
+    b.push_void(Op::Mma {
+        a,
+        b: bref,
+        c,
+        d,
+        m: 2,
+        n: 2,
+        k: 2,
+        in_dtype: Scalar::F32,
+        acc_dtype: Scalar::F32,
+        layout_a: MmaLayout::RowMajor,
+        layout_b: MmaLayout::RowMajor,
+    });
+    b.end_block(Term::Ret(None));
+    let f = b.finish(
+        "f",
+        vec![PTR_GLOBAL, PTR_GLOBAL, PTR_GLOBAL, PTR_GLOBAL],
+        Ty::Void,
+    );
+    let m = module_of(vec![f]);
+
+    let out = eliminate_dead_code(&m);
+    assert_eq!(
+        out.funcs[0].insts.len(),
+        1,
+        "mma must survive as a root even though nothing reads a result from it: {}",
+        basalt_bir::print(&out)
+    );
+    assert!(matches!(out.funcs[0].insts[0].op, Op::Mma { .. }));
     assert_roundtrip(&out);
 }
 

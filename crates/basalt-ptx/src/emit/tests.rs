@@ -1,11 +1,11 @@
 // Coverage: one representative case per BIR op category this backend claims to support (hand-
 // built modules, mirroring `basalt-x86`'s own test style), a phi/control-flow test, the real
-// frontend/sema/passes pipeline over `tests/kernels/vector_add.cu`, determinism, and the one
-// refusal this backend actually takes (`f16`).
+// frontend/sema/passes pipeline over `tests/kernels/vector_add.cu`, determinism, and the
+// refusals this backend actually takes (`f16`, `mma`).
 
 use super::*;
 use basalt_backend::{Backend, EmitOpts, Support};
-use basalt_bir::{Block, Inst};
+use basalt_bir::{Block, Inst, MmaLayout};
 
 fn wrap(f: Function) -> Module {
     Module {
@@ -611,6 +611,41 @@ fn f16_arithmetic_is_refused_not_guessed() {
         Support::Unsupported(basalt_diag::ECode::UnsupportedType)
     );
     assert!(Ptx.emit(&module, &EmitOpts::default()).is_err());
+}
+
+#[test]
+fn mma_is_refused_not_guessed() {
+    let ptr_global = Ty::Ptr(AddrSpace::Global);
+    let f = simple_fn(
+        "usesmma",
+        vec![ptr_global, ptr_global, ptr_global, ptr_global],
+        vec![Inst {
+            ty: Ty::Void,
+            op: Op::Mma {
+                a: ValRef::Param(0),
+                b: ValRef::Param(1),
+                c: ValRef::Param(2),
+                d: ValRef::Param(3),
+                m: 2,
+                n: 2,
+                k: 2,
+                in_dtype: Scalar::F32,
+                acc_dtype: Scalar::F32,
+                layout_a: MmaLayout::RowMajor,
+                layout_b: MmaLayout::RowMajor,
+            },
+        }],
+        Term::Ret(None),
+    );
+    let module = wrap(f);
+    assert_eq!(
+        Ptx.supports(&module),
+        Support::Unsupported(basalt_diag::ECode::UnsupportedOp)
+    );
+    let err = Ptx
+        .emit(&module, &EmitOpts::default())
+        .expect_err("emit must refuse what supports() refuses, not guess");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
 }
 
 #[test]

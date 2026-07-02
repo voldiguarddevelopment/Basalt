@@ -157,7 +157,7 @@ fn classify_rule(op: &Op) -> Rule {
         Op::Load { ptr, .. } => Rule::FromOperands(vec![*ptr]),
         Op::Phi(incoming) => Rule::FromOperands(incoming.iter().map(|(_, v)| *v).collect()),
         // No result (`Ty::Void`): never looked up, but every `Op` needs a rule.
-        Op::Store { .. } | Op::Barrier => Rule::Fixed(Divergence::Uniform),
+        Op::Store { .. } | Op::Barrier | Op::Mma { .. } => Rule::Fixed(Divergence::Uniform),
     }
 }
 

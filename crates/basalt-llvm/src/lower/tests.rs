@@ -5,7 +5,7 @@
 // without target-machine object emission (out of scope for this file).
 
 use super::*;
-use basalt_bir::{Block, InstId, LaunchBounds};
+use basalt_bir::{Block, InstId, LaunchBounds, MmaLayout};
 use inkwell::context::Context;
 
 fn wrap(f: Function) -> Module {
@@ -403,6 +403,41 @@ fn amdgpu_block_dim_is_a_clean_refusal_not_a_panic() {
     let ctx = Context::create();
     let err = lower_module(&wrap(f), &ctx, GpuDialect::Amdgpu)
         .expect_err("bdim.x has no confident amdgpu mapping in this lane");
+    assert_eq!(err.code, ECode::UnsupportedOp);
+}
+
+#[test]
+fn mma_is_a_clean_refusal_not_a_panic() {
+    let ptr_global = Ty::Ptr(AddrSpace::Global);
+    let f = Function {
+        name: "usesmma".into(),
+        params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
+        ret: Ty::Void,
+        insts: vec![Inst {
+            ty: Ty::Void,
+            op: Op::Mma {
+                a: ValRef::Param(0),
+                b: ValRef::Param(1),
+                c: ValRef::Param(2),
+                d: ValRef::Param(3),
+                m: 2,
+                n: 2,
+                k: 2,
+                in_dtype: Scalar::F32,
+                acc_dtype: Scalar::F32,
+                layout_a: MmaLayout::RowMajor,
+                layout_b: MmaLayout::RowMajor,
+            },
+        }],
+        blocks: vec![Block {
+            insts: ids(1),
+            term: Term::Ret(None),
+        }],
+    };
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx)
+        .expect_err("mma has no LLVM IR lowering in this lane yet");
     assert_eq!(err.code, ECode::UnsupportedOp);
 }
 

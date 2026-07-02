@@ -200,6 +200,31 @@ fn remap_op(op: &Op, inst_offset: u32, block_offset: u32) -> Op {
         Op::VoteAll(v) => Op::VoteAll(rv(*v)),
         Op::Atomic(o, ptr, val, s) => Op::Atomic(*o, rv(*ptr), rv(*val), *s),
         Op::AtomicCas(ptr, cmp, newv, s) => Op::AtomicCas(rv(*ptr), rv(*cmp), rv(*newv), *s),
+        Op::Mma {
+            a,
+            b,
+            c,
+            d,
+            m,
+            n,
+            k,
+            in_dtype,
+            acc_dtype,
+            layout_a,
+            layout_b,
+        } => Op::Mma {
+            a: rv(*a),
+            b: rv(*b),
+            c: rv(*c),
+            d: rv(*d),
+            m: *m,
+            n: *n,
+            k: *k,
+            in_dtype: *in_dtype,
+            acc_dtype: *acc_dtype,
+            layout_a: *layout_a,
+            layout_b: *layout_b,
+        },
     }
 }
 

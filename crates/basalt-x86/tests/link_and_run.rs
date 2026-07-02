@@ -25,7 +25,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use basalt_backend::{Backend, EmitOpts, Support};
-use basalt_bir::{BinOp, Block, Function, Inst, InstId, Module, Op, Scalar, Term, Ty, ValRef};
+use basalt_bir::{
+    AddrSpace, BinOp, Block, Function, Inst, InstId, MmaLayout, Module, Op, Scalar, Term, Ty,
+    ValRef,
+};
 use basalt_frontend_c::PpOpts;
 use basalt_x86::X86Oracle;
 
@@ -217,6 +220,70 @@ fn hand_built_add_i32_links_and_runs() {
     write_object(bytes, &obj);
 
     compile_link_and_run(&root, "examples/cpu_launch_add_i32.c", &obj, "add_i32");
+
+    let _ = std::fs::remove_file(&obj);
+}
+
+/// `mma2x2(ptr.global, ptr.global, ptr.global, ptr.global) -> void`: `D = A*B + C` at
+/// `M=N=K=2`, row-major `A`/`B`, `f32` throughout — the same fixture as `oracle.rs`'s own
+/// private `func_mma2x2` (reconstructed here for the same reason `hand_built_add_i32` mirrors
+/// `func_add_i32`). All four params are pointers (integer-class), so `nthreads` is the fifth
+/// integer register, `r8`.
+fn hand_built_mma2x2() -> Module {
+    let ptr_global = Ty::Ptr(AddrSpace::Global);
+    let f = Function {
+        name: "mma2x2".into(),
+        params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
+        ret: Ty::Void,
+        insts: vec![Inst {
+            ty: Ty::Void,
+            op: Op::Mma {
+                a: ValRef::Param(0),
+                b: ValRef::Param(1),
+                c: ValRef::Param(2),
+                d: ValRef::Param(3),
+                m: 2,
+                n: 2,
+                k: 2,
+                in_dtype: Scalar::F32,
+                acc_dtype: Scalar::F32,
+                layout_a: MmaLayout::RowMajor,
+                layout_b: MmaLayout::RowMajor,
+            },
+        }],
+        blocks: vec![Block {
+            insts: vec![InstId(0)],
+            term: Term::Ret(None),
+        }],
+    };
+    Module {
+        funcs: vec![f],
+        launch_bounds: None,
+        shared_mem_bytes: 0,
+        target_dtypes: vec![],
+    }
+}
+
+#[test]
+fn hand_built_mma2x2_links_and_runs() {
+    if !cc_available() {
+        eprintln!("skipping hand_built_mma2x2_links_and_runs: `cc` not found");
+        return;
+    }
+
+    let module = hand_built_mma2x2();
+    assert_eq!(X86Oracle.supports(&module), Support::Supported);
+    let artifact = X86Oracle
+        .emit(&module, &EmitOpts::default())
+        .expect("oracle emit succeeds for hand-built mma2x2");
+    let bytes = artifact.as_bytes().expect("oracle emits an object payload");
+
+    let root = workspace_root();
+    let pid = std::process::id();
+    let obj = std::env::temp_dir().join(format!("basalt_mma2x2_{pid}.o"));
+    write_object(bytes, &obj);
+
+    compile_link_and_run(&root, "examples/cpu_launch_mma2x2.c", &obj, "mma2x2");
 
     let _ = std::fs::remove_file(&obj);
 }

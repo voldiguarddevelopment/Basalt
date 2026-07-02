@@ -49,6 +49,9 @@
 //   atomic.add|atomic.sub|atomic.exch|atomic.min|atomic.max|atomic.and|atomic.or|atomic.xor
 //                                       <ty> <ptr_ty> <val> "," <val>
 //   atomic.cas <ty> <ptr_ty> <val> "," <val> "," <val>
+//   mma <in_dtype> <acc_dtype> <layout> <layout> "m" int "n" int "k" int
+//                                       <val> "," <val> "," <val> "," <val>
+//                                       ; layout: row|col ; operands: a, b, c, d
 //
 // term      := "br" "bb" int
 //            | "condbr" <val> "," "bb" int "," "bb" int
@@ -73,7 +76,7 @@ mod ty;
 
 pub use ir::{
     AtomicOp, BinOp, Block, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, InstId,
-    LaunchBounds, Module, Op, ShuffleKind, Term, ValRef,
+    LaunchBounds, MmaLayout, Module, Op, ShuffleKind, Term, ValRef,
 };
 pub use parse::{parse, ParseError};
 pub use print::print;

@@ -168,6 +168,7 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         Op::Ballot(a) | Op::VoteAny(a) | Op::VoteAll(a) => vec![*a],
         Op::Atomic(_, ptr, v, _) => vec![*ptr, *v],
         Op::AtomicCas(ptr, cmp, new, _) => vec![*ptr, *cmp, *new],
+        Op::Mma { a, b, c, d, .. } => vec![*a, *b, *c, *d],
     }
 }
 

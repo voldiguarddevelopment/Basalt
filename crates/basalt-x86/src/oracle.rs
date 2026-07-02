@@ -97,6 +97,27 @@
 // present. A multi-function module is refused (`E093`): `ElfObjectSpec` binds exactly one
 // named symbol to the whole `.text` payload, which has nothing sound to do with a second
 // function's code.
+//
+// # `mma`
+//
+// Lowered as a genuine triple-nested runtime loop (`for i in 0..m { for j in 0..n { for k in
+// 0..k { ... } } }`), not unrolled — `m`/`n`/`k` are ordinary compile-time `u32` fields on the
+// op, but this backend still emits real loop counters (their own stack homes, exactly like
+// the outer per-thread loop's own `loopctr_home`) so code size stays flat regardless of tile
+// size. Every element access recomputes its byte address from scratch each iteration (row/col
+// times the operand's own leading dimension, times its element width, plus the base pointer)
+// — no cleverness, no strength reduction, matching this backend's whole stance. `A`/`B`
+// addressing follows `layout_a`/`layout_b`; `C`/`D` are always row-major (see `Op::Mma`'s own
+// doc comment).
+//
+// Supported `(in_dtype, acc_dtype)` pairs: both integer or both float (never mixed — BIR gives
+// this op no cast step to bridge them), `acc_dtype` at least as wide as `in_dtype` (never
+// narrowing, which would make overflow behavior a silent guess), and never `i1`/`f16` in
+// either position (a 1-bit product is not a sensible matmul input, and `f16` needs F16C like
+// everywhere else in this backend). Anything else is refused (`E091`). Within a supported
+// pair, the multiply-accumulate itself always runs at `acc_dtype`'s width: narrower inputs are
+// widened first (`movsx` for integers, `cvtss2sd` for the one legal float widening, `f32` ->
+// `f64`) so the running sum is never computed at less precision than the type BIR asked for.
 
 use std::collections::HashMap;
 
@@ -105,8 +126,8 @@ use basalt_backend::{
     Endianness, Support,
 };
 use basalt_bir::{
-    AddrSpace, AtomicOp, BinOp, CastOp, FCmpPred, Function, ICmpPred, InstId, Module, Op, Scalar,
-    Term, Ty, ValRef,
+    AddrSpace, AtomicOp, BinOp, CastOp, FCmpPred, Function, ICmpPred, InstId, MmaLayout, Module,
+    Op, Scalar, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 
@@ -195,6 +216,16 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
             Op::Store { ty: sty, .. } if ty_is_f16(*sty) => {
                 return Err(Diag::new(ECode::UnsupportedType).with_arg("f16 store needs F16C"));
             }
+            Op::Mma {
+                in_dtype,
+                acc_dtype,
+                ..
+            } if !mma_dtypes_supported(*in_dtype, *acc_dtype) => {
+                return Err(Diag::new(ECode::UnsupportedType).with_arg(
+                    "mma dtype pair: in_dtype/acc_dtype must both be integer or both float, \
+                     acc_dtype at least as wide as in_dtype, and neither i1 nor f16",
+                ));
+            }
             _ => {}
         }
     }
@@ -204,6 +235,33 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
 
 fn ty_is_f16(ty: Ty) -> bool {
     matches!(ty, Ty::Scalar(Scalar::F16))
+}
+
+/// `(is_float, byte width)` for the scalar types `mma` accepts at all — `None` for `i1`/`f16`,
+/// which are never valid in either of `mma`'s dtype fields (see the module header's `# mma`
+/// section).
+fn mma_scalar_class(s: Scalar) -> Option<(bool, u8)> {
+    match s {
+        Scalar::I8 => Some((false, 1)),
+        Scalar::I16 => Some((false, 2)),
+        Scalar::I32 => Some((false, 4)),
+        Scalar::I64 => Some((false, 8)),
+        Scalar::F32 => Some((true, 4)),
+        Scalar::F64 => Some((true, 8)),
+        Scalar::I1 | Scalar::F16 => None,
+    }
+}
+
+/// Whether this backend's oracle lowering supports multiplying-accumulating `in_dtype`
+/// operands into an `acc_dtype` accumulator: both integer or both float, `acc_dtype` no
+/// narrower than `in_dtype`.
+fn mma_dtypes_supported(in_dtype: Scalar, acc_dtype: Scalar) -> bool {
+    match (mma_scalar_class(in_dtype), mma_scalar_class(acc_dtype)) {
+        (Some((in_float, in_w)), Some((acc_float, acc_w))) => {
+            in_float == acc_float && acc_w >= in_w
+        }
+        _ => false,
+    }
 }
 
 fn is_float(ty: Ty) -> bool {
@@ -227,6 +285,16 @@ fn width_of(ty: Ty) -> W {
         Ty::Scalar(Scalar::F16) | Ty::Vec(..) | Ty::Void => {
             unreachable!("width_of called on a type check_module should have refused")
         }
+    }
+}
+
+/// `W`'s byte count, for `mma`'s address arithmetic (an `i64` multiplicand, not a `W` itself).
+fn w_bytes(w: W) -> i64 {
+    match w {
+        W::B1 => 1,
+        W::B2 => 2,
+        W::B4 => 4,
+        W::B8 => 8,
     }
 }
 
@@ -286,6 +354,18 @@ fn classify_params(params: &[Ty]) -> Option<(Vec<ArgLoc>, ArgLoc)> {
     Some((locs, ArgLoc::Int(INT_ARG_REGS[int_idx])))
 }
 
+/// The extra stack homes one `mma` instruction needs for its own triple loop: `i`/`j`/`k`
+/// loop counters (one per nesting level, the same "a live scheduling value gets a stack home"
+/// treatment as the outer per-thread loop's `loopctr_home`) plus a running-sum accumulator
+/// reloaded and re-stored every `k` iteration rather than ever held live in a register.
+#[derive(Clone, Copy)]
+struct MmaSlots {
+    i: i32,
+    j: i32,
+    k: i32,
+    acc: i32,
+}
+
 /// This function's real native stack frame: every fixed home plus one 8-byte slot per BIR
 /// instruction result and one per synthesized local/param/shared/constant address. See the
 /// module header for why every slot is uniformly 8 bytes.
@@ -296,6 +376,7 @@ struct Frame {
     retval_home: Option<i32>,
     inst_slot: Vec<i32>,
     const_addr_disp: HashMap<(u8, i64), i32>,
+    mma_slots: HashMap<u32, MmaSlots>,
     frame_size: i32,
 }
 
@@ -330,6 +411,19 @@ impl Frame {
             }
         }
 
+        let mut mma_slots = HashMap::new();
+        for (idx, inst) in f.insts.iter().enumerate() {
+            if matches!(inst.op, Op::Mma { .. }) {
+                let slots = MmaSlots {
+                    i: next_slot(&mut offset),
+                    j: next_slot(&mut offset),
+                    k: next_slot(&mut offset),
+                    acc: next_slot(&mut offset),
+                };
+                mma_slots.insert(idx as u32, slots);
+            }
+        }
+
         let frame_size = (offset + 15) & !15;
         Frame {
             param_home,
@@ -338,6 +432,7 @@ impl Frame {
             retval_home,
             inst_slot,
             const_addr_disp,
+            mma_slots,
             frame_size,
         }
     }
@@ -635,6 +730,26 @@ impl<'a> CodeGen<'a> {
             Op::AtomicCas(ptr, cmp, newv, _space) => {
                 let (ptr, cmp, newv) = (*ptr, *cmp, *newv);
                 self.lower_atomic_cas(id, ptr, cmp, newv, ty);
+            }
+            Op::Mma {
+                a,
+                b,
+                c,
+                d,
+                m,
+                n,
+                k,
+                in_dtype,
+                acc_dtype,
+                layout_a,
+                layout_b,
+            } => {
+                let (a, b, c, d, m, n, k, in_dtype, acc_dtype, layout_a, layout_b) = (
+                    *a, *b, *c, *d, *m, *n, *k, *in_dtype, *acc_dtype, *layout_a, *layout_b,
+                );
+                self.lower_mma(
+                    id, a, b, c, d, m, n, k, in_dtype, acc_dtype, layout_a, layout_b,
+                );
             }
         }
     }
@@ -1141,6 +1256,228 @@ impl<'a> CodeGen<'a> {
         self.store_result(id, RAX, w);
     }
 
+    /// `dst := [rbp + base_disp] + (row*leading_dim + col) * elem_bytes`, the address of one
+    /// element of an `mma` operand tile — always recomputed from scratch (see the module
+    /// header's `# mma` section). `RAX`/`RCX` are scratch; `dst` may be either of them, in
+    /// which case the final copy into `dst` is skipped.
+    fn mma_addr(
+        &mut self,
+        dst: u8,
+        base_disp: i32,
+        row_disp: i32,
+        col_disp: i32,
+        leading_dim: u32,
+        elem_bytes: i64,
+    ) {
+        self.enc.mov_reg_rbp(W::B8, RAX, row_disp);
+        self.enc.movabs(RCX, leading_dim as i64);
+        self.enc.imul_reg_reg(W::B8, RAX, RCX);
+        self.enc.mov_reg_rbp(W::B8, RCX, col_disp);
+        self.enc.alu_reg_reg(AluOp::Add, W::B8, RAX, RCX);
+        self.enc.movabs(RCX, elem_bytes);
+        self.enc.imul_reg_reg(W::B8, RAX, RCX);
+        self.enc.mov_reg_rbp(W::B8, RCX, base_disp);
+        self.enc.alu_reg_reg(AluOp::Add, W::B8, RAX, RCX);
+        if dst != RAX {
+            self.enc.mov_reg_reg(W::B8, dst, RAX);
+        }
+    }
+
+    /// Loads an `mma` integer operand element from `[addr_reg]`, sign-extending from `in_w`
+    /// up to `target_w` if they differ (matches this backend's uniform signed stance —
+    /// `BinOp::Div`/`Rem` and the atomic min/max ops make the same choice, since BIR gives
+    /// `mma` no signed/unsigned distinction to ask for either).
+    fn load_mma_int(&mut self, dst: u8, addr_reg: u8, in_w: W, target_w: W) {
+        if in_w == target_w {
+            self.enc.mov_reg_ind(target_w, dst, addr_reg);
+        } else {
+            self.enc.movsx(target_w, in_w, dst, Rm::IndBase(addr_reg));
+        }
+    }
+
+    /// Loads an `mma` float operand element from `[addr_reg]` into `dst_xmm`, widening `f32`
+    /// -> `f64` if `in_dtype`/`acc_dtype` differ (the only legal float widening `mma_dtypes_
+    /// supported` admits).
+    fn load_mma_float(&mut self, dst_xmm: u8, addr_reg: u8, in_f64: bool, acc_f64: bool) {
+        if in_f64 == acc_f64 {
+            if acc_f64 {
+                self.enc.movsd_load(dst_xmm, Rm::IndBase(addr_reg));
+            } else {
+                self.enc.movss_load(dst_xmm, Rm::IndBase(addr_reg));
+            }
+        } else {
+            debug_assert!(!in_f64 && acc_f64, "f64 input into an f32 accumulator");
+            self.enc.movss_load(dst_xmm, Rm::IndBase(addr_reg));
+            self.enc.cvtss2sd(dst_xmm, Rm::Direct(dst_xmm));
+        }
+    }
+
+    /// `mma`: a genuine triple-nested runtime loop over `i in 0..m`, `j in 0..n`, `k in 0..k`
+    /// — see the module header's `# mma` section for the addressing and dtype-widening rules
+    /// this implements. `check_module` has already refused any `(in_dtype, acc_dtype)` pair
+    /// this can't lower, so every arm below is exhaustive over what actually reaches here.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_mma(
+        &mut self,
+        id: InstId,
+        a: ValRef,
+        b: ValRef,
+        c: ValRef,
+        d: ValRef,
+        m: u32,
+        n: u32,
+        k: u32,
+        in_dtype: Scalar,
+        acc_dtype: Scalar,
+        layout_a: MmaLayout,
+        layout_b: MmaLayout,
+    ) {
+        let a_disp = self.operand_disp(a);
+        let b_disp = self.operand_disp(b);
+        let c_disp = self.operand_disp(c);
+        let d_disp = self.operand_disp(d);
+        let slots = *self
+            .frame
+            .mma_slots
+            .get(&id.0)
+            .expect("Frame::build reserves i/j/k/acc slots for every mma instruction");
+
+        let in_ty = Ty::Scalar(in_dtype);
+        let acc_ty = Ty::Scalar(acc_dtype);
+        let in_w = width_of(in_ty);
+        let acc_w = width_of(acc_ty);
+        let in_bytes = w_bytes(in_w);
+        let acc_bytes = w_bytes(acc_w);
+        let acc_float = is_float(acc_ty);
+        let acc_f64 = is_f64(acc_ty);
+        let in_f64 = is_f64(in_ty);
+        // `imul` has no 8-bit two-operand form (same constraint `lower_bin`'s `BinOp::Mul`
+        // works around): an i8 accumulator's multiply-accumulate runs at 32 bits internally,
+        // truncating back to 8 bits only when the running sum is written back to its slot.
+        let cw = if acc_w == W::B1 { W::B4 } else { acc_w };
+
+        let (a_row, a_col, a_leading) = match layout_a {
+            MmaLayout::RowMajor => (slots.i, slots.k, k),
+            MmaLayout::ColMajor => (slots.k, slots.i, m),
+        };
+        let (b_row, b_col, b_leading) = match layout_b {
+            MmaLayout::RowMajor => (slots.k, slots.j, n),
+            MmaLayout::ColMajor => (slots.j, slots.k, k),
+        };
+
+        let i_check = self.fresh_label("mma_i_check");
+        let i_end = self.fresh_label("mma_i_end");
+        let j_check = self.fresh_label("mma_j_check");
+        let j_end = self.fresh_label("mma_j_end");
+        let k_check = self.fresh_label("mma_k_check");
+        let k_end = self.fresh_label("mma_k_end");
+
+        self.enc.mov_reg_imm32(W::B8, RAX, 0);
+        self.enc.mov_rbp_reg(W::B8, slots.i, RAX);
+        self.enc.label(&i_check);
+        self.enc.mov_reg_rbp(W::B8, RAX, slots.i);
+        self.enc.movabs(RCX, m as i64);
+        self.enc.alu_reg_reg(AluOp::Cmp, W::B8, RAX, RCX);
+        self.enc.jcc(cc::GE, &i_end);
+
+        self.enc.mov_reg_imm32(W::B8, RAX, 0);
+        self.enc.mov_rbp_reg(W::B8, slots.j, RAX);
+        self.enc.label(&j_check);
+        self.enc.mov_reg_rbp(W::B8, RAX, slots.j);
+        self.enc.movabs(RCX, n as i64);
+        self.enc.alu_reg_reg(AluOp::Cmp, W::B8, RAX, RCX);
+        self.enc.jcc(cc::GE, &j_end);
+
+        self.enc.mov_reg_imm32(acc_w, RAX, 0);
+        self.enc.mov_rbp_reg(acc_w, slots.acc, RAX);
+
+        self.enc.mov_reg_imm32(W::B8, RAX, 0);
+        self.enc.mov_rbp_reg(W::B8, slots.k, RAX);
+        self.enc.label(&k_check);
+        self.enc.mov_reg_rbp(W::B8, RAX, slots.k);
+        self.enc.movabs(RCX, k as i64);
+        self.enc.alu_reg_reg(AluOp::Cmp, W::B8, RAX, RCX);
+        self.enc.jcc(cc::GE, &k_end);
+
+        if acc_float {
+            self.mma_addr(R10, a_disp, a_row, a_col, a_leading, in_bytes);
+            self.load_mma_float(0, R10, in_f64, acc_f64);
+            self.mma_addr(R10, b_disp, b_row, b_col, b_leading, in_bytes);
+            self.load_mma_float(1, R10, in_f64, acc_f64);
+            self.enc.sse_arith(SseArith::Mul, acc_f64, 0, Rm::Direct(1));
+            if acc_f64 {
+                self.enc.movsd_load(2, Rm::RbpDisp(slots.acc));
+            } else {
+                self.enc.movss_load(2, Rm::RbpDisp(slots.acc));
+            }
+            self.enc.sse_arith(SseArith::Add, acc_f64, 2, Rm::Direct(0));
+            if acc_f64 {
+                self.enc.movsd_store(Rm::RbpDisp(slots.acc), 2);
+            } else {
+                self.enc.movss_store(Rm::RbpDisp(slots.acc), 2);
+            }
+        } else {
+            self.mma_addr(R10, a_disp, a_row, a_col, a_leading, in_bytes);
+            self.load_mma_int(RDX, R10, in_w, cw);
+            self.mma_addr(R10, b_disp, b_row, b_col, b_leading, in_bytes);
+            self.load_mma_int(RAX, R10, in_w, cw);
+            self.enc.imul_reg_reg(cw, RDX, RAX);
+            if cw == acc_w {
+                self.enc.mov_reg_rbp(acc_w, RCX, slots.acc);
+            } else {
+                self.enc.movzx(cw, acc_w, RCX, Rm::RbpDisp(slots.acc));
+            }
+            self.enc.alu_reg_reg(AluOp::Add, cw, RCX, RDX);
+            self.enc.mov_rbp_reg(acc_w, slots.acc, RCX);
+        }
+
+        self.enc.mov_reg_rbp(W::B8, RAX, slots.k);
+        self.enc.alu_reg_imm32(AluOp::Add, W::B8, RAX, 1);
+        self.enc.mov_rbp_reg(W::B8, slots.k, RAX);
+        self.enc.jmp(&k_check);
+        self.enc.label(&k_end);
+
+        if acc_float {
+            self.mma_addr(R10, c_disp, slots.i, slots.j, n, acc_bytes);
+            if acc_f64 {
+                self.enc.movsd_load(0, Rm::IndBase(R10));
+            } else {
+                self.enc.movss_load(0, Rm::IndBase(R10));
+            }
+            if acc_f64 {
+                self.enc.movsd_load(1, Rm::RbpDisp(slots.acc));
+            } else {
+                self.enc.movss_load(1, Rm::RbpDisp(slots.acc));
+            }
+            self.enc.sse_arith(SseArith::Add, acc_f64, 0, Rm::Direct(1));
+            self.mma_addr(R10, d_disp, slots.i, slots.j, n, acc_bytes);
+            if acc_f64 {
+                self.enc.movsd_store(Rm::IndBase(R10), 0);
+            } else {
+                self.enc.movss_store(Rm::IndBase(R10), 0);
+            }
+        } else {
+            self.mma_addr(R10, c_disp, slots.i, slots.j, n, acc_bytes);
+            self.enc.mov_reg_ind(acc_w, RAX, R10);
+            self.enc.mov_reg_rbp(acc_w, RCX, slots.acc);
+            self.enc.alu_reg_reg(AluOp::Add, acc_w, RAX, RCX);
+            self.mma_addr(R10, d_disp, slots.i, slots.j, n, acc_bytes);
+            self.enc.mov_ind_reg(acc_w, R10, RAX);
+        }
+
+        self.enc.mov_reg_rbp(W::B8, RAX, slots.j);
+        self.enc.alu_reg_imm32(AluOp::Add, W::B8, RAX, 1);
+        self.enc.mov_rbp_reg(W::B8, slots.j, RAX);
+        self.enc.jmp(&j_check);
+        self.enc.label(&j_end);
+
+        self.enc.mov_reg_rbp(W::B8, RAX, slots.i);
+        self.enc.alu_reg_imm32(AluOp::Add, W::B8, RAX, 1);
+        self.enc.mov_rbp_reg(W::B8, slots.i, RAX);
+        self.enc.jmp(&i_check);
+        self.enc.label(&i_end);
+    }
+
     fn emit_phi_copies(&mut self, from: u32, to: u32) {
         let Some(copies) = self.phi_copies.get(&(from, to)).cloned() else {
             return;
@@ -1426,6 +1763,72 @@ mod tests {
         }
     }
 
+    /// `func @mma2x2(ptr.global, ptr.global, ptr.global, ptr.global) -> void`: one `mma`
+    /// instruction, `D = A*B + C` at `M=N=K=2`, row-major `A`/`B`, `f32` throughout — small
+    /// enough to hand-verify. With `A = [[1,2],[3,4]]`, `B = [[5,6],[7,8]]`,
+    /// `C = [[0.5,0.5],[0.5,0.5]]`: `A*B = [[19,22],[43,50]]`, so
+    /// `D = [[19.5,22.5],[43.5,50.5]]` (see `link_and_run.rs` for the executed proof).
+    fn func_mma2x2() -> Function {
+        let ptr_global = Ty::Ptr(AddrSpace::Global);
+        Function {
+            name: "mma2x2".into(),
+            params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::Mma {
+                    a: ValRef::Param(0),
+                    b: ValRef::Param(1),
+                    c: ValRef::Param(2),
+                    d: ValRef::Param(3),
+                    m: 2,
+                    n: 2,
+                    k: 2,
+                    in_dtype: Scalar::F32,
+                    acc_dtype: Scalar::F32,
+                    layout_a: MmaLayout::RowMajor,
+                    layout_b: MmaLayout::RowMajor,
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
+            }],
+        }
+    }
+
+    /// `func @mma_i8i32(ptr.global x4) -> void`: `M=N=K=2`, col-major `A`, row-major `B`,
+    /// `i8` inputs into an `i32` accumulator — exercises the integer widening path
+    /// (`load_mma_int`'s `movsx`) and a non-default layout in the same fixture.
+    fn func_mma_i8_i32_colmajor_a() -> Function {
+        let ptr_global = Ty::Ptr(AddrSpace::Global);
+        Function {
+            name: "mma_i8i32".into(),
+            params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::Mma {
+                    a: ValRef::Param(0),
+                    b: ValRef::Param(1),
+                    c: ValRef::Param(2),
+                    d: ValRef::Param(3),
+                    m: 2,
+                    n: 2,
+                    k: 2,
+                    in_dtype: Scalar::I8,
+                    acc_dtype: Scalar::I32,
+                    layout_a: MmaLayout::ColMajor,
+                    layout_b: MmaLayout::RowMajor,
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
+            }],
+        }
+    }
+
     // ---- supports() --------------------------------------------------------------------
 
     #[test]
@@ -1445,6 +1848,81 @@ mod tests {
         assert_eq!(
             X86Oracle.supports(&wrap(func_write_idx())),
             Support::Supported
+        );
+        assert_eq!(X86Oracle.supports(&wrap(func_mma2x2())), Support::Supported);
+        assert_eq!(
+            X86Oracle.supports(&wrap(func_mma_i8_i32_colmajor_a())),
+            Support::Supported
+        );
+    }
+
+    #[test]
+    fn refuses_mma_i1_input_with_e091() {
+        let mut f = func_mma2x2();
+        let Op::Mma {
+            in_dtype,
+            acc_dtype,
+            ..
+        } = &mut f.insts[0].op
+        else {
+            unreachable!()
+        };
+        *in_dtype = Scalar::I1;
+        *acc_dtype = Scalar::I32;
+        assert_eq!(
+            X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedType)
+        );
+    }
+
+    #[test]
+    fn refuses_mma_f16_accumulator_with_e091() {
+        let mut f = func_mma2x2();
+        let Op::Mma { acc_dtype, .. } = &mut f.insts[0].op else {
+            unreachable!()
+        };
+        *acc_dtype = Scalar::F16;
+        assert_eq!(
+            X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedType)
+        );
+    }
+
+    #[test]
+    fn refuses_mma_mixed_int_float_dtypes_with_e091() {
+        let mut f = func_mma2x2();
+        let Op::Mma {
+            in_dtype,
+            acc_dtype,
+            ..
+        } = &mut f.insts[0].op
+        else {
+            unreachable!()
+        };
+        *in_dtype = Scalar::I32;
+        *acc_dtype = Scalar::F32;
+        assert_eq!(
+            X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedType)
+        );
+    }
+
+    #[test]
+    fn refuses_mma_narrowing_accumulator_with_e091() {
+        let mut f = func_mma2x2();
+        let Op::Mma {
+            in_dtype,
+            acc_dtype,
+            ..
+        } = &mut f.insts[0].op
+        else {
+            unreachable!()
+        };
+        *in_dtype = Scalar::F64;
+        *acc_dtype = Scalar::F32;
+        assert_eq!(
+            X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedType)
         );
     }
 
@@ -1626,6 +2104,39 @@ mod tests {
             .emit(&wrap(func_write_idx()), &EmitOpts::default())
             .expect("emit succeeds");
         parses_as_elf_with_symbol(artifact.as_bytes().unwrap(), "write_idx");
+    }
+
+    #[test]
+    fn emits_valid_elf_for_mma() {
+        let artifact = X86Oracle
+            .emit(&wrap(func_mma2x2()), &EmitOpts::default())
+            .expect("emit succeeds");
+        parses_as_elf_with_symbol(artifact.as_bytes().unwrap(), "mma2x2");
+    }
+
+    #[test]
+    fn emits_valid_elf_for_mma_int_colmajor() {
+        let artifact = X86Oracle
+            .emit(&wrap(func_mma_i8_i32_colmajor_a()), &EmitOpts::default())
+            .expect("emit succeeds");
+        parses_as_elf_with_symbol(artifact.as_bytes().unwrap(), "mma_i8i32");
+    }
+
+    #[test]
+    fn emit_refuses_mma_dtype_pair_supports_refuses() {
+        let mut f = func_mma2x2();
+        let Op::Mma { acc_dtype, .. } = &mut f.insts[0].op else {
+            unreachable!()
+        };
+        *acc_dtype = Scalar::F16;
+        assert_eq!(
+            X86Oracle.supports(&wrap(f.clone())),
+            Support::Unsupported(ECode::UnsupportedType)
+        );
+        let err = X86Oracle
+            .emit(&wrap(f), &EmitOpts::default())
+            .expect_err("must refuse, not guess");
+        assert_eq!(err.code, ECode::UnsupportedType);
     }
 
     #[test]

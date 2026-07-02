@@ -175,6 +175,10 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
             Op::Store { ty: sty, .. } if ty_is_f16(*sty) => {
                 return Err(Diag::new(ECode::UnsupportedType).with_arg("f16 store needs F16C"));
             }
+            Op::Mma { .. } => {
+                return Err(Diag::new(ECode::UnsupportedOp)
+                    .with_arg("mma has no lowering in the regalloc-based x86-64 backend yet"));
+            }
             _ => {}
         }
     }
@@ -756,6 +760,9 @@ impl<'a> CodeGen<'a> {
                 let (ptr, cmp, newv) = (*ptr, *cmp, *newv);
                 self.lower_atomic_cas(id, ptr, cmp, newv, ty);
             }
+            Op::Mma { .. } => {
+                unreachable!("check_module refuses mma before codegen starts")
+            }
         }
     }
 
@@ -1304,7 +1311,7 @@ impl<'a> CodeGen<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basalt_bir::{Block, BlockId, Inst, LaunchBounds};
+    use basalt_bir::{Block, BlockId, Inst, LaunchBounds, MmaLayout};
     use object::read::{Object as ReadObject, ObjectSection, ObjectSymbol};
 
     fn wrap(f: Function) -> Module {
@@ -1514,6 +1521,44 @@ mod tests {
             X86Regalloc.supports(&wrap(f)),
             Support::Unsupported(ECode::UnsupportedOp)
         );
+    }
+
+    #[test]
+    fn refuses_mma_with_e090() {
+        let ptr_global = Ty::Ptr(AddrSpace::Global);
+        let f = Function {
+            name: "usesmma".into(),
+            params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::Mma {
+                    a: ValRef::Param(0),
+                    b: ValRef::Param(1),
+                    c: ValRef::Param(2),
+                    d: ValRef::Param(3),
+                    m: 2,
+                    n: 2,
+                    k: 2,
+                    in_dtype: Scalar::F32,
+                    acc_dtype: Scalar::F32,
+                    layout_a: MmaLayout::RowMajor,
+                    layout_b: MmaLayout::RowMajor,
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
+            }],
+        };
+        assert_eq!(
+            X86Regalloc.supports(&wrap(f.clone())),
+            Support::Unsupported(ECode::UnsupportedOp)
+        );
+        let err = X86Regalloc
+            .emit(&wrap(f), &EmitOpts::default())
+            .expect_err("emit must refuse what supports() refuses, not guess");
+        assert_eq!(err.code, ECode::UnsupportedOp);
     }
 
     #[test]

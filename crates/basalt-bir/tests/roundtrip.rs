@@ -8,7 +8,7 @@
 
 use basalt_bir::{
     AddrSpace, AtomicOp, BinOp, Block, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, InstId,
-    LaunchBounds, Module, Op, Scalar, ShuffleKind, Term, Ty, ValRef,
+    LaunchBounds, MmaLayout, Module, Op, Scalar, ShuffleKind, Term, Ty, ValRef,
 };
 
 /// Appends instructions/blocks to one function's arenas in construction order.
@@ -385,6 +385,32 @@ fn roundtrip_module_metadata_and_multiple_functions() {
         target_dtypes: vec![Scalar::I32, Scalar::F32, Scalar::F64],
     };
     assert_roundtrip(&m);
+}
+
+#[test]
+fn roundtrip_mma() {
+    let ptr_global = ValRef::Param(0);
+    let ptr_shared = ValRef::Param(1);
+
+    let mut b = FnB::new();
+    b.push_void(Op::Mma {
+        a: ptr_shared,
+        b: ptr_shared,
+        c: ptr_global,
+        d: ptr_global,
+        m: 16,
+        n: 16,
+        k: 16,
+        in_dtype: Scalar::F16,
+        acc_dtype: Scalar::F32,
+        layout_a: MmaLayout::RowMajor,
+        layout_b: MmaLayout::ColMajor,
+    });
+    b.end_block(Term::Ret(None));
+
+    let params = vec![Ty::Ptr(AddrSpace::Global), Ty::Ptr(AddrSpace::Shared)];
+    let f = b.finish("mma_fn", params, Ty::Void);
+    assert_roundtrip(&module_of(vec![f]));
 }
 
 #[test]

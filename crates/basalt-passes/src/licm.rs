@@ -467,6 +467,31 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
         Op::VoteAll(a) => Op::VoteAll(f(*a)),
         Op::Atomic(o, ptr, v, s) => Op::Atomic(*o, f(*ptr), f(*v), *s),
         Op::AtomicCas(ptr, cmp, new, s) => Op::AtomicCas(f(*ptr), f(*cmp), f(*new), *s),
+        Op::Mma {
+            a,
+            b,
+            c,
+            d,
+            m,
+            n,
+            k,
+            in_dtype,
+            acc_dtype,
+            layout_a,
+            layout_b,
+        } => Op::Mma {
+            a: f(*a),
+            b: f(*b),
+            c: f(*c),
+            d: f(*d),
+            m: *m,
+            n: *n,
+            k: *k,
+            in_dtype: *in_dtype,
+            acc_dtype: *acc_dtype,
+            layout_a: *layout_a,
+            layout_b: *layout_b,
+        },
     }
 }
 

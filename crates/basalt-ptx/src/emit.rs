@@ -463,6 +463,17 @@ fn check_no_pred_shuffle(inst: &Inst) -> Result<(), Diag> {
     Ok(())
 }
 
+/// `mma` has no `mma.sync`/tensor-core lowering in this backend yet — that is separate, later
+/// work (see the module header). Refuse cleanly rather than falling through to the scalar
+/// per-op emitters below, which have no case for it.
+fn check_no_mma(inst: &Inst) -> Result<(), Diag> {
+    if matches!(&inst.op, Op::Mma { .. }) {
+        return Err(Diag::new(ECode::UnsupportedOp)
+            .with_arg("mma has no mma.sync lowering in this backend yet"));
+    }
+    Ok(())
+}
+
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
 /// `emit()`. Run once, on the module as originally handed in — `construct_ssa` never introduces
 /// an op/type shape this pass didn't already see, so re-checking after it would be redundant.
@@ -482,6 +493,7 @@ fn check_module(module: &Module) -> Result<(), Diag> {
             check_pred_bin_is_logical(inst)?;
             check_atomic_width(inst)?;
             check_no_pred_shuffle(inst)?;
+            check_no_mma(inst)?;
         }
     }
     Ok(())
@@ -838,6 +850,9 @@ impl<'a> CodeGen<'a> {
             Op::AtomicCas(ptr, cmp, newv, space) => {
                 let (ptr, cmp, newv, space) = (*ptr, *cmp, *newv, *space);
                 self.lower_atomic_cas(id, ptr, cmp, newv, space, ty);
+            }
+            Op::Mma { .. } => {
+                unreachable!("check_module refuses mma before codegen starts")
             }
         }
     }

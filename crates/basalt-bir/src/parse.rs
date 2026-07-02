@@ -12,7 +12,7 @@ use std::fmt;
 
 use crate::ir::{
     AtomicOp, BinOp, Block, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, InstId,
-    LaunchBounds, Module, Op, ShuffleKind, Term, ValRef,
+    LaunchBounds, MmaLayout, Module, Op, ShuffleKind, Term, ValRef,
 };
 use crate::ty::{AddrSpace, Scalar, Ty};
 
@@ -269,6 +269,22 @@ impl<'a> Parser<'a> {
         block_id_from_word(&w).ok_or_else(|| ParseError {
             line: self.line(),
             msg: format!("expected a block label, found `{w}`"),
+        })
+    }
+
+    fn scalar_ty(&mut self) -> Result<Scalar, ParseError> {
+        let w = self.word()?;
+        Scalar::parse(&w).ok_or_else(|| ParseError {
+            line: self.line(),
+            msg: format!("unknown scalar type `{w}`"),
+        })
+    }
+
+    fn mma_layout(&mut self) -> Result<MmaLayout, ParseError> {
+        let w = self.word()?;
+        MmaLayout::parse(&w).ok_or_else(|| ParseError {
+            line: self.line(),
+            msg: format!("unknown mma layout `{w}`"),
         })
     }
 
@@ -634,6 +650,41 @@ impl<'a> Parser<'a> {
                 self.expect_tok(Tok::Comma)?;
                 let new = self.val()?;
                 Ok((ty, Op::AtomicCas(ptr, cmp, new, space)))
+            }
+            "mma" => {
+                let in_dtype = self.scalar_ty()?;
+                let acc_dtype = self.scalar_ty()?;
+                let layout_a = self.mma_layout()?;
+                let layout_b = self.mma_layout()?;
+                self.expect_kw("m")?;
+                let m = self.u32_lit()?;
+                self.expect_kw("n")?;
+                let n = self.u32_lit()?;
+                self.expect_kw("k")?;
+                let k = self.u32_lit()?;
+                let a = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let b = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let c = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let d = self.val()?;
+                Ok((
+                    Ty::Void,
+                    Op::Mma {
+                        a,
+                        b,
+                        c,
+                        d,
+                        m,
+                        n,
+                        k,
+                        in_dtype,
+                        acc_dtype,
+                        layout_a,
+                        layout_b,
+                    },
+                ))
             }
             other => Err(self.err(format!("unknown opcode `{other}`"))),
         }

@@ -1020,6 +1020,12 @@ fn lower_inst<'ctx>(
             let nv = get_val(params, values, *newv);
             Some(lower_atomic_cas(builder, pv, cv, nv, inst.ty)?)
         }
+        // `wmma`/`mma.sync` intrinsic lowering is separate, later work — refuse cleanly
+        // rather than guess at a mapping.
+        Op::Mma { .. } => {
+            return Err(Diag::new(ECode::UnsupportedOp)
+                .with_arg("mma has no LLVM IR lowering in this lane yet"))
+        }
     };
     Ok(val)
 }

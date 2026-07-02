@@ -169,6 +169,30 @@ fn print_op(out: &mut String, inst: &Inst) {
                 val(*new)
             );
         }
+        Op::Mma {
+            a,
+            b,
+            c,
+            d,
+            m,
+            n,
+            k,
+            in_dtype,
+            acc_dtype,
+            layout_a,
+            layout_b,
+        } => {
+            let _ = write!(
+                out,
+                "mma {in_dtype} {acc_dtype} {} {} m {m} n {n} k {k} {}, {}, {}, {}",
+                layout_a.text(),
+                layout_b.text(),
+                val(*a),
+                val(*b),
+                val(*c),
+                val(*d)
+            );
+        }
         other => {
             // Zero-operand GPU index intrinsics (tid.x, bid.y, ...).
             let mnemonic = other

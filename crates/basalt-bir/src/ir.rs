@@ -312,6 +312,30 @@ impl AtomicOp {
     }
 }
 
+/// Row- vs column-major addressing for an `mma` input tile's 2D-to-linear mapping. No
+/// separate stride field: an operand's own natural extent (`A`'s `M`/`K`, `B`'s `K`/`N`)
+/// is its leading dimension — row-major `A[i,j]` sits at `i*K + j`, col-major at `j*M + i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmaLayout {
+    RowMajor,
+    ColMajor,
+}
+
+impl MmaLayout {
+    pub const ALL: &'static [MmaLayout] = &[MmaLayout::RowMajor, MmaLayout::ColMajor];
+
+    pub fn text(self) -> &'static str {
+        match self {
+            MmaLayout::RowMajor => "row",
+            MmaLayout::ColMajor => "col",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<MmaLayout> {
+        MmaLayout::ALL.iter().copied().find(|l| l.text() == s)
+    }
+}
+
 /// One instruction's operation and operands. The result type lives on the owning `Inst`,
 /// not here, except where an op's operand type must differ from its result type: `icmp`/
 /// `fcmp` compare a wider type than the `i1` they produce, and casts convert between two
@@ -360,6 +384,30 @@ pub enum Op {
     VoteAll(ValRef),
     Atomic(AtomicOp, ValRef, ValRef, AddrSpace),
     AtomicCas(ValRef, ValRef, ValRef, AddrSpace),
+    /// Tile-level matrix-multiply-accumulate: `D[m,n] = sum_k(A[m,k] * B[k,n]) + C[m,n]`,
+    /// writing through `d` (which may alias `c`). Side-effecting like `Store` rather than
+    /// value-producing — BIR has no register-fragment value class, so `a`/`b`/`c`/`d` are
+    /// plain pointers into whatever address space they were already given, and the owning
+    /// `Inst::ty` is `Ty::Void`. A hand-rolled tensor-core backend decomposes this into its
+    /// own fragment load/execute/store sequence; that decomposition is backend-internal,
+    /// not part of BIR.
+    ///
+    /// `layout_a`/`layout_b` only govern `A`/`B`; `C`/`D` (the `m`-by-`n` accumulator tile)
+    /// have no layout attribute of their own and are always addressed row-major with `n` as
+    /// their leading dimension — the one fixed convention for the op's output.
+    Mma {
+        a: ValRef,
+        b: ValRef,
+        c: ValRef,
+        d: ValRef,
+        m: u32,
+        n: u32,
+        k: u32,
+        in_dtype: Scalar,
+        acc_dtype: Scalar,
+        layout_a: MmaLayout,
+        layout_b: MmaLayout,
+    },
 }
 
 /// One arena-resident instruction: its result type (`Ty::Void` if it produces no value)
