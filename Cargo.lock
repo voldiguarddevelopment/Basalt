@@ -86,6 +86,13 @@ dependencies = [
 [[package]]
 name = "basalt-runtime"
 version = "0.0.0"
+dependencies = [
+ "basalt-backend",
+ "basalt-frontend-c",
+ "basalt-passes",
+ "basalt-ptx",
+ "basalt-sema",
+]
 
 [[package]]
 name = "basalt-rv"
