@@ -62,9 +62,11 @@ version = "0.0.0"
 name = "basalt-passes"
 version = "0.0.0"
 dependencies = [
+ "basalt-backend",
  "basalt-bir",
  "basalt-frontend-c",
  "basalt-sema",
+ "basalt-x86",
 ]
 
 [[package]]

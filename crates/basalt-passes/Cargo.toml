@@ -7,5 +7,7 @@ edition.workspace = true
 basalt-bir = { path = "../basalt-bir" }
 
 [dev-dependencies]
+basalt-backend = { path = "../basalt-backend" }
 basalt-frontend-c = { path = "../basalt-frontend-c" }
 basalt-sema = { path = "../basalt-sema" }
+basalt-x86 = { path = "../basalt-x86" }

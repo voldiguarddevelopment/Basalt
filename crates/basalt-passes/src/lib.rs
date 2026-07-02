@@ -16,16 +16,24 @@
 // loops from its own control flow (source-level `for`/`while`/`do-while`, not the sequential
 // per-thread loop a CPU backend synthesizes at emission time, which BIR has no visibility
 // into). `constfold::constant_fold` and `dce::eliminate_dead_code` are straightforward BIR to
-// BIR cleanups; see each module's header for what they cover and what they deliberately don't.
+// BIR cleanups; `licm::licm` hoists loop-invariant pure computation out of those same natural
+// loops. `divergence::analyze_divergence` classifies every value as uniform or divergent
+// across a warp/block; it has no consumer yet in this tree — it exists for a later
+// divergence-aware GPU register allocator to use. See each module's header for exactly what
+// it covers and what it deliberately doesn't.
 
 mod constfold;
 mod dce;
+mod divergence;
 mod dom;
+mod licm;
 mod regalloc;
 mod ssa;
 
 pub use constfold::constant_fold;
 pub use dce::eliminate_dead_code;
+pub use divergence::{analyze_divergence, Divergence, DivergenceInfo};
 pub use dom::{detect_loops, Dominators, NaturalLoop};
+pub use licm::licm;
 pub use regalloc::{allocate, Allocation, Location, RegClass, ValueId};
 pub use ssa::construct_ssa;
