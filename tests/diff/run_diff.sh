@@ -147,6 +147,63 @@ $stdout_ra"
   fi
 
   echo "  oracle and regalloc agree: $name"
+
+  # AMDGCN-via-emulator lane, stress only: the LLVM backend's AMDGCN object-emission path
+  # (`--llvm --amdgpu-bin`) is the only thing that can turn a kernel into a real RDNA3
+  # artifact right now (there is no hand-rolled basalt-amdgpu backend yet), and it has never
+  # been checked against anything but ELF structure. Actually running it needs either RDNA3
+  # silicon (none of this project's machines have one) or an instruction-level emulator —
+  # tests/diff/rdna3_sim/run_kernel.py drives tinygrad's maintained one (DEV=MOCK+AMD) against
+  # the real HSACO bytes. Both the LLVM feature and a tinygrad checkout are optional, so this
+  # lane skips (never fails the default run) when either is missing.
+  if [ "$name" = "stress" ]; then
+    rdna3_harness="$root/tests/diff/rdna3_sim/run_kernel.py"
+    rdna3_python="${RDNA3_SIM_PYTHON:-python3}"
+    if ! command -v llvm-config-18 >/dev/null 2>&1; then
+      echo "  skip: rdna3-sim (no llvm-config-18 — --features llvm cannot be built here)"
+    elif ! command -v "$rdna3_python" >/dev/null 2>&1; then
+      echo "  skip: rdna3-sim (no $rdna3_python — set RDNA3_SIM_PYTHON to an interpreter with tinygrad's mockgpu)"
+    else
+      export LLVM_SYS_180_PREFIX="${LLVM_SYS_180_PREFIX:-$(llvm-config-18 --prefix)}"
+      if ! cargo build --locked --quiet --features llvm --bin basalt 2>"$tmpdir/$name.llvmbuild.log"; then
+        echo "  skip: rdna3-sim (--features llvm build failed)"
+        sed 's/^/    /' "$tmpdir/$name.llvmbuild.log"
+      else
+        llvm_obj="$tmpdir/$name.hsaco"
+        if ! "$basalt" --llvm --amdgpu-bin "$kernel_path" -o "$llvm_obj" 2>"$tmpdir/$name.amdgpu.log"; then
+          echo "  FAIL: basalt --llvm --amdgpu-bin $kernel did not exit 0:" >&2
+          sed 's/^/    /' "$tmpdir/$name.amdgpu.log" >&2
+          fail=1
+        else
+          # Same eighteen-temporary fold, same a[i] = (i+1)*0.5 - 3.0 generator as
+          # examples/cpu_launch_stress.c, so the emulated run and the oracle's own live run
+          # (captured above in $actual) are exercising identical inputs.
+          expected_val="$(grep -oE '[0-9]+\.[0-9]+' <<<"$actual" | tail -1)"
+          set +e
+          rdna3_out="$("$rdna3_python" "$rdna3_harness" --hsaco "$llvm_obj" --kernel stress \
+            --buf in:f32:-2.5,-2.0,-1.5,-1.0,-0.5,0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0 \
+            --buf out:f32:1 --scalar i32:1 --global 1,1,1 --local 1,1,1 2>"$tmpdir/$name.rdna3.log")"
+          rdna3_code=$?
+          set -e
+          if [ "$rdna3_code" -eq 77 ]; then
+            echo "  skip: rdna3-sim ($(tail -1 "$tmpdir/$name.rdna3.log"))"
+          elif [ "$rdna3_code" -ne 0 ]; then
+            echo "  FAIL: rdna3-sim harness did not exit 0:" >&2
+            sed 's/^/    /' "$tmpdir/$name.rdna3.log" >&2
+            fail=1
+          else
+            rdna3_val="$(tail -1 <<<"$rdna3_out")"
+            if awk -v a="$expected_val" -v b="$rdna3_val" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 0.001) }'; then
+              echo "  rdna3-sim matches oracle: $name ($rdna3_val)"
+            else
+              echo "  FAIL: $name diverges between the oracle ($expected_val) and rdna3-sim ($rdna3_val)" >&2
+              fail=1
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then

@@ -289,12 +289,16 @@ fn build_local_slots<'ctx>(
     slots
 }
 
+/// LLVM's numeric id for the `amdgpu_kernel` calling convention (`CallingConv::AMDGPU_KERNEL`
+/// in `llvm/IR/CallingConv.h`), not exposed as a named constant by inkwell 0.9.
+const AMDGPU_KERNEL_CALL_CONV: u32 = 91;
+
 fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag> {
     let LowerCtx {
         ctx,
         llvm_mod,
         builder,
-        dialect: _,
+        dialect,
     } = cx;
     let param_tys: Vec<BasicMetadataTypeEnum> = f
         .params
@@ -307,6 +311,20 @@ fn lower_function<'ctx>(cx: LowerCtx<'ctx, '_>, f: &Function) -> Result<(), Diag
         ret => basic_ty(ctx, ret)?.fn_type(&param_tys, false),
     };
     let llvm_fn: FunctionValue<'ctx> = llvm_mod.add_function(&f.name, fn_ty, None);
+    // Every BIR function reaching this lowering is a kernel entry point (there is no
+    // separate device-function concept yet — `basalt-ptx` makes the same assumption, always
+    // emitting `.visible .entry`). On the Amdgpu dialect this must be spelled out explicitly:
+    // without the `amdgpu_kernel` calling convention, LLVM's AMDGPU backend lowers the
+    // function as an ordinary subroutine — no kernel descriptor, no kernarg ABI, an empty
+    // `amdhsa.kernels` metadata array — which is structurally valid ELF but not a
+    // dispatchable HSA kernel. LLVM's verifier rejects `amdgpu_kernel` on anything but a
+    // void-returning function, which every real `__global__` kernel is (the source language
+    // itself disallows a non-void `__global__`) — this file's own non-void test fixtures
+    // exist only to exercise a single op's lowering in isolation and were never meant to be
+    // dispatchable kernels, so they correctly fall back to the plain calling convention.
+    if dialect == GpuDialect::Amdgpu && f.ret == Ty::Void {
+        llvm_fn.set_call_conventions(AMDGPU_KERNEL_CALL_CONV);
+    }
 
     let params: Vec<BasicValueEnum<'ctx>> = (0..f.params.len() as u32)
         .map(|i| {
