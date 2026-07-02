@@ -199,3 +199,55 @@ fn nvptx_file_type_assembly_produces_real_ptx_text() {
     assert!(text.contains(".target sm_70"), "{text}");
     assert!(text.contains("add_i32"), "{text}");
 }
+
+/// The strongest structural signal available for the canonical wmma tile without real
+/// hardware: real NVPTX assembly, produced by LLVM's own NVPTX backend, containing the
+/// `wmma.load`/`wmma.mma`/`wmma.store` PTX mnemonics `sm_70` (Volta, the floor WMMA has been
+/// available on since fp16 tensor cores shipped) is expected to lower these to.
+#[test]
+fn nvptx_canonical_wmma_produces_real_wmma_ptx_mnemonics() {
+    let ptr_global = basalt_bir::AddrSpace::Global;
+    let ptrt = Ty::Ptr(ptr_global);
+    let module = wrap(Function {
+        name: "matmul_tile".into(),
+        params: vec![ptrt, ptrt, ptrt, ptrt],
+        ret: Ty::Void,
+        insts: vec![Inst {
+            ty: Ty::Void,
+            op: Op::Mma {
+                a: ValRef::Param(0),
+                b: ValRef::Param(1),
+                c: ValRef::Param(2),
+                d: ValRef::Param(3),
+                m: 16,
+                n: 16,
+                k: 16,
+                in_dtype: Scalar::F16,
+                acc_dtype: Scalar::F32,
+                layout_a: MmaLayout::RowMajor,
+                layout_b: MmaLayout::RowMajor,
+            },
+        }],
+        blocks: vec![Block {
+            insts: vec![InstId(0)],
+            term: Term::Ret(None),
+        }],
+    });
+
+    let ctx = Context::create();
+    let llvm_mod = crate::lower_module(&module, &ctx, crate::GpuDialect::Nvptx)
+        .expect("canonical m16n16k16 f16/f32 tile lowers on the nvptx dialect");
+    llvm_mod.verify().expect("module verifies");
+
+    let (tm, triple) = target_machine(LlvmTarget::Nvptx).expect("nvptx target machine builds");
+    llvm_mod.set_triple(&triple);
+    llvm_mod.set_data_layout(&tm.get_target_data().get_data_layout());
+
+    let buf = tm
+        .write_to_memory_buffer(&llvm_mod, inkwell::targets::FileType::Assembly)
+        .expect("FileType::Assembly succeeds for a module built entirely from wmma intrinsics");
+    let text = String::from_utf8(buf.as_slice().to_vec()).expect("PTX assembly is UTF-8 text");
+    assert!(text.contains("wmma.load"), "{text}");
+    assert!(text.contains("wmma.mma"), "{text}");
+    assert!(text.contains("wmma.store"), "{text}");
+}

@@ -406,10 +406,20 @@ fn amdgpu_block_dim_is_a_clean_refusal_not_a_panic() {
     assert_eq!(err.code, ECode::UnsupportedOp);
 }
 
-#[test]
-fn mma_is_a_clean_refusal_not_a_panic() {
+/// Builds a single-instruction `mma` kernel over four global pointer params (`a`,`b`,`c`,`d`
+/// in that order), letting each case pick its own shape/dtype/layout.
+#[allow(clippy::too_many_arguments)]
+fn mma_fn(
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: Scalar,
+    acc_dtype: Scalar,
+    layout_a: MmaLayout,
+    layout_b: MmaLayout,
+) -> Function {
     let ptr_global = Ty::Ptr(AddrSpace::Global);
-    let f = Function {
+    Function {
         name: "usesmma".into(),
         params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
         ret: Ty::Void,
@@ -420,25 +430,141 @@ fn mma_is_a_clean_refusal_not_a_panic() {
                 b: ValRef::Param(1),
                 c: ValRef::Param(2),
                 d: ValRef::Param(3),
-                m: 2,
-                n: 2,
-                k: 2,
-                in_dtype: Scalar::F32,
-                acc_dtype: Scalar::F32,
-                layout_a: MmaLayout::RowMajor,
-                layout_b: MmaLayout::RowMajor,
+                m,
+                n,
+                k,
+                in_dtype,
+                acc_dtype,
+                layout_a,
+                layout_b,
             },
         }],
         blocks: vec![Block {
             insts: ids(1),
             term: Term::Ret(None),
         }],
-    };
+    }
+}
+
+#[test]
+fn nvptx_mma_unsupported_shape_is_a_clean_refusal_not_a_panic() {
+    let f = mma_fn(
+        2,
+        2,
+        2,
+        Scalar::F32,
+        Scalar::F32,
+        MmaLayout::RowMajor,
+        MmaLayout::RowMajor,
+    );
 
     let ctx = Context::create();
     let err = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx)
+        .expect_err("only the canonical m16n16k16 f16-input tile is lowered in this lane");
+    assert_eq!(err.code, ECode::UnsupportedType);
+}
+
+#[test]
+fn nvptx_mma_unsupported_accumulator_is_a_clean_refusal_not_a_panic() {
+    let f = mma_fn(
+        16,
+        16,
+        16,
+        Scalar::F16,
+        Scalar::I32,
+        MmaLayout::RowMajor,
+        MmaLayout::RowMajor,
+    );
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx)
+        .expect_err("only an f16 or f32 accumulator is lowered in this lane");
+    assert_eq!(err.code, ECode::UnsupportedType);
+}
+
+#[test]
+fn amdgpu_mma_is_a_clean_refusal_not_a_panic_even_for_the_canonical_shape() {
+    // Amdgcn's tensor-core path (MFMA) belongs to a separate, hand-rolled backend. This must
+    // stay a clean refusal no matter the shape/dtype, including the exact tile this lane
+    // lowers for real on Nvptx.
+    let f = mma_fn(
+        16,
+        16,
+        16,
+        Scalar::F16,
+        Scalar::F32,
+        MmaLayout::RowMajor,
+        MmaLayout::RowMajor,
+    );
+
+    let ctx = Context::create();
+    let err = lower_module(&wrap(f), &ctx, GpuDialect::Amdgpu)
         .expect_err("mma has no LLVM IR lowering in this lane yet");
     assert_eq!(err.code, ECode::UnsupportedOp);
+}
+
+#[test]
+fn nvptx_canonical_wmma_f32_accumulator_lowers_and_verifies() {
+    let f = mma_fn(
+        16,
+        16,
+        16,
+        Scalar::F16,
+        Scalar::F32,
+        MmaLayout::RowMajor,
+        MmaLayout::RowMajor,
+    );
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("call { <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half> } @llvm.nvvm.wmma.m16n16k16.load.a.row.stride.f16"),
+        "{text}"
+    );
+    assert!(
+        text.contains("call { float, float, float, float, float, float, float, float } @llvm.nvvm.wmma.m16n16k16.mma.row.row.f32.f32"),
+        "{text}"
+    );
+    assert!(
+        text.contains("call void @llvm.nvvm.wmma.m16n16k16.store.d.row.stride.f32"),
+        "{text}"
+    );
+}
+
+#[test]
+fn nvptx_canonical_wmma_f16_accumulator_lowers_and_verifies() {
+    let f = mma_fn(
+        16,
+        16,
+        16,
+        Scalar::F16,
+        Scalar::F16,
+        MmaLayout::ColMajor,
+        MmaLayout::RowMajor,
+    );
+
+    let ctx = Context::create();
+    let llvm_mod = lower_module(&wrap(f), &ctx, GpuDialect::Nvptx).expect("lowering succeeds");
+    llvm_mod.verify().expect("module verifies");
+    let text = llvm_mod.print_to_string().to_string();
+    assert!(
+        text.contains("@llvm.nvvm.wmma.m16n16k16.load.a.col.stride.f16"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@llvm.nvvm.wmma.m16n16k16.load.b.row.stride.f16"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@llvm.nvvm.wmma.m16n16k16.mma.col.row.f16.f16"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@llvm.nvvm.wmma.m16n16k16.store.d.row.stride.f16"),
+        "{text}"
+    );
 }
 
 #[test]

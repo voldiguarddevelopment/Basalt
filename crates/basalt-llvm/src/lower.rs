@@ -66,6 +66,33 @@
 // never learns whether the wavefront is 32 or 64 lanes, and "all lanes voted true" only has a
 // definite answer once that width is known — so both are `Err(Diag)` for `Amdgpu`.
 //
+// `mma`: real tensor-core lowering, Nvptx only, and only for one fixed tile shape — this is
+// deliberately a "buy the fast, common case first" lane, not a general tensor-core code
+// generator. When `m == n == k == 16`, `in_dtype == f16`, and `acc_dtype` is `f16` or `f32`,
+// this lowers to LLVM's NVVM WMMA intrinsic family: load fragment `a`/`b`/`c` from memory,
+// `mma` the three fragments into a `d` fragment, store `d` back to memory. Every other
+// shape/dtype combination is `Err(Diag)` — no partial decomposition, no fallback loop. The
+// three intrinsic families and their exact signatures (confirmed against a real LLVM 18
+// install via `Intrinsic::find`/`get_declaration`, not assumed from documentation):
+//   - `llvm.nvvm.wmma.m16n16k16.load.{a,b}.{row,col}.stride.f16.p0(ptr, i32 stride)` ->
+//     `{ <2 x half> x 8 }`, one call per operand, `row`/`col` selected by `layout_a`/
+//     `layout_b`.
+//   - `llvm.nvvm.wmma.m16n16k16.load.c.row.stride.{f16,f32}.p0(ptr, i32 stride)` -> `{ <2 x
+//     half> x 4 }` or `{ float x 8 }` depending on `acc_dtype`. `c`/`d` have no layout
+//     attribute of their own in BIR (see `Op::Mma`'s own doc comment) and always use the
+//     `row` intrinsic variant.
+//   - `llvm.nvvm.wmma.m16n16k16.mma.<a-layout>.<b-layout>.<acc>.<acc>(<16 fragment-a/b
+//     registers>, <4 or 8 fragment-c registers>)` -> the same aggregate shape as `d`'s load
+//     intrinsic. Takes every fragment register as a separate flat argument (not a struct),
+//     matching the aggregate's own field order.
+//   - `llvm.nvvm.wmma.m16n16k16.store.d.row.stride.{f16,f32}.p0(ptr, <4 or 8 fragment-d
+//     registers>, i32 stride)`.
+// `stride` is `16` for every load/store call: BIR's own `Mma` doc comment fixes each
+// operand's leading dimension to its natural extent with no separate stride field, and every
+// extent in this tile shape is `16`, so the load/store `stride` argument (LLVM's WMMA
+// intrinsics always take one, independent of BIR's own no-stride addressing convention) is a
+// tile-shape constant here, not a value threaded in from BIR.
+//
 // `atomic`/`atomic.cas`: dialect-independent — `atomicrmw`/`cmpxchg` are target-agnostic LLVM
 // IR instructions, not intrinsics. `atomic` (read-modify-write) covers `i8`/`i16`/`i32`/`i64`
 // through inkwell's `build_atomicrmw`; `Min`/`Max` map to LLVM's *signed* `Min`/`Max` variants,
@@ -115,8 +142,8 @@ use inkwell::AddressSpace;
 use inkwell::{AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate};
 
 use basalt_bir::{
-    AddrSpace, AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, Module, Op,
-    Scalar, ShuffleKind, Term, Ty, ValRef,
+    AddrSpace, AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, MmaLayout,
+    Module, Op, Scalar, ShuffleKind, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 
@@ -876,6 +903,116 @@ fn lower_atomic_cas<'ctx>(
     }
 }
 
+fn wmma_layout_str(l: MmaLayout) -> &'static str {
+    match l {
+        MmaLayout::RowMajor => "row",
+        MmaLayout::ColMajor => "col",
+    }
+}
+
+/// The canonical WMMA tile this lane lowers for real: `m == n == k == 16`, fp16 inputs, and
+/// either an fp16 or fp32 accumulator. See the module header for exactly which NVVM
+/// intrinsics that maps to and why. Any other shape/dtype combination is out of scope and
+/// comes back as `Err(Diag)` rather than a partial or guessed lowering.
+#[allow(clippy::too_many_arguments)]
+fn lower_wmma<'ctx>(
+    cx: LowerCtx<'ctx, '_>,
+    a: PointerValue<'ctx>,
+    b: PointerValue<'ctx>,
+    c: PointerValue<'ctx>,
+    d: PointerValue<'ctx>,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: Scalar,
+    acc_dtype: Scalar,
+    layout_a: MmaLayout,
+    layout_b: MmaLayout,
+) -> Result<(), Diag> {
+    if !(m == 16 && n == 16 && k == 16 && in_dtype == Scalar::F16) {
+        return Err(Diag::new(ECode::UnsupportedType).with_arg(format!(
+            "mma m{m}n{n}k{k} in={in_dtype:?}: only the canonical m16n16k16 f16-input wmma \
+             tile is lowered to a real intrinsic on the nvptx dialect in this lane"
+        )));
+    }
+    let acc = match acc_dtype {
+        Scalar::F16 => "f16",
+        Scalar::F32 => "f32",
+        _ => {
+            return Err(Diag::new(ECode::UnsupportedType).with_arg(format!(
+                "mma acc_dtype {acc_dtype:?}: only an f16 or f32 accumulator is lowered to a \
+                 real wmma intrinsic on the nvptx dialect in this lane"
+            )))
+        }
+    };
+    // Every operand's leading dimension is `16` for this fixed tile shape (see the module
+    // header): the fragment count, not this stride, is what changes with `acc_dtype`.
+    let c_regs = if acc_dtype == Scalar::F16 { 4 } else { 8 };
+
+    let LowerCtx {
+        ctx,
+        llvm_mod,
+        builder,
+        ..
+    } = cx;
+    let ptr_ty: BasicTypeEnum = ctx.ptr_type(AddressSpace::default()).into();
+    let stride = ctx.i32_type().const_int(16, false);
+    let a_layout = wmma_layout_str(layout_a);
+    let b_layout = wmma_layout_str(layout_b);
+
+    let load = |ptr: PointerValue<'ctx>, name: String| {
+        call_intrinsic(
+            llvm_mod,
+            builder,
+            &name,
+            &[ptr_ty],
+            &[ptr.into(), stride.into()],
+        )
+        .try_as_basic_value()
+        .expect_basic("wmma load intrinsic returns a fragment aggregate")
+        .into_struct_value()
+    };
+    let frag_a = load(
+        a,
+        format!("llvm.nvvm.wmma.m16n16k16.load.a.{a_layout}.stride.f16"),
+    );
+    let frag_b = load(
+        b,
+        format!("llvm.nvvm.wmma.m16n16k16.load.b.{b_layout}.stride.f16"),
+    );
+    let frag_c = load(
+        c,
+        format!("llvm.nvvm.wmma.m16n16k16.load.c.row.stride.{acc}"),
+    );
+
+    let extract =
+        |agg: inkwell::values::StructValue<'ctx>, n: u32| -> BasicMetadataValueEnum<'ctx> {
+            builder
+                .build_extract_value(agg, n, "")
+                .expect("fragment index within the aggregate's own field count")
+                .into()
+        };
+    let mut mma_args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(16 + c_regs as usize);
+    mma_args.extend((0..8).map(|i| extract(frag_a, i)));
+    mma_args.extend((0..8).map(|i| extract(frag_b, i)));
+    mma_args.extend((0..c_regs).map(|i| extract(frag_c, i)));
+
+    let mma_name = format!("llvm.nvvm.wmma.m16n16k16.mma.{a_layout}.{b_layout}.{acc}.{acc}");
+    let frag_d = call_intrinsic(llvm_mod, builder, &mma_name, &[], &mma_args)
+        .try_as_basic_value()
+        .expect_basic("wmma mma intrinsic returns a fragment aggregate")
+        .into_struct_value();
+
+    let mut store_args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(c_regs as usize + 2);
+    store_args.push(d.into());
+    store_args.extend((0..c_regs).map(|i| extract(frag_d, i)));
+    store_args.push(stride.into());
+    let store_name = format!("llvm.nvvm.wmma.m16n16k16.store.d.row.stride.{acc}");
+    call_intrinsic(llvm_mod, builder, &store_name, &[ptr_ty], &store_args);
+
+    Ok(())
+}
+
 fn lower_inst<'ctx>(
     cx: LowerCtx<'ctx, '_>,
     params: &[BasicValueEnum<'ctx>],
@@ -1020,11 +1157,34 @@ fn lower_inst<'ctx>(
             let nv = get_val(params, values, *newv);
             Some(lower_atomic_cas(builder, pv, cv, nv, inst.ty)?)
         }
-        // `wmma`/`mma.sync` intrinsic lowering is separate, later work — refuse cleanly
-        // rather than guess at a mapping.
-        Op::Mma { .. } => {
-            return Err(Diag::new(ECode::UnsupportedOp)
-                .with_arg("mma has no LLVM IR lowering in this lane yet"))
+        // Amdgcn's tensor-core path (MFMA) is a separate, hand-rolled backend's job, not this
+        // lane's — refuse cleanly rather than guess at a mapping. Nvptx gets a real lowering
+        // for the one canonical tile shape this lane supports; see `lower_wmma`.
+        Op::Mma {
+            a,
+            b,
+            c,
+            d,
+            m,
+            n,
+            k,
+            in_dtype,
+            acc_dtype,
+            layout_a,
+            layout_b,
+        } => {
+            if cx.dialect == GpuDialect::Amdgpu {
+                return Err(Diag::new(ECode::UnsupportedOp)
+                    .with_arg("mma has no LLVM IR lowering in this lane yet"));
+            }
+            let av = get_val(params, values, *a).into_pointer_value();
+            let bv = get_val(params, values, *b).into_pointer_value();
+            let cv = get_val(params, values, *c).into_pointer_value();
+            let dv = get_val(params, values, *d).into_pointer_value();
+            lower_wmma(
+                cx, av, bv, cv, dv, *m, *n, *k, *in_dtype, *acc_dtype, *layout_a, *layout_b,
+            )?;
+            None
         }
     };
     Ok(val)
