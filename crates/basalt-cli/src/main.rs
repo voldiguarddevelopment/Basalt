@@ -9,12 +9,14 @@
 // build from. `--cpu` runs that same frontend/sema pipeline, then `basalt_passes::optimize`,
 // and hands the result to the x86-64 oracle backend, writing an object file to `-o`.
 // `--cpu-regalloc` does the same against the x86-64 regalloc backend instead (the CPU
-// performance path). Every backend that emits real machine code is handed the optimized
-// module, unconditionally — there is no flag to opt out, since the whole point is that these
-// cleanups are load-bearing infrastructure every target gets for free, not a feature a caller
-// has to remember to ask for. Every other mode flag parses into `Config` cleanly and fails
-// with a diagnostic at dispatch time rather than guessing at output (no silently-wrong
-// behavior).
+// performance path). `--nvidia-ptx` runs the same pipeline against the PTX backend; its
+// output is text like `--ir`'s, so it prints to stdout or `-o` rather than requiring `-o`
+// the way the object-file modes do. Every backend that emits real machine code is handed the
+// optimized module, unconditionally — there is no flag to opt out, since the whole point is
+// that these cleanups are load-bearing infrastructure every target gets for free, not a
+// feature a caller has to remember to ask for. Every other mode flag parses into `Config`
+// cleanly and fails with a diagnostic at dispatch time rather than guessing at output (no
+// silently-wrong behavior).
 //
 // Adding a real backend later is meant to be a small change: one new arm in `run`'s match
 // over `Mode`.
@@ -27,6 +29,7 @@ use basalt_backend::{Backend, EmitOpts, Support};
 use basalt_diag::{Diag, ECode, LangTable};
 use basalt_frontend_c::ast::TranslationUnit;
 use basalt_frontend_c::PpOpts;
+use basalt_ptx::Ptx;
 use basalt_x86::{X86Oracle, X86Regalloc};
 
 /// A mode-selecting flag. Exactly one must be given; a second conflicts with the first.
@@ -418,6 +421,55 @@ fn run_cpu_regalloc(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--nvidia-ptx <file>`: same frontend/sema/lower/optimize pipeline as `--cpu`, handed to the
+/// PTX backend instead of the x86-64 oracle. Unlike `--cpu`, the artifact here is text, not an
+/// object file, so it follows `--ir`'s output convention: printed to stdout, or written to `-o`
+/// if given, and `-o` is optional. A module the backend can't lower is refused the same way
+/// `--cpu` refuses one, with the backend's own `Diag`.
+fn run_nvidia_ptx(
+    input: &Path,
+    output: Option<&Path>,
+    cfg: &Config,
+    table: &LangTable,
+) -> Result<ExitCode, Diag> {
+    let module = if is_bir_input(input) {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        basalt_bir::parse(&src)
+            .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        let fe = run_frontend(&src, input, cfg);
+        let sema_diags = basalt_sema::check(&fe.tu);
+        let (module, lower_diags) = basalt_sema::lower(&fe.tu);
+
+        for p in &fe.problems {
+            eprintln!("{p}");
+        }
+        for d in sema_diags.iter().chain(lower_diags.iter()) {
+            eprintln!("{}", d.render(table));
+        }
+
+        if fe.has_problems() || !sema_diags.is_empty() || !lower_diags.is_empty() {
+            return Ok(ExitCode::FAILURE);
+        }
+        module
+    };
+    let module = basalt_passes::optimize(&module);
+
+    let backend = Ptx;
+    match backend.supports(&module) {
+        Support::Supported => {}
+        Support::Unsupported(code) => return Err(Diag::new(code).with_arg(backend.name())),
+    }
+
+    let artifact = backend.emit(&module, &EmitOpts::default())?;
+    let text = artifact
+        .as_text()
+        .expect("Ptx::emit always produces a Payload::Text artifact");
+    write_output(output, text)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Writes `text` to `output` if given, else stdout — the common tail of every mode that
 /// produces a single text artifact.
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
@@ -430,9 +482,9 @@ fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
     }
 }
 
-/// Dispatches on the selected mode. `--ast`/`--sema`/`--ir` run the real pipeline; every
-/// other mode has no implementation yet (backends land in later phases) — refuse cleanly
-/// rather than emit anything.
+/// Dispatches on the selected mode. `--ast`/`--sema`/`--ir`/`--cpu`/`--cpu-regalloc`/
+/// `--nvidia-ptx` run the real pipeline; every other mode has no implementation yet (backends
+/// land in later phases) — refuse cleanly rather than emit anything.
 fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
     let mode = cfg
         .mode
@@ -448,6 +500,7 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
         Mode::Sema => run_sema(input()?, cfg, table),
         Mode::Cpu => run_cpu(input()?, cfg.output.as_deref(), cfg, table),
         Mode::CpuRegalloc => run_cpu_regalloc(input()?, cfg.output.as_deref(), cfg, table),
+        Mode::NvidiaPtx => run_nvidia_ptx(input()?, cfg.output.as_deref(), cfg, table),
         other => Err(Diag::new(ECode::UnsupportedFeature).with_arg(other.flag())),
     }
 }
