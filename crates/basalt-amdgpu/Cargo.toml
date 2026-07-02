@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+basalt-diag = { path = "../basalt-diag" }
+
+[dev-dependencies]
+object = { version = "0.39", default-features = false, features = ["read", "elf"] }
