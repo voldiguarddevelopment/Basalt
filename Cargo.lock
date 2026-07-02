@@ -120,6 +120,7 @@ dependencies = [
  "basalt-passes",
  "basalt-ptx",
  "basalt-sema",
+ "basalt-spirv",
 ]
 
 [[package]]

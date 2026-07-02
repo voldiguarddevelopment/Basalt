@@ -17,6 +17,10 @@
 //
 // The HSA half (`hsa/`) wraps `libhsa-runtime64.so`, the ROCm-side counterpart to the CUDA
 // Driver API above — see `hsa/mod.rs` for how the two loaders differ and why.
+//
+// The Vulkan half (`vulkan/`) wraps `libvulkan.so.1`, a real software-Vulkan-capable compute
+// runtime (validated against Mesa's `llvmpipe`) — see `vulkan/mod.rs` for its own empirical
+// finding on what `basalt-spirv`'s `Kernel`-execution-model output can and cannot do through it.
 
 mod context;
 mod dl;
@@ -25,6 +29,7 @@ mod error;
 mod ffi;
 mod hsa;
 mod module;
+mod vulkan;
 
 pub use context::{CudaContext, DeviceBuffer};
 pub use driver::CudaDriver;
@@ -35,3 +40,7 @@ pub use hsa::{
     HSA_PACKET_TYPE_KERNEL_DISPATCH,
 };
 pub use module::{CudaFunction, CudaModule};
+pub use vulkan::{
+    VulkanBuffer, VulkanComputePipeline, VulkanDevice, VulkanDeviceType, VulkanError,
+    VulkanInstance, VulkanPhysicalDeviceInfo,
+};

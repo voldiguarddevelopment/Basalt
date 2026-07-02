@@ -11,3 +11,4 @@ basalt-frontend-c = { path = "../basalt-frontend-c" }
 basalt-passes = { path = "../basalt-passes" }
 basalt-ptx = { path = "../basalt-ptx" }
 basalt-sema = { path = "../basalt-sema" }
+basalt-spirv = { path = "../basalt-spirv" }
