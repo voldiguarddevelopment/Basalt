@@ -38,8 +38,11 @@ SKIP = 77
 # interface.
 os.environ.setdefault("DEV", "MOCK+AMD")
 
-DTYPE_FMT = {"i32": "i", "i64": "q", "f32": "f", "f64": "d"}
-DTYPE_SIZE = {"i32": 4, "i64": 8, "f32": 4, "f64": 8}
+# `struct`'s `e` code (IEEE 754 binary16, Python 3.6+) packs/unpacks f16 buffers directly from
+# plain decimal text — needed for a WMMA kernel's f16-input tiles; no caller has needed it
+# before this, so `basalt-amdgpu`'s WMMA proof is the first user.
+DTYPE_FMT = {"i32": "i", "i64": "q", "f32": "f", "f64": "d", "f16": "e"}
+DTYPE_SIZE = {"i32": 4, "i64": 8, "f32": 4, "f64": 8, "f16": 2}
 
 
 def find_tinygrad_src_root() -> str | None:

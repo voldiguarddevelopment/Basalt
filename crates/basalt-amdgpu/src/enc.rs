@@ -804,6 +804,72 @@ pub fn vop3_carry(
     code
 }
 
+// ---- VOP3P: vector ALU, packed/matrix (WMMA) -----------------------------------------------
+//
+// Two dwords, a fixed bit pattern in both words distinct from every other VOP3-family encoding
+// above. Word0: `[31:26]=0b11_0011` (fixed) `[25:16]=OP(10)` `[14]=1` (fixed — present in
+// every probe below regardless of opcode/operands, a second WMMA-specific default bit
+// alongside word1's; not one of the general VOP3 CLAMP/ABS bits this file's own `vop3` uses,
+// since those never set anything at this position for any other instruction here)
+// `[7:0]=VDST(8, plain register number)`. Word1: `[31:27]=0b00011` (fixed — a WMMA-specific
+// "opsel-hi" default this encoder never varies; every register combination probed below
+// reproduces the identical top-5-bit pattern) `[26:18]=SRC2(9)` `[17:9]=SRC1(9)` `[8:0]=SRC0
+// (9)`, each using the same VGPR-only
+// (`256 + register number`) code `encode_vsrc` uses elsewhere in this file. Real WMMA operands
+// are always a full 8-VGPR fragment tuple at a given base register, never a scalar or
+// inline-constant form, so this encoder takes plain register numbers rather than a general
+// `VSrc`.
+//
+// Confirmed byte-exact against `llvm-mc-18 -triple=amdgcn-amd-amdhsa -mcpu=gfx1100
+// -show-encoding` for all four opcodes below (`v_wmma_f32_16x16x16_f16`/`_bf16`,
+// `v_wmma_f16_16x16x16_f16`, `v_wmma_bf16_16x16x16_bf16`) — see the `tests` module for the
+// exact assembly lines and resulting bytes. The field boundaries above were derived, not
+// assumed, by varying `vdst`/`src0`/`src1`/`src2` independently across several probes and
+// checking which output bits moved in response to each. What `llvm-mc` cannot confirm is the
+// per-lane VGPR/half data layout these instructions actually read and write (which physical
+// lane and which VGPR half a given fragment element lives in) — that comes from
+// `lower.rs`'s own module header, verified against tinygrad's real, instruction-level RDNA3
+// emulator (`test/mockgpu/amd/emu.py`'s `_compile_wmma`), not from this file.
+
+#[derive(Clone, Copy)]
+pub enum Vop3pOp {
+    WmmaF32F16,
+    WmmaF32Bf16,
+    WmmaF16F16,
+    WmmaBf16Bf16,
+}
+
+impl Vop3pOp {
+    fn opcode(self) -> u32 {
+        match self {
+            Vop3pOp::WmmaF32F16 => 0x40,
+            Vop3pOp::WmmaF32Bf16 => 0x41,
+            Vop3pOp::WmmaF16F16 => 0x42,
+            Vop3pOp::WmmaBf16Bf16 => 0x43,
+        }
+    }
+}
+
+fn enc_wmma_vgpr(r: u8) -> u32 {
+    256 + r as u32
+}
+
+/// `vdst`/`src0`/`src1`/`src2` are all plain VGPR register numbers — the base of that
+/// operand's own 8-register fragment tuple (`v[16:23]` is passed as plain `16`). `WmmaF32Bf16`/
+/// `WmmaBf16Bf16` are exposed since the encoding is free to expose (confirmed below alongside
+/// the two opcodes actually used), but `lower.rs`'s own lowering only ever emits the two
+/// f16-input variants — see that file's module header for the declared scope.
+pub fn vop3p_wmma(op: Vop3pOp, vdst: u8, src0: u8, src1: u8, src2: u8) -> Vec<u8> {
+    let word0 = (0b11_0011u32 << 26) | ((op.opcode() & 0x3FF) << 16) | (1u32 << 14) | vdst as u32;
+    let word1 = (0b00011u32 << 27)
+        | (enc_wmma_vgpr(src2) << 18)
+        | (enc_wmma_vgpr(src1) << 9)
+        | enc_wmma_vgpr(src0);
+    let mut code = word0.to_le_bytes().to_vec();
+    code.extend_from_slice(&word1.to_le_bytes());
+    code
+}
+
 // ---- SMEM: scalar memory (kernarg/constant reads) -----------------------------------------
 //
 // Two dwords. Word0: `[31:26]=0b11_1101` (fixed) `[25:18]=OP(8)` `[14]=GLC` `[13]=DLC`
@@ -2674,6 +2740,66 @@ mod tests {
         assert_eq!(
             flat_load(Seg::Scratch, FlatOp::LoadB32, 0, 2, None, 0, false).as_slice()[0..4],
             [0x00, 0x00, 0x51, 0xdc]
+        );
+    }
+
+    // ---- VOP3P (WMMA) ----
+
+    #[test]
+    fn vop3p_wmma_opcodes() {
+        // v_wmma_f32_16x16x16_f16 v[0:7], v[16:23], v[24:31], v[0:7]
+        //   ; encoding: [0x00,0x40,0x40,0xcc,0x10,0x31,0x02,0x1c]
+        // v_wmma_f32_16x16x16_bf16 v[0:7], v[16:23], v[24:31], v[0:7]
+        //   ; encoding: [0x00,0x40,0x41,0xcc,0x10,0x31,0x02,0x1c]
+        // v_wmma_f16_16x16x16_f16 v[0:7], v[16:23], v[24:31], v[0:7]
+        //   ; encoding: [0x00,0x40,0x42,0xcc,0x10,0x31,0x02,0x1c]
+        // v_wmma_bf16_16x16x16_bf16 v[0:7], v[16:23], v[24:31], v[0:7]
+        //   ; encoding: [0x00,0x40,0x43,0xcc,0x10,0x31,0x02,0x1c]
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF32F16, 0, 16, 24, 0),
+            [0x00, 0x40, 0x40, 0xcc, 0x10, 0x31, 0x02, 0x1c]
+        );
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF32Bf16, 0, 16, 24, 0),
+            [0x00, 0x40, 0x41, 0xcc, 0x10, 0x31, 0x02, 0x1c]
+        );
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF16F16, 0, 16, 24, 0),
+            [0x00, 0x40, 0x42, 0xcc, 0x10, 0x31, 0x02, 0x1c]
+        );
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaBf16Bf16, 0, 16, 24, 0),
+            [0x00, 0x40, 0x43, 0xcc, 0x10, 0x31, 0x02, 0x1c]
+        );
+    }
+
+    #[test]
+    fn vop3p_wmma_register_fields() {
+        // Independently varying vdst/src0/src1/src2 to pin down each field's exact bit
+        // position, re-derived (not assumed) from these four probes:
+        // v_wmma_f32_16x16x16_f16 v[8:15], v[32:39], v[40:47], v[8:15]
+        //   ; encoding: [0x08,0x40,0x40,0xcc,0x20,0x51,0x22,0x1c]
+        // v_wmma_f32_16x16x16_f16 v[100:107], v[16:23], v[24:31], v[0:7]
+        //   ; encoding: [0x64,0x40,0x40,0xcc,0x10,0x31,0x02,0x1c]
+        // v_wmma_f32_16x16x16_f16 v[0:7], v[200:207], v[24:31], v[0:7]
+        //   ; encoding: [0x00,0x40,0x40,0xcc,0xc8,0x31,0x02,0x1c]
+        // v_wmma_f32_16x16x16_f16 v[0:7], v[16:23], v[224:231], v[0:7]
+        //   ; encoding: [0x00,0x40,0x40,0xcc,0x10,0xc1,0x03,0x1c]
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF32F16, 8, 32, 40, 8),
+            [0x08, 0x40, 0x40, 0xcc, 0x20, 0x51, 0x22, 0x1c]
+        );
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF32F16, 100, 16, 24, 0),
+            [0x64, 0x40, 0x40, 0xcc, 0x10, 0x31, 0x02, 0x1c]
+        );
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF32F16, 0, 200, 24, 0),
+            [0x00, 0x40, 0x40, 0xcc, 0xc8, 0x31, 0x02, 0x1c]
+        );
+        assert_eq!(
+            vop3p_wmma(Vop3pOp::WmmaF32F16, 0, 16, 224, 0),
+            [0x00, 0x40, 0x40, 0xcc, 0x10, 0xc1, 0x03, 0x1c]
         );
     }
 }

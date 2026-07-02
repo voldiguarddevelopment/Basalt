@@ -53,8 +53,13 @@
 // `Select`, integer/float compare, `Atomic` on `Global`). Anything outside that slice is a
 // clean `Support::Unsupported` refusal with a stable E-code (`check_module` below), never a
 // guess:
-//   - `i8`/`i16`/`f16`/`f64` and every `Ty::Vec` are refused (`E091`): only `i1`/`i32`/`i64`/
-//     `f32`/pointers are lowered.
+//   - `i8`/`i16`/`f64` and every `Ty::Vec` are refused (`E091`): only `i1`/`i32`/`i64`/`f32`/
+//     pointers are lowered as real values. `f16` is a narrow exception, in scope *only* as an
+//     opaque 2-byte bit-pattern payload for `Load`/`Store` (see `vgpr_width`'s own doc comment)
+//     — needed to stage a WMMA operand tile through ordinary memory ops (see "Matrix ops
+//     (WMMA)" below) — never a value this backend does arithmetic, comparison, or conversion
+//     on; `check_bin`/`check_cast`/`Op::ConstFloat`'s own type checks all still refuse it
+//     everywhere else.
 //   - Integer `div`/`rem` and float `div`/`rem` are refused (`E093`): AMDGCN has no native
 //     integer divide (true of every real GPU ISA), and an IEEE-correct float divide needs a
 //     verified reciprocal-plus-Newton-Raphson sequence this task's time budget did not reach —
@@ -86,6 +91,88 @@
 //   - `Term::Switch` is refused (`E093`): only `Br`/`CondBr`/`Ret` are lowered.
 //   - More than one function per module is refused (`E093`): `hsaco::HsacoSpec` is one kernel
 //     per object (see that module's header), matching this same simplification.
+//
+// # Matrix ops (WMMA)
+//
+// `Op::Mma` gets a real, hand-rolled RDNA3 `v_wmma_*` lowering (`check_mma_shape`, `lower_mma`
+// and its helpers), scoped identically to `basalt-llvm`'s own WMMA lane (see that crate's
+// `lower_wmma`): exactly the canonical `m == 16 && n == 16 && k == 16` tile, `in_dtype ==
+// Scalar::F16`, and `acc_dtype` either `Scalar::F32` or `Scalar::F16`. Every other shape/dtype
+// combination — and any `a`/`b`/`c`/`d` operand that is not a `Global` pointer (this backend has
+// no other 64-bit-address space in scope) — is refused with `E099`, never a partial or guessed
+// lowering.
+//
+// The four opcodes this needs (`v_wmma_f32_16x16x16_f16` = `0x40`, `v_wmma_f16_16x16x16_f16` =
+// `0x42`, plus the unused-but-free `_bf16` variants `0x41`/`0x43`) live in a new `VOP3P` encoding
+// family in `enc.rs` (`Vop3pOp`/`vop3p_wmma`) — this crate's first, since nothing before this
+// task needed it. Confirmed byte-exact against `llvm-mc-18 -triple=amdgcn-amd-amdhsa
+// -mcpu=gfx1100 -show-encoding` the same way every other opcode in `enc.rs` was (see that file's
+// own module header and `tests` module for the exact assembly lines/bytes and the independent
+// per-field probes that pinned down `vdst`/`src0`/`src1`/`src2`'s bit positions).
+//
+// What `llvm-mc` cannot confirm is the per-lane data layout these instructions actually read and
+// write — that came from reading tinygrad's real, instruction-level RDNA3 emulator's own
+// implementation directly (`test/mockgpu/amd/emu.py`'s `_compile_wmma`, the same emulator this
+// crate's tests already drive HSACO objects through), not from the task brief's own
+// paraphrase of it, which this lowering's derivation double-checked against the real source and
+// found accurate on every point but one (see below). The real per-lane layout, for the
+// non-RDNA4 (wave32, this backend's only target) case:
+//   - `A`/`B` are each read from `src0`/`src1`'s own 8-VGPR fragment tuple: element `(row, k)`
+//     (`row`/`k` both `0..16`) lives at **lane = row**, **vgpr = src_base + k/2**, low 16 bits
+//     of that vgpr if `k` is even, high 16 bits if odd. Only lanes `0..16` hold meaningful `A`/
+//     `B` data (the upper half of the wave is a don't-care for these two operands).
+//   - `C`/`D` are read/written via `src2`/`vdst`'s own 8-VGPR fragment tuple, spread across the
+//     *full* 32-lane wave: element `(m, n)` (`m`/`n` both `0..16`) lives at **lane = n + 16*(m &
+//     1)**, **vgpr = m >> 1**, one full vgpr per element for an `f32` accumulator. **The one
+//     place the task brief's own paraphrase did not hold once checked against the real source**:
+//     it suggested `f16`-accumulator `C`/`D` might pack two elements per vgpr the same low/high
+//     way `A`/`B` do. Reading `_compile_wmma`'s own `is_f16_output` branch directly shows RDNA3
+//     does **not** pack there — an `f16` element occupies the identical one-vgpr-per-element
+//     slot an `f32` element would, just narrower (`read_f16_val(..., half=0)` — only the low 16
+//     bits of that vgpr are ever read or written; `f32`'s `slot_stride`/`cd_off` scale by the
+//     accumulator's own element size, see `lower_mma_cd`).
+//
+// From the per-lane `(row, k)`/`(m, n)` addressing above and each operand's own fixed-stride-16
+// memory layout (`Op::Mma`'s own doc comment; row-major or column-major per `layout_a`/
+// `layout_b` — `C`/`D` have no layout of their own and are always row-major, matching
+// `basalt-llvm`'s identical convention), this lowering derives, and empirically confirmed
+// end-to-end on the real emulator (see `tests/tiled_sgemm_wmma.rs` and
+// `tests/mma16x16_f16acc.rs`):
+//   - `A`'s row and `B`'s column are simply this lane's own thread index (the same `v0 & 0x3FF`
+//     bits `Op::TidX` itself reads — see "Thread/block index" below — read directly in
+//     `lower_mma` rather than depending on an `Op::TidX` instruction existing in the program).
+//   - Whether a fragment's own `k` dimension is contiguous in memory for a fixed lane depends on
+//     *which* operand and *which* layout: `A` is contiguous with `layout_a == RowMajor`, `B` is
+//     contiguous with `layout_b == ColMajor` (the mirror image — a well-known real tensor-core
+//     quirk, not a bug: standard row-major-stored matrices need `A` read plainly but `B` read
+//     "transposed" relative to its own storage order, since the fragment convention treats `B`'s
+//     lane dimension as the output-column index, not a reduction index). `lower_mma_fragment`
+//     does not special-case the contiguous, single-wider-load-per-pair form — it always loads
+//     each of the 16 `k` values as its own 16-bit read and combines two into a packed fragment
+//     register, one code path for both layouts, trading a few extra instructions in the
+//     contiguous case for one less thing to get wrong.
+//   - `C`/`D`'s per-lane `(m, n)` inverts to `parity = lane >> 4`, `n = lane & 0xF`, and (per
+//     fragment slot `s`) `m = 2*s + parity` — `lower_mma`'s own `cd_off` precomputes the
+//     resulting lane-dependent byte offset once, reused for both the `C` read and the `D` write.
+//
+// A real WMMA instruction is warp-collective — this lowering does not, and does not need to,
+// reason about that collectivity itself: it just arranges each lane's own registers into the
+// layout above and issues one `v_wmma_*`, exactly like every other real hardware tensor-core
+// path in this project. Every kernel this lowering has been validated against launches a single
+// 32-lane workgroup (`f32`-accumulator proof: the 32x32 tiled-SGEMM fixture shared with
+// `basalt-x86`/`basalt-llvm`'s own WMMA tests, eight `Op::Mma` calls with real accumulator
+// chaining across two K-steps each; `f16`-accumulator proof: a single, untiled `m16n16k16` call)
+// — a genuinely divergent or multi-workgroup WMMA launch is out of scope here, matching this
+// file's own general control-flow scope limit (see "Control flow and divergence" below).
+//
+// `Op::Mma` produces no SSA result of its own (`Ty::Void`); its real, large scratch footprint —
+// three contiguous 8-VGPR fragment tuples plus a handful of address/lane temporaries (see
+// `MmaScratch`, `MMA_SCRATCH_LEN`) — is allocated by repurposing the zero-width "result" slot
+// `RegAlloc::build` would otherwise give it, live only for this one instruction (see that
+// function's own `Op::Mma` case) via a new `Pools::alloc_block8`/`block8_free` pair alongside
+// the existing narrow/wide pools (a WMMA fragment operand is one base register standing for a
+// hardware-contiguous 8-register tuple, unlike any ordinary SSA value this backend otherwise
+// homes).
 //
 // # Register model — divergence-aware since this task
 //
@@ -324,15 +411,15 @@ use std::collections::HashMap;
 
 use basalt_backend::{Artifact, ArtifactKind, Backend, EmitOpts, Support};
 use basalt_bir::{
-    AddrSpace, AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, InstId, Module, Op,
-    Scalar, Term, Ty, ValRef,
+    AddrSpace, AtomicOp, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, InstId, MmaLayout,
+    Module, Op, Scalar, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 use basalt_passes::{analyze_divergence, construct_ssa, Divergence, DivergenceInfo};
 
 use crate::enc::{
     self, BrCc, DsLoadOp, DsStoreOp, FlatOp, Imm, Seg, SmemOp, Sop1Op, Sop2Op, SopcOp, Src, VCmpOp,
-    VSrc, Vop1Op, Vop2Op, Vop3CarryOp, Vop3Mods, Vop3Op, VCC_LO,
+    VSrc, Vop1Op, Vop2Op, Vop3CarryOp, Vop3Mods, Vop3Op, Vop3pOp, VCC_LO,
 };
 use crate::hsaco::{write_hsaco, GfxArch, HsacoSpec};
 
@@ -355,6 +442,14 @@ const BID_SGPR_BASE: u8 = 2;
 /// The highest legal SGPR number (`enc.rs`'s own header: "SGPRs are numbered 0-105 directly").
 const MAX_SGPR: u8 = 105;
 
+/// How many VGPRs `Op::Mma`'s own lowering needs as private scratch (see `MmaScratch`, and the
+/// module header's "Matrix ops" section): three 8-wide fragment tuples (A/B/C-D) plus one
+/// 2-wide address pair plus eight single-register temporaries. `Op::Mma` is `Ty::Void` (it has
+/// no SSA result of its own — see `basalt-bir`'s own doc comment), so `RegAlloc` repurposes the
+/// zero-width "result" slot every other op would get to instead hold this fixed scratch bundle,
+/// live only for the duration of this one instruction (see `RegAlloc::build`'s own Mma case).
+const MMA_SCRATCH_LEN: usize = 34;
+
 fn e_type() -> Diag {
     Diag::new(ECode::UnsupportedType)
 }
@@ -371,15 +466,19 @@ fn e_feature() -> Diag {
 
 /// How many consecutive VGPRs a value of this type occupies. `None` for anything out of this
 /// backend's declared scope (see the module header) — never a guess at a plausible-looking
-/// width.
+/// width. `Scalar::F16` fits in one VGPR (low 16 bits; the high half is never given a defined
+/// meaning) exactly like every other narrow scalar here — see the module header's "Matrix ops"
+/// section for why this type is in scope at all: an opaque bit-pattern payload for staging a
+/// WMMA operand tile through ordinary `Load`/`Store`, never a value this backend does arithmetic
+/// on (`check_bin`/`check_cast`/`ConstFloat`'s own type checks all still refuse it elsewhere).
 fn vgpr_width(ty: Ty) -> Option<u8> {
     match ty {
         Ty::Void => Some(0),
-        Ty::Scalar(Scalar::I1 | Scalar::I32 | Scalar::F32) => Some(1),
+        Ty::Scalar(Scalar::I1 | Scalar::I32 | Scalar::F32 | Scalar::F16) => Some(1),
         Ty::Scalar(Scalar::I64) => Some(2),
         Ty::Ptr(AddrSpace::Shared | AddrSpace::Local) => Some(1),
         Ty::Ptr(AddrSpace::Global | AddrSpace::Constant | AddrSpace::Param) => Some(2),
-        Ty::Scalar(Scalar::I8 | Scalar::I16 | Scalar::F16 | Scalar::F64) | Ty::Vec(..) => None,
+        Ty::Scalar(Scalar::I8 | Scalar::I16 | Scalar::F64) | Ty::Vec(..) => None,
     }
 }
 
@@ -523,6 +622,12 @@ struct Pools {
     next_free_vgpr: u16,
     narrow_free: Vec<u8>,
     wide_free: Vec<u8>,
+    /// Free list for 8-wide contiguous blocks — used only by `Op::Mma`'s own scratch (a WMMA
+    /// fragment tuple, `frag_a`/`frag_b`/`frag_cd`, is addressed in hardware as one base
+    /// register standing for an 8-register-wide operand, so it must be a contiguous run, unlike
+    /// every ordinary SSA value this backend otherwise homes). Not reachable through `alloc`/
+    /// `vgpr_width` (which only ever produce widths 0/1/2): see `alloc_block8`.
+    block8_free: Vec<u8>,
 }
 
 impl Pools {
@@ -531,6 +636,7 @@ impl Pools {
             next_free_vgpr: FIRST_FREE_VGPR,
             narrow_free: Vec::new(),
             wide_free: Vec::new(),
+            block8_free: Vec::new(),
         }
     }
 
@@ -563,12 +669,31 @@ impl Pools {
         }
     }
 
+    /// A contiguous 8-register block, for one WMMA fragment tuple (see `Pools::block8_free`'s
+    /// own doc comment). Bump-allocated/reused exactly like `alloc`'s narrow/wide cases, just at
+    /// a fixed width `alloc` itself never needs.
+    fn alloc_block8(&mut self) -> Result<Vec<u8>, Diag> {
+        if let Some(base) = self.block8_free.pop() {
+            return Ok((base..base + 8).collect());
+        }
+        let base = self.next_free_vgpr;
+        if base + 7 > MAX_VGPR {
+            return Err(e_feature());
+        }
+        self.next_free_vgpr += 8;
+        Ok((base as u8..(base + 8) as u8).collect())
+    }
+
     fn free(&mut self, regs: &[u8]) {
         match regs.len() {
             0 => {}
             1 => self.narrow_free.push(regs[0]),
             2 => self.wide_free.push(regs[0]),
-            _ => unreachable!("vgpr_width only ever returns 0, 1, or 2"),
+            8 => self.block8_free.push(regs[0]),
+            _ => unreachable!(
+                "only vgpr_width's 0/1/2 and Op::Mma's own 8-wide fragment blocks are ever \
+                 allocated from this pool"
+            ),
         }
     }
 }
@@ -759,6 +884,37 @@ impl RegAlloc {
 
             let width = vgpr_width(inst.ty).ok_or_else(e_type)?;
 
+            // `Op::Mma` produces no SSA result (`Ty::Void`, `width == 0` above) but needs a
+            // large, fixed scratch footprint of its own — three contiguous 8-wide fragment
+            // tuples plus a handful of singles/pairs (see `MMA_SCRATCH_LEN`/`MmaScratch`). It is
+            // allocated here, live only across this one instruction (nothing else ever reads
+            // `ValRef::Val(InstId(idx))`, so `inst_last[idx]`'s default — "last use is its own
+            // definition point" — already gives exactly that range), and freed the instant the
+            // next instruction's retain-and-free pass above runs. Each sub-allocation is tracked
+            // as its own `active_v` entry so `Pools::free` gets back the same shapes `Pools`
+            // handed out (three 8-blocks, one wide pair, eight narrows) rather than one
+            // unrecognized 34-long slice.
+            if matches!(inst.op, Op::Mma { .. }) {
+                let mut regs = Vec::with_capacity(MMA_SCRATCH_LEN);
+                for _ in 0..3 {
+                    let block = vpools.alloc_block8()?;
+                    active_v.push((block.clone(), inst_last[idx]));
+                    regs.extend(block);
+                }
+                let pair = vpools.alloc(2)?;
+                active_v.push((pair.clone(), inst_last[idx]));
+                regs.extend(pair);
+                for _ in 0..8 {
+                    let single = vpools.alloc(1)?;
+                    active_v.push((single.clone(), inst_last[idx]));
+                    regs.extend(single);
+                }
+                debug_assert_eq!(regs.len(), MMA_SCRATCH_LEN);
+                inst_home[idx] = Home::Vgpr;
+                inst_reg.push(regs);
+                continue;
+            }
+
             // `Op::BidX/Y/Z`: the value already lives at the fixed SGPR hardware preloads for
             // that axis (see the module header) — not from the pool, never freed.
             let fixed_bid = match inst.op {
@@ -932,6 +1088,13 @@ fn build_phi_copies(f: &Function) -> PhiCopies {
 
 fn check_bin(op: BinOp, ty: Ty) -> Result<(), Diag> {
     use BinOp::*;
+    // `Scalar::F16` is in scope only as an opaque bit-pattern payload for `Load`/`Store` (see
+    // `vgpr_width`'s own doc comment) — never a value this backend does arithmetic on, so it is
+    // refused here explicitly rather than falling through to the catch-all below, which (unlike
+    // every other in-scope type) would otherwise silently accept it.
+    if ty == Ty::Scalar(Scalar::F16) {
+        return Err(e_type());
+    }
     match op {
         Div | Rem | FDiv | FRem => Err(e_feature()),
         // `Add`/`Mul` have a real 64-bit lowering (the carry chain / cross-term-multiply
@@ -962,6 +1125,27 @@ fn check_cast(cop: CastOp, sty: Ty, dty: Ty) -> Result<(), Diag> {
         Ok(())
     } else {
         Err(e_type())
+    }
+}
+
+/// `Op::Mma`'s own scope narrowing (see the module header's "Matrix ops" section): exactly the
+/// canonical `m16n16k16`, f16-input tile, with either an f32 or f16 accumulator — matching
+/// `basalt-llvm`'s own WMMA lane's declared scope precisely (see that crate's `lower_wmma`).
+/// Anything else is a clean `E099` refusal, never a guess at a plausible-looking lowering.
+fn check_mma_shape(
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: Scalar,
+    acc_dtype: Scalar,
+) -> Result<(), Diag> {
+    let shape_ok = m == 16 && n == 16 && k == 16;
+    let in_ok = in_dtype == Scalar::F16;
+    let acc_ok = matches!(acc_dtype, Scalar::F32 | Scalar::F16);
+    if shape_ok && in_ok && acc_ok {
+        Ok(())
+    } else {
+        Err(Diag::new(ECode::MatrixPathUnsupported))
     }
 }
 
@@ -1042,7 +1226,26 @@ fn check_function(f: &Function) -> Result<(), Diag> {
                 }
             }
             Op::AtomicCas(..) => return Err(e_feature()),
-            Op::Mma { .. } => return Err(Diag::new(ECode::MatrixPathUnsupported)),
+            Op::Mma {
+                a,
+                b,
+                c,
+                d,
+                m,
+                n,
+                k,
+                in_dtype,
+                acc_dtype,
+                ..
+            } => {
+                check_mma_shape(*m, *n, *k, *in_dtype, *acc_dtype)?;
+                let ptr_global = Ty::Ptr(AddrSpace::Global);
+                for operand in [*a, *b, *c, *d] {
+                    if valref_ty(f, operand) != ptr_global {
+                        return Err(e_space());
+                    }
+                }
+            }
         }
     }
     for block in &f.blocks {
@@ -1162,6 +1365,70 @@ fn atomic_flatop(op: AtomicOp) -> FlatOp {
 
 enum BranchTarget {
     Block(u32),
+}
+
+/// A view over `Op::Mma`'s own `MMA_SCRATCH_LEN`-long scratch slice (see `RegAlloc::build`'s
+/// Mma case), naming each piece by what `lower_mma` actually uses it for rather than by index.
+/// `frag_a`/`frag_b`/`frag_cd` are each the base of a real, hardware-contiguous 8-VGPR fragment
+/// tuple (`v_wmma_*`'s own operand shape — see `enc::vop3p_wmma`'s header); `frag_cd` holds `C`
+/// on the way in and `D` on the way out, matching `Op::Mma`'s own "`d` aliases `c`" convention
+/// (see that op's doc comment in `basalt-bir`) — real hardware reads and writes the identical
+/// registers for this instruction's `src2`/`vdst`. `addr_lo`/`addr_hi` is one scratch pointer
+/// pair, reused in turn for each operand's own per-lane address (`A` then `B` then `C` then `D`)
+/// since each phase runs strictly after the previous one is done reading or writing it. The rest
+/// are single-register temporaries; see `lower_mma`'s own comments for exactly how each is used.
+struct MmaScratch {
+    frag_a: [u8; 8],
+    frag_b: [u8; 8],
+    frag_cd: [u8; 8],
+    addr_lo: u8,
+    addr_hi: u8,
+    /// This lane's own thread index (`v0 & 0x3FF`, the same bits `Op::TidX` itself reads) —
+    /// `A`'s row and `B`'s column both are this value directly (see the module header's matrix
+    /// section), and `C`/`D`'s `parity`/`n` below are both derived from it.
+    lane: u8,
+    /// `lane >> 4`: which half of the wave (0 or 1) this lane's `C`/`D` element lives in.
+    parity: u8,
+    /// `lane & 0xF`: this lane's output-column index within `C`/`D`.
+    n: u8,
+    /// Scratch for the per-lane byte offset added to a base pointer before its wide add into
+    /// `addr_lo`/`addr_hi` (`A`/`B`'s `lane`-scaled component; recomputed fresh for each of the
+    /// four operand phases, never live across two of them at once).
+    lane_off: u8,
+    /// `C`/`D`'s own lane-derived byte offset (`parity*64 + n*4`), computed once and reused for
+    /// both the `C` read and the `D` write — both share the same per-lane address component
+    /// since row-major `C`/`D` addressing does not depend on which of the two pointers it is.
+    cd_off: u8,
+    /// Scratch for the "high half" 16-bit load before it is shifted and OR'd into a fragment
+    /// register (see `lower_mma`'s fragment-loading loop).
+    hi_val: u8,
+    /// Always `0` — the high-word augend for a 64-bit address add whose real offset is only
+    /// ever a 32-bit lane-derived value (see `lower_mma`'s address-computation helper).
+    zero: u8,
+    /// A general-purpose single-instruction scratch, used only where a value needs holding for
+    /// exactly one instruction before being consumed (e.g. `cd_off`'s own two-term sum).
+    tmp: u8,
+}
+
+impl MmaScratch {
+    fn from_regs(r: &[u8]) -> MmaScratch {
+        debug_assert_eq!(r.len(), MMA_SCRATCH_LEN);
+        MmaScratch {
+            frag_a: r[0..8].try_into().expect("8-element slice"),
+            frag_b: r[8..16].try_into().expect("8-element slice"),
+            frag_cd: r[16..24].try_into().expect("8-element slice"),
+            addr_lo: r[24],
+            addr_hi: r[25],
+            lane: r[26],
+            parity: r[27],
+            n: r[28],
+            lane_off: r[29],
+            cd_off: r[30],
+            hi_val: r[31],
+            zero: r[32],
+            tmp: r[33],
+        }
+    }
 }
 
 struct CodeGen<'a> {
@@ -1352,6 +1619,16 @@ impl<'a> CodeGen<'a> {
                 self.push(enc::s_barrier());
             }
             Op::Atomic(aop, ptr, val, _space) => self.lower_atomic(id, *aop, *ptr, *val),
+            Op::Mma {
+                a,
+                b,
+                c,
+                d,
+                acc_dtype,
+                layout_a,
+                layout_b,
+                ..
+            } => self.lower_mma(id, *a, *b, *c, *d, *acc_dtype, *layout_a, *layout_b),
             Op::BdimX
             | Op::BdimY
             | Op::BdimZ
@@ -1362,8 +1639,7 @@ impl<'a> CodeGen<'a> {
             | Op::Ballot(_)
             | Op::VoteAny(_)
             | Op::VoteAll(_)
-            | Op::AtomicCas(..)
-            | Op::Mma { .. } => {
+            | Op::AtomicCas(..) => {
                 unreachable!("check_module refuses this construct before codegen starts")
             }
         }
@@ -1912,6 +2188,10 @@ impl<'a> CodeGen<'a> {
     fn width_load_store(ty: Ty) -> (bool, u32) {
         match ty {
             Ty::Scalar(Scalar::I1) => (false, 1),
+            // `F16` is the opaque-bit-pattern-only case `vgpr_width`'s own doc comment
+            // describes: a plain 2-byte load/store, zero-extended into (and truncated out of)
+            // the low half of a VGPR, exactly like `I1`'s 1-byte case just above.
+            Ty::Scalar(Scalar::F16) => (false, 2),
             Ty::Scalar(Scalar::I32 | Scalar::F32) => (false, 4),
             Ty::Ptr(AddrSpace::Shared | AddrSpace::Local) => (false, 4),
             Ty::Scalar(Scalar::I64) => (true, 8),
@@ -1933,6 +2213,7 @@ impl<'a> CodeGen<'a> {
         if is_ds_space(space) {
             let op = match bytes {
                 1 => DsLoadOp::U8,
+                2 => DsLoadOp::U16,
                 4 => DsLoadOp::B32,
                 _ => unreachable!("check_module refuses a wide DS Load"),
             };
@@ -1940,6 +2221,7 @@ impl<'a> CodeGen<'a> {
         } else {
             let op = match (wide, bytes) {
                 (false, 1) => FlatOp::LoadU8,
+                (false, 2) => FlatOp::LoadU16,
                 (false, 4) => FlatOp::LoadB32,
                 (true, 8) => FlatOp::LoadB64,
                 _ => unreachable!(),
@@ -1966,6 +2248,7 @@ impl<'a> CodeGen<'a> {
         if is_ds_space(space) {
             let op = match bytes {
                 1 => DsStoreOp::B8,
+                2 => DsStoreOp::B16,
                 4 => DsStoreOp::B32,
                 _ => unreachable!("check_module refuses a wide DS Store"),
             };
@@ -1973,6 +2256,7 @@ impl<'a> CodeGen<'a> {
         } else {
             let op = match (wide, bytes) {
                 (false, 1) => FlatOp::StoreB8,
+                (false, 2) => FlatOp::StoreB16,
                 (false, 4) => FlatOp::StoreB32,
                 (true, 8) => FlatOp::StoreB64,
                 _ => unreachable!(),
@@ -2028,6 +2312,238 @@ impl<'a> CodeGen<'a> {
             0,
         ));
         self.waitcnt_all();
+    }
+
+    // ---- matrix (WMMA) ----------------------------------------------------------------------
+    //
+    // `Op::Mma`'s real lowering, scoped exactly to the canonical `m16n16k16` f16-input tile
+    // (`check_mma_shape`) — see the module header's "Matrix ops" section for the full derivation
+    // this rests on (from tinygrad's real RDNA3 emulator, `test/mockgpu/amd/emu.py`'s
+    // `_compile_wmma`, not from guesswork): `A`'s row and `B`'s column are both simply this
+    // lane's own thread index; `C`/`D` spread their 16x16 tile across the full 32-lane wave,
+    // two output rows per lane (`m = 2*slot + parity`, `n = lane & 0xF`).
+
+    /// `contig` is whether this operand's fixed-stride-16 memory layout (see the module header's
+    /// "Context" section — `Op::Mma` has no separate stride field) makes its own `k` dimension
+    /// contiguous in memory for a fixed lane (`A` with a row-major layout, `B` with a
+    /// column-major one — see the derivation in the module header): when it is, a fragment
+    /// element's `k` and `k+1` sit two bytes apart; when it isn't, one full row-length (32
+    /// bytes) apart. Either way this loads each of the 16 `k` values as its own zero-extending
+    /// 16-bit read and combines two into one packed 32-bit fragment register (low half even
+    /// `k`, high half odd `k` — the layout `v_wmma_*` itself reads), rather than special-casing
+    /// the contiguous op with a single wider load: one code path for both layouts, correctness
+    /// over the extra instructions the non-optimized case costs.
+    fn lower_mma_fragment(&mut self, s: &MmaScratch, frag: [u8; 8], ptr: ValRef, contig: bool) {
+        let base = self.materialize(ptr, &[s.addr_lo, s.addr_hi]);
+        let shift = if contig { 5 } else { 1 }; // lane*32 or lane*2 bytes
+        self.push(enc::vop2(
+            Vop2Op::LshlrevB32,
+            s.lane_off,
+            VSrc::Imm(Imm::Int(shift)),
+            s.lane,
+        ));
+        self.push(enc::vop3_carry(
+            Vop3CarryOp::AddCoU32,
+            s.addr_lo,
+            VCC_LO,
+            VSrc::Vgpr(base[0]),
+            VSrc::Vgpr(s.lane_off),
+            VSrc::Sgpr(0),
+        ));
+        self.push(enc::vop2(
+            Vop2Op::AddCoCiU32,
+            s.addr_hi,
+            VSrc::Vgpr(base[1]),
+            s.zero,
+        ));
+        for k2 in 0..8i16 {
+            let (off_lo, off_hi) = if contig {
+                (k2 * 4, k2 * 4 + 2)
+            } else {
+                (k2 * 64, k2 * 64 + 32)
+            };
+            let dst = frag[k2 as usize];
+            self.push(enc::flat_load(
+                Seg::Global,
+                FlatOp::LoadU16,
+                dst,
+                s.addr_lo,
+                None,
+                off_lo,
+                false,
+            ));
+            self.push(enc::flat_load(
+                Seg::Global,
+                FlatOp::LoadU16,
+                s.hi_val,
+                s.addr_lo,
+                None,
+                off_hi,
+                false,
+            ));
+            self.waitcnt_all();
+            self.push(enc::vop2(
+                Vop2Op::LshlrevB32,
+                s.hi_val,
+                VSrc::Imm(Imm::Int(16)),
+                s.hi_val,
+            ));
+            self.push(enc::vop2(Vop2Op::OrB32, dst, VSrc::Vgpr(dst), s.hi_val));
+        }
+    }
+
+    /// `C`/`D`'s shared transfer: both read the identical per-lane address (`cd_off`, computed
+    /// once in `lower_mma`, already scaled for `acc_dtype`'s own element size) off their own
+    /// base pointer, row-major (see the module header) — `store == false` loads `C` into
+    /// `frag_cd` before the `wmma` instruction runs; `store == true` writes `frag_cd` (now
+    /// holding `D`, computed in place — see `Op::Mma`'s own "`d` aliases `c`" doc comment) back
+    /// out after. `acc_dtype == F32` uses one full VGPR per element (`slot_stride == 128`
+    /// bytes); `F16` uses only the low 16 bits of each slot's VGPR the same way `A`/`B`'s own
+    /// fragments do (`slot_stride == 64` bytes) — both confirmed against the real emulator's
+    /// `_compile_wmma` (see the module header): RDNA3's `f16`-accumulator form does *not* pack
+    /// two elements per VGPR the way `A`/`B` do, unlike a first, unverified guess at this might
+    /// assume.
+    fn lower_mma_cd(&mut self, s: &MmaScratch, ptr: ValRef, store: bool, acc_dtype: Scalar) {
+        let base = self.materialize(ptr, &[s.addr_lo, s.addr_hi]);
+        self.push(enc::vop3_carry(
+            Vop3CarryOp::AddCoU32,
+            s.addr_lo,
+            VCC_LO,
+            VSrc::Vgpr(base[0]),
+            VSrc::Vgpr(s.cd_off),
+            VSrc::Sgpr(0),
+        ));
+        self.push(enc::vop2(
+            Vop2Op::AddCoCiU32,
+            s.addr_hi,
+            VSrc::Vgpr(base[1]),
+            s.zero,
+        ));
+        let slot_stride: i16 = if acc_dtype == Scalar::F32 { 128 } else { 64 };
+        for slot in 0..8i16 {
+            let off = slot * slot_stride;
+            let reg = s.frag_cd[slot as usize];
+            if store {
+                let op = if acc_dtype == Scalar::F32 {
+                    FlatOp::StoreB32
+                } else {
+                    FlatOp::StoreB16
+                };
+                self.push(enc::flat_store(
+                    Seg::Global,
+                    op,
+                    s.addr_lo,
+                    reg,
+                    None,
+                    off,
+                    false,
+                ));
+            } else {
+                let op = if acc_dtype == Scalar::F32 {
+                    FlatOp::LoadB32
+                } else {
+                    FlatOp::LoadU16
+                };
+                self.push(enc::flat_load(
+                    Seg::Global,
+                    op,
+                    reg,
+                    s.addr_lo,
+                    None,
+                    off,
+                    false,
+                ));
+            }
+        }
+        if !store {
+            self.waitcnt_all();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_mma(
+        &mut self,
+        id: InstId,
+        a: ValRef,
+        b: ValRef,
+        c: ValRef,
+        d: ValRef,
+        acc_dtype: Scalar,
+        layout_a: MmaLayout,
+        layout_b: MmaLayout,
+    ) {
+        let regs = self.dst(id).to_vec();
+        let s = MmaScratch::from_regs(&regs);
+
+        self.mov_imm(s.zero, Imm::Int(0));
+        // `lane`: this lane's own thread index, the same `v0 & 0x3FF` bits `Op::TidX` itself
+        // reads (see the module header's "Thread/block index" section) — read directly here
+        // rather than depending on an `Op::TidX` instruction existing anywhere in the program.
+        self.push(enc::vop2(
+            Vop2Op::AndB32,
+            s.lane,
+            VSrc::Imm(Imm::Int(0x3FF)),
+            0,
+        ));
+        self.push(enc::vop2(
+            Vop2Op::LshrrevB32,
+            s.parity,
+            VSrc::Imm(Imm::Int(4)),
+            s.lane,
+        ));
+        self.push(enc::vop2(
+            Vop2Op::AndB32,
+            s.n,
+            VSrc::Imm(Imm::Int(0xF)),
+            s.lane,
+        ));
+        // `cd_off = parity*(16*e) + n*e`, `e` the accumulator's own element size in bytes (`4`
+        // for `f32`, `2` for `f16` — see `lower_mma_cd`'s own doc comment): `parity*64 + n*4`
+        // when `e == 4`, `parity*32 + n*2` when `e == 2`.
+        let (parity_shift, n_shift) = if acc_dtype == Scalar::F32 {
+            (6, 2)
+        } else {
+            (5, 1)
+        };
+        self.push(enc::vop2(
+            Vop2Op::LshlrevB32,
+            s.cd_off,
+            VSrc::Imm(Imm::Int(parity_shift)),
+            s.parity,
+        ));
+        self.push(enc::vop2(
+            Vop2Op::LshlrevB32,
+            s.tmp,
+            VSrc::Imm(Imm::Int(n_shift)),
+            s.n,
+        ));
+        self.push(enc::vop2(
+            Vop2Op::AddNcU32,
+            s.cd_off,
+            VSrc::Vgpr(s.cd_off),
+            s.tmp,
+        ));
+
+        let a_contig = layout_a == MmaLayout::RowMajor;
+        let b_contig = layout_b == MmaLayout::ColMajor;
+        self.lower_mma_fragment(&s, s.frag_a, a, a_contig);
+        self.lower_mma_fragment(&s, s.frag_b, b, b_contig);
+        self.lower_mma_cd(&s, c, false, acc_dtype);
+
+        let op = match acc_dtype {
+            Scalar::F32 => Vop3pOp::WmmaF32F16,
+            Scalar::F16 => Vop3pOp::WmmaF16F16,
+            _ => unreachable!("check_mma_shape restricts acc_dtype to f16/f32"),
+        };
+        self.push(enc::vop3p_wmma(
+            op,
+            s.frag_cd[0],
+            s.frag_a[0],
+            s.frag_b[0],
+            s.frag_cd[0],
+        ));
+
+        self.lower_mma_cd(&s, d, true, acc_dtype);
     }
 
     // ---- phi / terminators ------------------------------------------------------------------
