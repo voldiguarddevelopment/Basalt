@@ -148,14 +148,16 @@ $stdout_ra"
 
   echo "  oracle and regalloc agree: $name"
 
-  # AMDGCN-via-emulator lane, stress only: the LLVM backend's AMDGCN object-emission path
-  # (`--llvm --amdgpu-bin`) is the only thing that can turn a kernel into a real RDNA3
-  # artifact right now (there is no hand-rolled basalt-amdgpu backend yet), and it has never
-  # been checked against anything but ELF structure. Actually running it needs either RDNA3
-  # silicon (none of this project's machines have one) or an instruction-level emulator —
-  # tests/diff/rdna3_sim/run_kernel.py drives tinygrad's maintained one (DEV=MOCK+AMD) against
-  # the real HSACO bytes. Both the LLVM feature and a tinygrad checkout are optional, so this
-  # lane skips (never fails the default run) when either is missing.
+  # AMDGCN-via-emulator lanes, stress only: two independent backends can turn this kernel into
+  # a real RDNA3 artifact — the LLVM backend's AMDGCN object-emission path (`--llvm
+  # --amdgpu-bin`) and the hand-rolled `basalt-amdgpu` backend (plain `--amdgpu-bin`, the "no
+  # LLVM" flagship) — and each gets its own lane below rather than one replacing the other.
+  # Actually running either needs RDNA3 silicon (none of this project's machines have one) or
+  # an instruction-level emulator — tests/diff/rdna3_sim/run_kernel.py drives tinygrad's
+  # maintained one (DEV=MOCK+AMD) against the real HSACO bytes. The LLVM lane additionally
+  # needs the `llvm` feature buildable; the hand-rolled lane needs nothing but tinygrad, since
+  # `basalt-amdgpu` is always built. Both lanes skip (never fail the default run) when their
+  # own prerequisite is missing.
   if [ "$name" = "stress" ]; then
     rdna3_harness="$root/tests/diff/rdna3_sim/run_kernel.py"
     rdna3_python="${RDNA3_SIM_PYTHON:-python3}"
@@ -199,6 +201,45 @@ $stdout_ra"
               echo "  FAIL: $name diverges between the oracle ($expected_val) and rdna3-sim ($rdna3_val)" >&2
               fail=1
             fi
+          fi
+        fi
+      fi
+    fi
+
+    # Hand-rolled AMDGCN-via-emulator lane, stress only: `basalt-amdgpu` (`--amdgpu-bin`, no
+    # `--llvm`) needs no LLVM anywhere — this is the "no LLVM" flagship's own real proof, run
+    # against the default (no-feature) `$basalt` already built above. Only a tinygrad checkout
+    # is needed (no llvm-config-18 requirement, unlike the LLVM lane above), so this lane skips
+    # (never fails the default run) only when that is missing.
+    if ! command -v "$rdna3_python" >/dev/null 2>&1; then
+      echo "  skip: rdna3-sim hand-rolled (no $rdna3_python — set RDNA3_SIM_PYTHON to an interpreter with tinygrad's mockgpu)"
+    else
+      handrolled_obj="$tmpdir/$name.handrolled.hsaco"
+      if ! "$basalt" --amdgpu-bin "$kernel_path" -o "$handrolled_obj" 2>"$tmpdir/$name.amdgpu-hr.log"; then
+        echo "  FAIL: basalt --amdgpu-bin $kernel did not exit 0:" >&2
+        sed 's/^/    /' "$tmpdir/$name.amdgpu-hr.log" >&2
+        fail=1
+      else
+        expected_val="$(grep -oE '[0-9]+\.[0-9]+' <<<"$actual" | tail -1)"
+        set +e
+        rdna3_out_hr="$("$rdna3_python" "$rdna3_harness" --hsaco "$handrolled_obj" --kernel stress \
+          --buf in:f32:-2.5,-2.0,-1.5,-1.0,-0.5,0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0 \
+          --buf out:f32:1 --scalar i32:1 --global 1,1,1 --local 1,1,1 2>"$tmpdir/$name.rdna3-hr.log")"
+        rdna3_code_hr=$?
+        set -e
+        if [ "$rdna3_code_hr" -eq 77 ]; then
+          echo "  skip: rdna3-sim hand-rolled ($(tail -1 "$tmpdir/$name.rdna3-hr.log"))"
+        elif [ "$rdna3_code_hr" -ne 0 ]; then
+          echo "  FAIL: rdna3-sim harness (hand-rolled) did not exit 0:" >&2
+          sed 's/^/    /' "$tmpdir/$name.rdna3-hr.log" >&2
+          fail=1
+        else
+          rdna3_val_hr="$(tail -1 <<<"$rdna3_out_hr")"
+          if awk -v a="$expected_val" -v b="$rdna3_val_hr" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 0.001) }'; then
+            echo "  rdna3-sim hand-rolled matches oracle: $name ($rdna3_val_hr)"
+          else
+            echo "  FAIL: $name diverges between the oracle ($expected_val) and rdna3-sim hand-rolled ($rdna3_val_hr)" >&2
+            fail=1
           fi
         fi
       fi

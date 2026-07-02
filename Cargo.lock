@@ -38,6 +38,7 @@ version = "0.0.0"
 name = "basalt-cli"
 version = "0.0.0"
 dependencies = [
+ "basalt-amdgpu",
  "basalt-backend",
  "basalt-bir",
  "basalt-clif",
