@@ -12,7 +12,6 @@ llvm = ["dep:basalt-llvm", "basalt-llvm/llvm"]
 mlir = ["dep:basalt-mlir"]
 clif = ["dep:basalt-clif"]
 ptx = []
-spirv = []
 tensix = []
 
 [dependencies]
@@ -25,6 +24,7 @@ basalt-sema = { path = "../basalt-sema" }
 basalt-x86 = { path = "../basalt-x86" }
 basalt-ptx = { path = "../basalt-ptx" }
 basalt-amdgpu = { path = "../basalt-amdgpu" }
+basalt-spirv = { path = "../basalt-spirv" }
 basalt-llvm = { path = "../basalt-llvm", optional = true }
 basalt-mlir = { path = "../basalt-mlir", optional = true }
 basalt-clif = { path = "../basalt-clif", optional = true }

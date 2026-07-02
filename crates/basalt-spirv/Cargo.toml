@@ -4,3 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+basalt-bir = { path = "../basalt-bir" }
+basalt-backend = { path = "../basalt-backend" }
+basalt-diag = { path = "../basalt-diag" }
+basalt-passes = { path = "../basalt-passes" }
+rspirv = "0.13"
+
+[dev-dependencies]
+basalt-frontend-c = { path = "../basalt-frontend-c" }
+basalt-sema = { path = "../basalt-sema" }

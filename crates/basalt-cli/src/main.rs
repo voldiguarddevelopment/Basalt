@@ -21,7 +21,8 @@
 // instead routes through `basalt-llvm`'s `TargetMachine`-based AMDGCN object emission, a
 // second, independent lane kept for cross-checking rather than replaced outright. Every other
 // combination of `--llvm` with a mode is a clean refusal, never a silent fallback to the
-// non-LLVM path.
+// non-LLVM path. `--spirv` runs the real hand-rolled `basalt-spirv` backend (`Spirv`, always
+// built, no feature gate), following `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention.
 //
 // Adding a real backend later is meant to be a small change: one new arm in `run`'s match
 // over `Mode`.
@@ -38,6 +39,7 @@ use basalt_frontend_c::PpOpts;
 #[cfg(feature = "llvm")]
 use basalt_llvm::LlvmAmdgcn;
 use basalt_ptx::Ptx;
+use basalt_spirv::Spirv;
 use basalt_x86::{X86Oracle, X86Regalloc};
 
 /// A mode-selecting flag. Exactly one must be given; a second conflicts with the first.
@@ -584,6 +586,56 @@ fn run_amdgpu_bin(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--spirv <file>`: same frontend/sema/lower/optimize pipeline as `--cpu`, handed to the real
+/// hand-rolled `basalt-spirv` backend (`Spirv`, always built, no feature gate). The emitted
+/// SPIR-V module is binary, like `--amdgpu-bin`'s HSACO, so this follows that mode's `-o`-
+/// mandatory, raw-bytes-to-file convention rather than `--nvidia-ptx`'s stdout-text one.
+fn run_spirv(
+    input: &Path,
+    output: Option<&Path>,
+    cfg: &Config,
+    table: &LangTable,
+) -> Result<ExitCode, Diag> {
+    let output = output.ok_or_else(|| Diag::new(ECode::CliMissingArgument).with_arg("-o"))?;
+
+    let module = if is_bir_input(input) {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        basalt_bir::parse(&src)
+            .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        let fe = run_frontend(&src, input, cfg);
+        let sema_diags = basalt_sema::check(&fe.tu);
+        let (module, lower_diags) = basalt_sema::lower(&fe.tu);
+
+        for p in &fe.problems {
+            eprintln!("{p}");
+        }
+        for d in sema_diags.iter().chain(lower_diags.iter()) {
+            eprintln!("{}", d.render(table));
+        }
+
+        if fe.has_problems() || !sema_diags.is_empty() || !lower_diags.is_empty() {
+            return Ok(ExitCode::FAILURE);
+        }
+        module
+    };
+    let module = basalt_passes::optimize(&module);
+
+    let backend = Spirv;
+    match backend.supports(&module) {
+        Support::Supported => {}
+        Support::Unsupported(code) => return Err(Diag::new(code).with_arg(backend.name())),
+    }
+
+    let artifact = backend.emit(&module, &EmitOpts::default())?;
+    let bytes = artifact
+        .as_bytes()
+        .expect("Spirv::emit always produces a Payload::Bytes artifact");
+    fs::write(output, bytes).map_err(|e| io_diag(output, e))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Writes `text` to `output` if given, else stdout — the common tail of every mode that
 /// produces a single text artifact.
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
@@ -597,7 +649,7 @@ fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
 }
 
 /// Dispatches on the selected mode. `--ast`/`--sema`/`--ir`/`--cpu`/`--cpu-regalloc`/
-/// `--nvidia-ptx`/`--amdgpu-bin` run the real pipeline; every other mode has no implementation
+/// `--nvidia-ptx`/`--amdgpu-bin`/`--spirv` run the real pipeline; every other mode has no implementation
 /// yet (backends land in later phases) — refuse cleanly rather than emit anything.
 fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
     let mode = cfg
@@ -625,6 +677,7 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
             run_llvm_amdgpu_bin(input()?, cfg.output.as_deref(), cfg, table)
         }
         Mode::AmdgpuBin => run_amdgpu_bin(input()?, cfg.output.as_deref(), cfg, table),
+        Mode::Spirv => run_spirv(input()?, cfg.output.as_deref(), cfg, table),
         other => Err(Diag::new(ECode::UnsupportedFeature).with_arg(other.flag())),
     }
 }
