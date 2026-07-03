@@ -1,0 +1,2 @@
+exit=0
+PASS: masked triton vector_add computed c[i]=a[i]+b[i] for i<1000 and left the poisoned c[i] untouched for 1000<=i<1024 (BLOCK=1024, not a multiple of N)

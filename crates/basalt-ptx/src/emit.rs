@@ -1419,9 +1419,25 @@ impl<'a> CodeGen<'a> {
 
     // ---- GPU index ops --------------------------------------------------------------------
 
+    /// Every `.sreg` special register PTX exposes here (`%tid.x`, `%ctaid.x`, ...) is natively
+    /// `.u32` — CUDA-C's own lowering (`basalt-sema`'s `lower.rs`) always gives these ops a
+    /// 32-bit BIR type, matching that native width, but a frontend is free to ask for a wider
+    /// result (Triton's own lowering uniformly types every index/arithmetic value `i64` — see
+    /// `triton_lower.rs`'s module header). A 64-bit destination therefore reads the special
+    /// register into a 32-bit scratch first and widens it, rather than assuming the caller's
+    /// result width always matches the hardware register's own.
     fn lower_index(&mut self, id: InstId, special: &str) {
         let dst = self.dst_reg(id);
-        self.line(&format!("mov.u32 {}, {special};", dst.text()));
+        match dst.class {
+            RegClass::B32 => self.line(&format!("mov.u32 {}, {special};", dst.text())),
+            RegClass::B64 => {
+                self.line(&format!("mov.u32 {SCRATCH0}, {special};"));
+                self.line(&format!("cvt.u64.u32 {}, {SCRATCH0};", dst.text()));
+            }
+            RegClass::Pred | RegClass::F32 | RegClass::F64 => {
+                unreachable!("a GPU index op's result is always an unsigned integer type")
+            }
+        }
     }
 
     // ---- warp-collective ops ---------------------------------------------------------------

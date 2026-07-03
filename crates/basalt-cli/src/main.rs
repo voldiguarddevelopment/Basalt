@@ -23,6 +23,17 @@
 // combination of `--llvm` with a mode is a clean refusal, never a silent fallback to the
 // non-LLVM path. `--spirv` runs the real hand-rolled `basalt-spirv` backend (`Spirv`, always
 // built, no feature gate), following `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention.
+// `--triton` is a modifier following `--llvm`'s own pattern, but on the *frontend* side rather
+// than the backend side: paired with `--cpu`, `--cpu-regalloc`, or `--nvidia-ptx` it redirects
+// the input from the CUDA-C `run_frontend`/`basalt_sema::check`/`basalt_sema::lower` pipeline
+// to the real Triton one (`basalt_frontend_triton::parse` -> `basalt_sema::check_triton` ->
+// `basalt_sema::lower_triton`, see `run_triton_frontend`) and leaves backend selection
+// completely untouched — the resulting `basalt_bir::Module` flows into whichever backend was
+// selected, same as any other module (this is exactly why `--cpu-regalloc` is included
+// alongside the exit criterion's own two named modes: the diff harness needs a real
+// oracle-vs-regalloc cross-check for a Triton kernel too, the same way every CUDA-C kernel
+// already gets one). Paired with any other mode it is a clean refusal, matching `--llvm`'s own
+// refusal discipline exactly.
 //
 // Adding a real backend later is meant to be a small change: one new arm in `run`'s match
 // over `Mode`.
@@ -97,7 +108,11 @@ impl Mode {
 /// Parsed CLI state. `-I`/`-D` feed `run_frontend`'s `PpOpts`; `tdf`/`snap` are collected but
 /// still unused until the corresponding tooling lands. `llvm` is the `--llvm` modifier: paired
 /// with `Mode::AmdgpuBin` it selects the LLVM-backed AMDGCN object-emission path (see `run`);
-/// paired with anything else, `run` refuses cleanly rather than silently ignoring it.
+/// paired with anything else, `run` refuses cleanly rather than silently ignoring it. `triton`
+/// is the `--triton` modifier: paired with `Mode::Cpu`, `Mode::CpuRegalloc`, or
+/// `Mode::NvidiaPtx` it selects the real Triton frontend/sema pipeline instead of the CUDA-C
+/// one (see `run_triton_frontend`); paired with anything else, `run` refuses the same way
+/// `llvm` does.
 #[derive(Debug, Default)]
 struct Config {
     mode: Option<Mode>,
@@ -108,6 +123,7 @@ struct Config {
     tdf: bool,
     snap: bool,
     llvm: bool,
+    triton: bool,
 }
 
 /// Consumes the argument that follows a value-taking flag, erroring with `E101` if there
@@ -149,6 +165,7 @@ fn parse_args(args: &[String], table: &mut LangTable) -> Result<Config, Diag> {
                 "--tdf" => cfg.tdf = true,
                 "--snap" => cfg.snap = true,
                 "--llvm" => cfg.llvm = true,
+                "--triton" => cfg.triton = true,
                 _ if arg.starts_with('-') => {
                     return Err(Diag::new(ECode::CliUnknownFlag).with_arg(arg));
                 }
@@ -225,6 +242,33 @@ fn run_frontend(src: &str, input: &Path, cfg: &Config) -> Frontend {
     let (tu, parse_errors) = basalt_frontend_c::parse(&tokens);
     problems.extend(parse_errors.iter().map(|e| e.to_string()));
     Frontend { tu, problems }
+}
+
+/// Runs the real Triton pipeline (`basalt_frontend_triton::parse` -> `basalt_sema::check_triton`
+/// -> `basalt_sema::lower_triton`) over `src`, the `--triton` counterpart to `run_frontend` +
+/// `basalt_sema::check` + `basalt_sema::lower` combined. Every diagnostic from any of the three
+/// stages is rendered against `table` and printed, exactly like the CUDA-C path's own
+/// frontend/sema/lower diagnostics; returns the lowered module only if all three stages came
+/// back clean, so a caller can treat `None` as "already reported, just fail" the same way the
+/// CUDA-C path's own inline check does.
+fn run_triton_frontend(src: &str, table: &LangTable) -> Option<basalt_bir::Module> {
+    let (module, parse_diags) = basalt_frontend_triton::parse(src);
+    let (shapes, check_diags) = basalt_sema::check_triton(&module);
+    let (bir, lower_diags) = basalt_sema::lower_triton(&module, &shapes);
+
+    for d in parse_diags
+        .iter()
+        .chain(check_diags.iter())
+        .chain(lower_diags.iter())
+    {
+        eprintln!("{}", d.render(table));
+    }
+
+    if parse_diags.is_empty() && check_diags.is_empty() && lower_diags.is_empty() {
+        Some(bir)
+    } else {
+        None
+    }
 }
 
 /// Diagnoses a `.bir` file handed to a mode that expects C/CUDA source.
@@ -351,6 +395,12 @@ fn run_cpu(
         let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
         basalt_bir::parse(&src)
             .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else if cfg.triton {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        match run_triton_frontend(&src, table) {
+            Some(module) => module,
+            None => return Ok(ExitCode::FAILURE),
+        }
     } else {
         let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
         let fe = run_frontend(&src, input, cfg);
@@ -401,6 +451,12 @@ fn run_cpu_regalloc(
         let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
         basalt_bir::parse(&src)
             .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else if cfg.triton {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        match run_triton_frontend(&src, table) {
+            Some(module) => module,
+            None => return Ok(ExitCode::FAILURE),
+        }
     } else {
         let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
         let fe = run_frontend(&src, input, cfg);
@@ -450,6 +506,12 @@ fn run_nvidia_ptx(
         let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
         basalt_bir::parse(&src)
             .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else if cfg.triton {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        match run_triton_frontend(&src, table) {
+            Some(module) => module,
+            None => return Ok(ExitCode::FAILURE),
+        }
     } else {
         let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
         let fe = run_frontend(&src, input, cfg);
@@ -650,7 +712,9 @@ fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
 
 /// Dispatches on the selected mode. `--ast`/`--sema`/`--ir`/`--cpu`/`--cpu-regalloc`/
 /// `--nvidia-ptx`/`--amdgpu-bin`/`--spirv` run the real pipeline; every other mode has no implementation
-/// yet (backends land in later phases) — refuse cleanly rather than emit anything.
+/// yet (backends land in later phases) — refuse cleanly rather than emit anything. `--triton`
+/// (only meaningful with `--cpu`/`--nvidia-ptx`) is handled above this match, before the mode
+/// dispatch even begins.
 fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
     let mode = cfg
         .mode
@@ -664,6 +728,12 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
     // refuse outright rather than silently falling through to that mode's non-LLVM behavior.
     if cfg.llvm && mode != Mode::AmdgpuBin {
         return Err(Diag::new(ECode::UnsupportedFeature).with_arg("--llvm"));
+    }
+    // `--triton` only has a wired path for `Mode::Cpu`/`Mode::CpuRegalloc`/`Mode::NvidiaPtx`;
+    // paired with any other mode it must refuse outright, matching `--llvm`'s own refusal
+    // discipline above.
+    if cfg.triton && mode != Mode::Cpu && mode != Mode::CpuRegalloc && mode != Mode::NvidiaPtx {
+        return Err(Diag::new(ECode::UnsupportedFeature).with_arg("--triton"));
     }
     match mode {
         Mode::Ir => run_ir(input()?, cfg.output.as_deref(), cfg, table),

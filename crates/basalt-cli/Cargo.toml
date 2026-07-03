@@ -19,6 +19,7 @@ basalt-bir = { path = "../basalt-bir" }
 basalt-diag = { path = "../basalt-diag" }
 basalt-backend = { path = "../basalt-backend" }
 basalt-frontend-c = { path = "../basalt-frontend-c" }
+basalt-frontend-triton = { path = "../basalt-frontend-triton" }
 basalt-passes = { path = "../basalt-passes" }
 basalt-sema = { path = "../basalt-sema" }
 basalt-x86 = { path = "../basalt-x86" }

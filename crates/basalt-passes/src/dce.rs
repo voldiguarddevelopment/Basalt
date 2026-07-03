@@ -20,12 +20,15 @@
 //
 // Since both sweeps remove entries from the block/instruction arenas, `BlockId`/`InstId`
 // must be renumbered; this walks the old function's reachable blocks in their original
-// order and, within each, its live instructions in their original order, appending each to a
-// fresh arena while recording an old-to-new id map — the same append-only-in-program-order
-// rebuild `ssa.rs`'s `Ctx::build` uses for the same reason. A `phi`'s own incoming-edge list
-// gets its block ids remapped the same way; an incoming pair whose predecessor block was
-// unreachable is dropped from the pair list rather than remapped, since that edge can never
-// actually be taken.
+// order and, within each, its live instructions in their original order, assigning each a
+// fresh id in a first pass, then remapping every operand/terminator in a second pass once
+// every surviving id in the function is known — the same two-pass technique `ssa.rs`'s own
+// `Ctx::build` uses for the same reason (see that module's header): a loop header's live
+// `phi` can reference a value produced later in program order, in the loop's own latch
+// block, which a single combined assign-and-remap pass cannot resolve. A `phi`'s own
+// incoming-edge list gets its block ids remapped the same way; an incoming pair whose
+// predecessor block was unreachable is dropped from the pair list rather than remapped,
+// since that edge can never actually be taken.
 //
 // `basalt-sema`'s lowering pass documents (see its `lower.rs` header, "trailing dead block")
 // that it always opens a fresh block after a terminator whether or not anything branches to
@@ -343,28 +346,49 @@ fn eliminate_dead_code_fn(f: &Function) -> Function {
         }
     }
 
+    // Two passes, mirroring `ssa.rs`'s own `Ctx::build` (see that module's header): a loop
+    // header's live phi can reference a value produced later in program order (the loop's
+    // latch block), so operands cannot be remapped in the same pass that assigns final ids —
+    // pass 1 assigns every surviving instruction its final id, in the exact order it will be
+    // printed (blocks in order, each block's own live instructions in order); pass 2 then
+    // remaps every operand/terminator now that every id in the function is already known.
     let mut inst_map: BTreeMap<u32, InstId> = BTreeMap::new();
-    let mut new_insts: Vec<Inst> = Vec::new();
+    let mut kept_per_block: Vec<Vec<u32>> = Vec::with_capacity(block_map.len());
+    for (bidx, block) in f.blocks.iter().enumerate() {
+        if !reachable.contains(&(bidx as u32)) {
+            continue;
+        }
+        let mut kept = Vec::new();
+        for &old_id in &block.insts {
+            if live[old_id.0 as usize] {
+                let new_id = InstId(inst_map.len() as u32);
+                inst_map.insert(old_id.0, new_id);
+                kept.push(old_id.0);
+            }
+        }
+        kept_per_block.push(kept);
+    }
+
+    let mut new_insts: Vec<Inst> = Vec::with_capacity(inst_map.len());
     let mut new_blocks: Vec<Block> = Vec::with_capacity(block_map.len());
+    let mut kept_per_block = kept_per_block.into_iter();
 
     for (bidx, block) in f.blocks.iter().enumerate() {
         if !reachable.contains(&(bidx as u32)) {
             continue;
         }
-        let mut kept_ids = Vec::new();
-        for &old_id in &block.insts {
-            if !live[old_id.0 as usize] {
-                continue;
-            }
-            let old_inst = &f.insts[old_id.0 as usize];
+        let kept = kept_per_block
+            .next()
+            .expect("one kept-instruction list per reachable block, in the same order as pass 1");
+        let mut kept_ids = Vec::with_capacity(kept.len());
+        for old_id in kept {
+            let old_inst = &f.insts[old_id as usize];
             let new_op = remap_op(&old_inst.op, &inst_map, &block_map, &reachable);
-            let new_id = InstId(new_insts.len() as u32);
             new_insts.push(Inst {
                 ty: old_inst.ty,
                 op: new_op,
             });
-            inst_map.insert(old_id.0, new_id);
-            kept_ids.push(new_id);
+            kept_ids.push(inst_map[&old_id]);
         }
         let new_term = remap_term(&block.term, &inst_map, &block_map);
         new_blocks.push(Block {

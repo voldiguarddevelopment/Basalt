@@ -1,0 +1,2 @@
+exit=0
+PASS: triton matmul_kernel computed D = A@B + C correctly (4x3x5, single program, real tl.dot triple loop)

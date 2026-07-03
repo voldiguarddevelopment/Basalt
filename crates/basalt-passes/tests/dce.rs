@@ -4,8 +4,8 @@
 // live/dead or reachable/unreachable shape.
 
 use basalt_bir::{
-    AddrSpace, AtomicOp, BinOp, Block, BlockId, Function, Inst, InstId, MmaLayout, Module, Op,
-    Scalar, Term, Ty, ValRef,
+    AddrSpace, AtomicOp, BinOp, Block, BlockId, Function, ICmpPred, Inst, InstId, MmaLayout,
+    Module, Op, Scalar, Term, Ty, ValRef,
 };
 use basalt_passes::eliminate_dead_code;
 
@@ -315,6 +315,82 @@ fn phi_drops_only_the_unreachable_predecessor_pair() {
         BlockId(0),
         "bb0 keeps its id (it's the entry block)"
     );
+    assert_roundtrip(&out);
+}
+
+#[test]
+fn loop_header_phi_referencing_its_own_latch_survives_dce() {
+    // bb0 (entry) -> bb1 (header, a live phi merging bb0's initial value and bb2's own
+    // incremented one) -> bb2 (body/latch, back-edges to bb1) or bb3 (exit, returns the phi).
+    // The phi's back-edge operand is defined in bb2, whose block index (2) is *higher* than
+    // the header's own (1) — a real forward reference in block-array order, exactly the shape
+    // any loop produces once `construct_ssa` promotes its counter to a real phi. This must not
+    // panic (a prior version of this pass assumed every operand was already assigned a new id
+    // by the time its user was remapped, which only holds for straight-line code) and the
+    // back-edge must still resolve to the right value once renumbered.
+    let mut b = FnB::new();
+    let zero = b.push(I32, Op::ConstInt(0));
+    b.end_block(Term::Br(BlockId(1))); // bb0
+
+    // The back-edge operand isn't known until `next` (bb2) is built, so the phi is pushed with
+    // a placeholder incoming pair for bb2 and patched below once `next`'s real id exists —
+    // mirroring how a real SSA-construction pass wires up a loop header incrementally.
+    let ValRef::Val(phi_id) = b.push(I32, Op::Phi(vec![(BlockId(0), zero), (BlockId(2), zero)]))
+    else {
+        unreachable!()
+    };
+    let phi = ValRef::Val(phi_id);
+    let one = b.push(I32, Op::ConstInt(1));
+    let cond = b.push(
+        Ty::Scalar(Scalar::I1),
+        Op::ICmp(ICmpPred::Slt, I32, phi, one),
+    );
+    b.end_block(Term::CondBr(cond, BlockId(2), BlockId(3))); // bb1
+
+    let next = b.push(I32, Op::Bin(BinOp::Add, phi, one));
+    b.end_block(Term::Br(BlockId(1))); // bb2, the latch — back-edges to the header
+
+    b.end_block(Term::Ret(Some(phi))); // bb3, exit
+
+    let mut f = b.finish("f", vec![], I32);
+    let Op::Phi(incoming) = &mut f.insts[phi_id.0 as usize].op else {
+        unreachable!()
+    };
+    incoming[1] = (BlockId(2), next);
+
+    let m = module_of(vec![f]);
+
+    let out = eliminate_dead_code(&m);
+    let after = &out.funcs[0];
+    assert_eq!(
+        after.blocks.len(),
+        4,
+        "every block here is reachable and live: {}",
+        basalt_bir::print(&out)
+    );
+
+    let phi_inst = after
+        .insts
+        .iter()
+        .find(|i| matches!(i.op, Op::Phi(_)))
+        .unwrap_or_else(|| panic!("phi must survive: {}", basalt_bir::print(&out)));
+    let Op::Phi(incoming) = &phi_inst.op else {
+        unreachable!()
+    };
+    assert_eq!(
+        incoming.len(),
+        2,
+        "both edges are reachable, neither is dropped"
+    );
+    let back_edge = incoming
+        .iter()
+        .find(|(bb, _)| bb.0 == 2)
+        .expect("the bb2 (latch) edge must survive");
+    assert!(
+        matches!(back_edge.1, ValRef::Val(_)),
+        "the back-edge operand must resolve to a real (renumbered) instruction, not dangle"
+    );
+
     assert_roundtrip(&out);
 }
 

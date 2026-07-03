@@ -308,6 +308,40 @@ fn all_twelve_gpu_index_ops_read_special_registers() {
 }
 
 #[test]
+fn i64_typed_index_op_widens_via_a_32_bit_scratch() {
+    // Every `.sreg` special register PTX exposes is natively `.u32`; CUDA-C's own lowering
+    // always types these ops `i32` (see `basalt-sema`'s `lower.rs`), but nothing in BIR itself
+    // requires that — a frontend is free to type an index op `i64` (Triton's own lowering does
+    // exactly this uniformly, see `triton_lower.rs`'s module header). `ptxas` genuinely rejects
+    // `mov.u32` into a `.b64` register (`Arguments mismatch for instruction 'mov'`), so this
+    // must widen through a 32-bit scratch instead of assuming the destination always matches
+    // the special register's own width.
+    let i64t = Ty::Scalar(Scalar::I64);
+    let f = simple_fn(
+        "wide_index",
+        vec![],
+        vec![Inst {
+            ty: i64t,
+            op: Op::BidX,
+        }],
+        Term::Ret(None),
+    );
+    let text = emit_text(&wrap(f));
+    assert!(
+        text.contains("mov.u32 %rs0, %ctaid.x;"),
+        "expected a 32-bit read of the special register into a scratch: {text}"
+    );
+    assert!(
+        text.contains("cvt.u64.u32 %rd0, %rs0;"),
+        "expected the scratch to widen into the real (b64) destination: {text}"
+    );
+    assert!(
+        !text.contains("mov.u32 %rd0, %ctaid.x;"),
+        "must never mix a b32 mov into a b64 destination register: {text}"
+    );
+}
+
+#[test]
 fn barrier_emits_real_sync() {
     let f = simple_fn(
         "barrier",

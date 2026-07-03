@@ -22,6 +22,13 @@
 # golden is compared against it and this script fails loudly on any mismatch. The
 # regalloc-vs-oracle comparison is separate from the golden and runs every time, golden or
 # not.
+#
+# TRITON_KERNELS below is a second, separate array/loop rather than more "kernel.cu:driver.c"
+# lines in KERNELS: a Triton kernel is parsed via a different frontend entirely
+# (`basalt_frontend_triton::parse`, selected by the `--triton` modifier — see `basalt-cli`'s
+# own module header), so every `$basalt` invocation in this second loop carries that extra
+# flag alongside `--cpu`/`--cpu-regalloc`; the golden/cross-backend comparison logic itself is
+# unchanged from the main loop above.
 
 set -euo pipefail
 
@@ -245,6 +252,110 @@ $stdout_ra"
       fi
     fi
   fi
+done
+
+# "kernel.py:driver.c" — same pairing convention as KERNELS above, driver.c relative to the
+# repo root. Routed through `--triton --cpu`/`--triton --cpu-regalloc` instead of the plain
+# `--cpu`/`--cpu-regalloc` the main loop uses (see this file's header).
+TRITON_KERNELS=(
+  "tri_vadd.py:examples/cpu_launch_triton_vadd.c"
+  "tri_matmul.py:examples/cpu_launch_triton_matmul.c"
+)
+
+for pair in "${TRITON_KERNELS[@]}"; do
+  kernel="${pair%%:*}"
+  driver="${pair#*:}"
+  name="${kernel%.py}"
+
+  kernel_path="$kernel_dir/$kernel"
+  driver_path="$root/$driver"
+  obj="$tmpdir/$name.o"
+  shim_o="$tmpdir/$name-shim.o"
+  exe="$tmpdir/$name-exe"
+
+  echo "run_diff: $name (triton)"
+
+  if ! "$basalt" --triton --cpu "$kernel_path" -o "$obj" 2>"$tmpdir/$name.stderr"; then
+    echo "  FAIL: basalt --triton --cpu $kernel did not exit 0:" >&2
+    sed 's/^/    /' "$tmpdir/$name.stderr" >&2
+    fail=1
+    continue
+  fi
+
+  if ! cc -c "$driver_path" -o "$shim_o" 2>"$tmpdir/$name.cc1.log"; then
+    echo "  FAIL: compiling $driver failed:" >&2
+    sed 's/^/    /' "$tmpdir/$name.cc1.log" >&2
+    fail=1
+    continue
+  fi
+
+  if ! cc "$shim_o" "$obj" -o "$exe" 2>"$tmpdir/$name.cc2.log"; then
+    echo "  FAIL: linking $name failed:" >&2
+    sed 's/^/    /' "$tmpdir/$name.cc2.log" >&2
+    fail=1
+    continue
+  fi
+
+  set +e
+  stdout="$("$exe")"
+  code=$?
+  set -e
+  actual="exit=$code
+$stdout"
+
+  golden="$golden_dir/$name.txt"
+  if [ ! -f "$golden" ]; then
+    printf '%s\n' "$actual" >"$golden"
+    echo "  stored golden: $golden"
+  else
+    expected="$(cat "$golden")"
+    if [ "$expected" != "$actual" ]; then
+      echo "  FAIL: $name does not match its golden" >&2
+      diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+      fail=1
+      continue
+    fi
+    echo "  matched golden: $golden"
+  fi
+
+  # Cross-backend diff: the regalloc backend must reproduce the oracle's own live output for
+  # this exact run, not just the golden — same real cross-backend correctness check the main
+  # loop runs, over BIR the Triton frontend produced instead of the CUDA-C one.
+  obj_ra="$tmpdir/$name-ra.o"
+  exe_ra="$tmpdir/$name-ra-exe"
+
+  if ! "$basalt" --triton --cpu-regalloc "$kernel_path" -o "$obj_ra" 2>"$tmpdir/$name.ra.stderr"; then
+    echo "  FAIL: basalt --triton --cpu-regalloc $kernel did not exit 0:" >&2
+    sed 's/^/    /' "$tmpdir/$name.ra.stderr" >&2
+    fail=1
+    continue
+  fi
+
+  if ! cc "$shim_o" "$obj_ra" -o "$exe_ra" 2>"$tmpdir/$name.cc3.log"; then
+    echo "  FAIL: linking $name (regalloc) failed:" >&2
+    sed 's/^/    /' "$tmpdir/$name.cc3.log" >&2
+    fail=1
+    continue
+  fi
+
+  set +e
+  stdout_ra="$("$exe_ra")"
+  code_ra=$?
+  set -e
+  actual_ra="exit=$code_ra
+$stdout_ra"
+
+  if [ "$actual" != "$actual_ra" ]; then
+    echo "  FAIL: $name diverges between the oracle and regalloc backends" >&2
+    echo "    oracle (live):" >&2
+    sed 's/^/      /' <<<"$actual" >&2
+    echo "    regalloc (live):" >&2
+    sed 's/^/      /' <<<"$actual_ra" >&2
+    fail=1
+    continue
+  fi
+
+  echo "  oracle and regalloc agree: $name"
 done
 
 if [ "$fail" -ne 0 ]; then
