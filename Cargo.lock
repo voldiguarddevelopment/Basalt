@@ -186,6 +186,7 @@ dependencies = [
  "basalt-bir",
  "basalt-diag",
  "basalt-frontend-c",
+ "basalt-frontend-triton",
 ]
 
 [[package]]

@@ -62,6 +62,19 @@ pub enum ECode {
     /// best-effort placeholder so the rest of the function can be inspected, but the result
     /// must not be handed to a backend while this code was reported.
     LoweringUnsupported,
+    /// Triton tile-shape inference found two tile shapes that cannot be reconciled: either a
+    /// rank mismatch (broadcasting never pads rank the way NumPy does — both operands of an
+    /// elementwise op must already share a rank, barring a rank-0 scalar), or a same-rank axis
+    /// whose sizes are neither equal nor size-1 on one side.
+    TileShapeMismatch,
+    /// A Triton tile dimension (an `tl.arange` bound, a `tl.zeros` shape entry, ...) is not an
+    /// expression this pass can resolve to a compile-time-constant size, concrete or
+    /// symbolic (traceable back to a `constexpr` name).
+    TileDimUnresolved,
+    /// A Triton construct this pass deliberately does not model (partial/strided tile
+    /// slicing, a reshape producing rank > 2, the `@` matmul operator standing in for
+    /// `tl.dot`, ...). Refused outright rather than guessed at.
+    TileConstructUnsupported,
 
     /// BIR textual parser rejected the input.
     BirParseError,
@@ -101,6 +114,9 @@ impl ECode {
         ECode::Redefinition,
         ECode::InvalidCudaQualifier,
         ECode::LoweringUnsupported,
+        ECode::TileShapeMismatch,
+        ECode::TileDimUnresolved,
+        ECode::TileConstructUnsupported,
         ECode::BirParseError,
         ECode::BirRoundTripMismatch,
         ECode::IoError,
@@ -130,6 +146,9 @@ impl ECode {
             ECode::Redefinition => "E302",
             ECode::InvalidCudaQualifier => "E303",
             ECode::LoweringUnsupported => "E304",
+            ECode::TileShapeMismatch => "E305",
+            ECode::TileDimUnresolved => "E306",
+            ECode::TileConstructUnsupported => "E307",
             ECode::BirParseError => "E400",
             ECode::BirRoundTripMismatch => "E401",
             ECode::IoError => "E500",

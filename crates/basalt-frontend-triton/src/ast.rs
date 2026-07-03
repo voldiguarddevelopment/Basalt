@@ -330,7 +330,11 @@ impl Stmt {
 /// True when `annotation` is Triton's `constexpr` marker: a bare `constexpr` name (the
 /// `from triton.language import constexpr` import style) or an attribute path ending in
 /// `.constexpr` (the usual `tl.constexpr`, or a longer path like `triton.language.constexpr`).
-pub(crate) fn is_constexpr_annotation(annotation: &Expr) -> bool {
+///
+/// `pub`: `basalt-sema`'s tile-shape inference (P10-T2) reuses this exact predicate for
+/// `AnnAssign`-bound locals rather than re-deriving it, so the two crates agree on what counts
+/// as a `constexpr` marker.
+pub fn is_constexpr_annotation(annotation: &Expr) -> bool {
     match annotation {
         Expr::Name { name, .. } => name == "constexpr",
         Expr::Attribute { attr, .. } => attr == "constexpr",

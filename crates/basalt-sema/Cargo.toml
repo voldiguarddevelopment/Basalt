@@ -7,3 +7,4 @@ edition.workspace = true
 basalt-bir = { path = "../basalt-bir" }
 basalt-diag = { path = "../basalt-diag" }
 basalt-frontend-c = { path = "../basalt-frontend-c" }
+basalt-frontend-triton = { path = "../basalt-frontend-triton" }
