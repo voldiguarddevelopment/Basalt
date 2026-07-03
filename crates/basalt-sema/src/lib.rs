@@ -18,17 +18,25 @@
 // entirely. See `triton_ty.rs` for the tile-shape type and `triton_check.rs` for the pass
 // itself. This is a sema barrier: it hands P10-T3 a shape-annotated representation to lower
 // `tl.dot`/masked `tl.load`/`tl.store` from, but does no BIR lowering of its own.
+//
+// `lower_triton(&basalt_frontend_triton::ast::Module, &[KernelShapes]) -> (basalt_bir::Module,
+// Vec<Diag>)` (P10-T3) is that BIR lowering: see `triton_lower.rs`'s module header for the
+// lowering strategy (every tile materializes into a scratch memory slot, filled by a real
+// runtime loop; `tl.dot` lowers to a scalar triple loop, never `Op::Mma` — that header
+// documents exactly why).
 
 mod checker;
 mod lower;
 mod scope;
 mod triton_check;
+mod triton_lower;
 mod triton_ty;
 mod ty;
 
 pub use checker::check;
 pub use lower::lower;
 pub use triton_check::{check_triton, KernelShapes};
+pub use triton_lower::lower_triton;
 pub use triton_ty::{Dim, Elem, TileTy};
 
 #[cfg(test)]

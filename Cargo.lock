@@ -214,6 +214,7 @@ dependencies = [
  "basalt-bir",
  "basalt-diag",
  "basalt-frontend-c",
+ "basalt-frontend-triton",
  "basalt-passes",
  "basalt-sema",
  "object",
