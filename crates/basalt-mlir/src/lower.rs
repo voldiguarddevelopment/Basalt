@@ -76,15 +76,31 @@
 //   (there is none in `memref` short of `memref.reinterpret_cast`-ing to a byte-typed
 //   1-D memref and computing the same flat address arithmetic SPIR-V's `Kernel` path
 //   already does, which would defeat the entire point of choosing `memref` over a "hand
-//   the raw pointer to `llvm.ptr`" dialect), this lane recognizes the *one* addressing shape
-//   `basalt-sema`'s indexed-access lowering ever emits (confirmed by reading
-//   `basalt-sema/src/lower.rs` and by dumping this project's own real post-optimize BIR for
-//   `vector_add.cu` — see `lower::tests`) and reconstructs the original **element** index
-//   from it, the same "recognize the one shape sema always produces, refuse everything
-//   else" discipline `basalt-spirv`'s `glcompute.rs` (`recognize_access`) already
-//   established for the structurally identical problem (`Logical` addressing there,
-//   `memref` here) — a fresh implementation here, not shared code, per backend isolation.
-//   See `recognize_access` below for the exact shape and what is refused.
+//   the raw pointer to `llvm.ptr`" dialect), this lane recognizes the addressing shapes
+//   `basalt-sema`'s indexed-access lowering emits (confirmed by reading
+//   `basalt-sema/src/lower.rs`/`basalt-sema/src/triton_lower.rs` and by dumping this
+//   project's own real post-`basalt_passes::optimize` BIR for both `vector_add.cu` and
+//   `tests/kernels/tri_vadd.py` — see `lower::tests`) and reconstructs the original
+//   **element** index from it, the same "recognize the shapes sema actually produces,
+//   refuse everything else" discipline `basalt-spirv`'s `glcompute.rs` (`recognize_access`)
+//   already established for the structurally identical problem (`Logical` addressing
+//   there, `memref` here) — a fresh implementation here, not shared code, per backend
+//   isolation. See `recognize_access` below for the exact shapes and what is refused.
+//
+//   A parameter's own `memref` element type is derived empirically, once, from every
+//   recognized access that reads or writes through it (`analyze_memory_accesses`), and
+//   this lowering insists every such access agree — a real, load-bearing limit found
+//   while proving out the Triton path, not a hypothetical: `basalt-sema::triton_lower`
+//   materializes every tile a Triton kernel builds (`offsets`, `mask`, `a`, `b`, ...) as a
+//   fixed byte range carved out of the kernel's own *last pointer parameter* (see that
+//   module's own `Storage::Scratch` doc), which for `tri_vadd.py` is `c_ptr` — the same
+//   parameter the kernel's real output also writes through, at a genuinely different
+//   element type per tile (`i64` for `offsets`, `i1` for `mask`, `f32` for the real
+//   output and the `a`/`b` tiles). `memref` has no representation for one buffer visited
+//   at more than one element type without exactly the byte-addressed reinterpretation
+//   this lane already declined above, so this is refused (`E092`, the same
+//   "pointer parameter accessed at two different element types" check this file already
+//   had) rather than solved — see "Known gap" below.
 // - **`linalg`**: **not attempted.** `Op::Mma` is the natural `linalg.matmul` target (as
 //   this task's own brief names), but `vector_add.cu` never emits one, and getting a real,
 //   `mlir-opt`-verified `linalg.matmul` lowering right (operand layouts, accumulator
@@ -99,40 +115,106 @@
 //   target-specific intrinsic at the dialect-emission stage, so this lane never references
 //   either dialect.
 //
+// # Local/shared/constant/param storage: `memref.alloca`, not a refusal (P11-T3)
+//
+// `basalt-sema`'s lowering (both `lower.rs` for CUDA-C and `triton_lower.rs` for Triton) has
+// no `alloca`: every local/parameter/shared/constant storage location is handed a small
+// integer slot id and materialized, wherever BIR needs its address, as
+// `const.i ptr.<space> (slot_id * SLOT_STRIDE)` — an opaque per-`(space, id)` key, not a real
+// address (`basalt-x86`'s oracle and `basalt-llvm`'s own `build_local_slots` both document
+// and handle the identical pattern). `build_local_slots` below builds one real, flat
+// `memref.alloca` per distinct key actually used in a function, in that function's entry
+// block ahead of its own instructions, so `Op::ConstInt`'s local-like-`Ty::Ptr` case has
+// genuine backing storage to hand back instead of treating the opaque key as a literal
+// index. Unlike `basalt-llvm`'s LLVM-side version (which allocates every slot uniformly as
+// an 8-byte `i64`, since an opaque `alloca` can be loaded/stored at any bit-compatible type),
+// `memref` is strongly typed — a `memref<i64>` cannot be `memref.load`ed as `f32` — so each
+// slot's element type is derived empirically (`analyze_local_slots`): every `Load`/`Store`
+// touching a given key must agree on one scalar type, mirroring `analyze_memory_accesses`'s
+// identical derivation for a `Global` parameter's own element type. A slot found to hold a
+// pointer value (`basalt-sema` can spill a previously-computed pointer through this same
+// idiom) or used at more than one type is refused (`E092`) rather than guessed at — not
+// exercised by either of this task's proof kernels (both promote every local/shared/
+// constant/param slot to real SSA via `basalt_passes::construct_ssa` before this lowering
+// ever sees them, so this pre-pass is inert for them in practice — see "Known gap" below for
+// what its own real gate turned out to be — but the mechanism is real, tested on its own
+// hand-built fixtures, and kept for parity with `basalt-llvm` and for whatever future kernel
+// `construct_ssa`'s own safety checks decline to promote).
+//
+// # `Op::Phi`: a block argument, not a refusal (P11-T3)
+//
+// MLIR has no implicit-phi block instruction; `cf`'s own answer is a block argument on the
+// merge block plus a matching operand on every predecessor's branch — real, existing
+// mechanism, no new dialect needed. `basalt_passes::construct_ssa`'s own documented output
+// order (a block's phis, if any, always come first, before its ordinary body — see that
+// pass's header) is what makes this tractable without a topological fixup: `lower_function`
+// gives every block one MLIR block argument per leading `Op::Phi` (in addition to the
+// function's own parameters, for block 0), binds each phi's BIR value to that argument
+// before lowering a single instruction, skips the phi instructions themselves during the
+// main lowering walk (their value is already bound), and threads the right operand list
+// through every `cf.br`/`cf.cond_br` by looking up, for the branch's own source block, which
+// incoming value each target phi records for it (`branch_args`). A pointer- or vector-typed
+// phi is refused (`E091`/`E092`) rather than guessed at — neither proof kernel's BIR ever
+// produces one (every phi in both is `i64` or `f32`), so there is no real shape to confirm
+// this lowering's block-argument mapping against yet.
+//
 // # Scope
 //
 // Implemented: kernel/module structure, `TidX/Y/Z`/`BidX/Y/Z`/`BdimX/Y/Z`/`GdimX/Y/Z`,
 // `Barrier`, every `BinOp`, `ICmp`/`FCmp` (both predicate sets map onto `arith`'s own
 // `Cmpi`/`CmpfPredicate` name-for-name), `Select`, every `CastOp`, `ConstInt`/`ConstFloat`
-// (scalar only), `Load`/`Store` through the one recognized `memref` addressing shape, and
-// `Br`/`CondBr`/`Ret(None)`.
+// (scalar, plus a local-like-`Ty::Ptr` slot constant — see above), `Load`/`Store` through a
+// recognized `memref` addressing shape (either a `Global` parameter access or a local-like
+// slot), scalar-typed `Op::Phi`, and `Br`/`CondBr`/`Ret(None)`.
 //
 // Refused with a stable E-code rather than guessed at: `Ty::Vec` (`E091`, the `vector`
 // dialect's real target once a tile-shaped kernel bootstraps this lane further); a pointer
-// value reaching `Load`/`Store` through any shape other than the one `recognize_access`
+// value reaching `Load`/`Store` through any shape other than the ones `recognize_access`
 // walks, including a bare pointer parameter used with no offset arithmetic at all (`E092`);
 // a kernel parameter in a non-`Global` address space, or a `Global` pointer parameter never
-// read or written through the recognized shape (`E092`, no element type to derive `memref`'s
-// type from); a local/shared/constant `ConstInt ptr.<space>` slot key, `basalt-sema`'s
-// opaque-address-synthesis idiom that `basalt-llvm` backs with a real `alloca` — this lane
-// has no such storage-synthesis pass yet, so it refuses rather than misreading the opaque
-// key as a real index (`E092`); `Op::Phi` (`E090` — MLIR has no implicit-phi block
-// instruction the way BIR does; a phi becomes a block argument plus a matching operand on
-// every predecessor's branch, which needs a real pre-pass this lane does not yet have, see
-// `basalt-llvm`'s own two-and-a-half-pass note for the mirror-image problem it solves for
-// LLVM IR, which *does* have implicit phis); `Op::Switch` (`E090`, real and cheap to add via
-// `melior::dialect::cf::switch` but not exercised by this task's one bring-up kernel, so
-// deliberately left for whenever a kernel actually needs it); `Op::Shuffle`/`Ballot`/
-// `VoteAny`/`VoteAll`/`Atomic`/`AtomicCas` (`E093` — every one of these has a real mapping
-// only once a target-specific dialect, `nvgpu`/`amdgpu`, is in the picture, exactly like
-// `basalt-llvm`'s own per-dialect gaps for the harder warp-level ops; deferred to P11-T2,
-// not guessed at here); `Op::Mma` (`E090`, see "linalg" above); a non-`Void`-returning
-// top-level function (`E090` — every BIR function reaching this lowering is assumed a
-// kernel entry point, the same assumption `basalt-llvm`'s own `amdgpu_kernel`-calling-
-// convention code documents, and a real device function on a GPU target is out of scope
-// until this project has one).
+// read or written through a recognized shape (`E092`, no element type to derive `memref`'s
+// type from); a `Global` parameter accessed at more than one element type (`E092` — see
+// "Known gap" below, the real reason `tri_vadd.py` does not clear this lane yet); a
+// pointer-valued or multiply-typed local/shared/constant/param slot (`E092`, see above); a
+// pointer- or vector-typed `Op::Phi` (`E091`/`E092`, see above); `Op::Switch` (`E090`, real
+// and cheap to add via `melior::dialect::cf::switch` but not exercised by either proof
+// kernel, so deliberately left for whenever a kernel actually needs it); `Op::Shuffle`/
+// `Ballot`/`VoteAny`/`VoteAll`/`Atomic`/`AtomicCas` (`E093` — every one of these has a real
+// mapping only once a target-specific dialect, `nvgpu`/`amdgpu`, is in the picture, exactly
+// like `basalt-llvm`'s own per-dialect gaps for the harder warp-level ops; deferred to
+// P11-T2, not guessed at here); `Op::Mma` (`E090`, see "linalg" above); a non-`Void`-
+// returning top-level function (`E090` — every BIR function reaching this lowering is
+// assumed a kernel entry point, the same assumption `basalt-llvm`'s own `amdgpu_kernel`-
+// calling-convention code documents, and a real device function on a GPU target is out of
+// scope until this project has one).
+//
+// # Known gap: one buffer, more than one element type (found proving out `tri_vadd.py`)
+//
+// P11-T3's own brief expected the Triton gap to be local-slot storage and `Op::Phi`; both
+// are real and are now handled above. The gap that actually stops `tri_vadd.py` short of a
+// clean lowering is different and was only visible once real Triton BIR was in hand:
+// `basalt-sema::triton_lower` carves every materialized tile's scratch storage out of the
+// kernel's *last pointer parameter* (see that module's own `Storage::Scratch` doc) — for
+// `tri_vadd.py` that parameter is `c_ptr`, which is *also* where the kernel's real output is
+// written. The same `Ty::Ptr(Global)` parameter is therefore read/written at `i64`
+// (the `offsets` tile), `i1` (`mask`), and `f32` (the `a`/`b` tiles *and* the real output) —
+// three incompatible `memref` element types for one buffer. `memref` has no representation
+// for that without the byte-addressed reinterpretation (`memref.view` off an `i8` buffer)
+// this file's own `memref` section above already declined as defeating the point of choosing
+// `memref` in the first place; building that reinterpretation layer is a real, separate unit
+// of work, not a shape `recognize_access` can be taught without it. `tri_vadd.py` therefore
+// still refuses today, honestly, with the same `E092` "parameter accessed at two different
+// element types" check this file already had — a correct refusal, not a bug, and the
+// concrete next step for whichever task picks this back up.
+//
+// `tri_matmul.py` (looked at, not this task's own bar — see `TASKS.md`) refuses even earlier,
+// on a distinct and more fundamental instance of the same underlying limit: it materializes
+// `a_ptrs`/`b_ptrs`/`c_ptrs`/`out_ptrs` as tiles *of pointers* (`tl.dot`'s own operands are
+// addressed through a pointer computed per element, not loaded data), so this lowering hits
+// `Op::Store` of a `Ty::Ptr(Global)`-typed *value* — `E091`, "stored value must be a plain
+// scalar" — before it would even reach the multi-element-type check above.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use melior::dialect::arith::{self, CmpfPredicate, CmpiPredicate};
 use melior::dialect::{cf, memref, DialectRegistry};
@@ -146,8 +228,8 @@ use melior::utility::register_all_dialects;
 use melior::Context;
 
 use basalt_bir::{
-    AddrSpace, BinOp, CastOp, FCmpPred, Function, ICmpPred, Inst, InstId, Module as BirModule, Op,
-    Scalar, Term, Ty, ValRef,
+    AddrSpace, BinOp, BlockId, CastOp, FCmpPred, Function, ICmpPred, Inst, InstId,
+    Module as BirModule, Op, Scalar, Term, Ty, ValRef,
 };
 use basalt_diag::{Diag, ECode};
 
@@ -248,30 +330,94 @@ fn result_of<'c, 'a>(op: OperationRef<'c, 'a>) -> Value<'c, 'a> {
     op.result(0).expect("operation has a result").into()
 }
 
-/// Walks the one pointer-arithmetic shape `basalt-sema` ever emits for an indexed memory
-/// access (confirmed against its real lowering and against this project's own compiled
-/// `vector_add.cu` BIR):
+const SHAPE_MISMATCH: &str =
+    "load/store address is not one of the recognized element-index shapes this lowering walks";
+
+/// Resolves the "base" operand of a recognized address to the kernel parameter it ultimately
+/// reads/writes through. Two real shapes are known, both confirmed against this project's own
+/// compiled BIR (`vector_add.cu`, and `tests/kernels/tri_vadd.py` via `basalt-sema`'s Triton
+/// path):
+///
+///  - a bare `ValRef::Param(i)` — the whole address is `<param> + off` directly (every
+///    `vector_add.cu`-shaped access, and a Triton kernel's own real-payload accesses, e.g.
+///    `a_ptr + offsets[i]`);
+///  - `add ptr.global <param>, <const>` — a real, once-computed pointer one fixed constant
+///    byte offset into a parameter's own storage, reused as the base of further indexed
+///    accesses. This is `basalt-sema::triton_lower`'s tile-scratch addressing (see that
+///    module's own `Storage::Scratch` doc): every materialized Triton tile is a fixed byte
+///    range carved out of the kernel's last pointer parameter, and each element access adds
+///    an index-scaled offset on top of that fixed base.
+///
+/// Refuses (`E092`) at anything else.
+fn resolve_base(f: &Function, base: ValRef) -> Result<usize, Diag> {
+    match base {
+        ValRef::Param(i) => Ok(i as usize),
+        ValRef::Val(id) => {
+            let inst = &f.insts[id.0 as usize];
+            if inst.ty != Ty::Ptr(AddrSpace::Global) {
+                return Err(unsupported_addr_space(SHAPE_MISMATCH));
+            }
+            match inst.op {
+                Op::Bin(BinOp::Add, ValRef::Param(i), ValRef::Val(off_id)) => {
+                    match f.insts[off_id.0 as usize].op {
+                        Op::ConstInt(_) => Ok(i as usize),
+                        _ => Err(unsupported_addr_space(SHAPE_MISMATCH)),
+                    }
+                }
+                _ => Err(unsupported_addr_space(SHAPE_MISMATCH)),
+            }
+        }
+    }
+}
+
+/// Resolves the element index feeding a recognized address's `mul <index>, <stride>` offset.
+/// Two real shapes are known:
+///
+///  - `sext i64 i32 <inner>` — CUDA-C's own shape (`vector_add.cu`): the index is computed at
+///    `i32` and widened; this lowering casts the pre-widening `i32` value straight to `index`
+///    rather than routing through the intermediate `i64` (either is a valid `arith.index_cast`
+///    source, but the narrower value is what is semantically the "real" index);
+///  - a bare `i64`-typed value with no `sext` at all — `basalt-sema::triton_lower`'s own shape:
+///    that pass lowers every index computation natively at `i64` throughout (see that module's
+///    own header), so there is never a narrower value to unwrap.
+///
+/// Refuses (`E092`) at anything else.
+fn resolve_index(f: &Function, val: ValRef) -> Result<ValRef, Diag> {
+    let id = match val {
+        ValRef::Val(id) => id,
+        ValRef::Param(_) => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
+    };
+    let inst = &f.insts[id.0 as usize];
+    if inst.ty != Ty::Scalar(Scalar::I64) {
+        return Err(unsupported_addr_space(SHAPE_MISMATCH));
+    }
+    match inst.op {
+        Op::Cast(CastOp::Sext, Ty::Scalar(Scalar::I32), inner) => Ok(inner),
+        _ => Ok(val),
+    }
+}
+
+/// Walks a recognized pointer-arithmetic shape for an indexed memory access:
 ///
 /// ```text
-/// %sext  = sext i64 i32 <inner>        ; <inner> is the pre-widened element index
-/// %esz   = const.i i64 <esz>           ; <esz> = the accessed scalar's byte size
-/// %off   = mul i64 %sext, %esz
-/// %addr  = add ptr.global <param>, %off
+/// %off   = mul i64 <index>, <esz>      ; <esz> = the accessed scalar's byte size
+/// %addr  = add ptr.global <base>, %off
 /// ```
 ///
-/// Returns `(param index, inner index ValRef, the outer Add's InstId)` on a match. Refuses
-/// (`E092`) at the first operand that does not match, never guessing at what an
-/// unrecognized shape might mean — the same discipline `basalt-spirv::glcompute`'s own
-/// `recognize_access` already established for the identical "no raw address representation"
-/// problem under `Logical` addressing.
+/// where `<base>` and `<index>` are each resolved by `resolve_base`/`resolve_index` above.
+/// Returns `(param index, index ValRef, the outer Add's InstId, the inner "Param + const"
+/// base add's InstId if `<base>` was that shape rather than a bare parameter)` on a match.
+/// The fourth element exists purely so callers can mark that instruction as consumed the same
+/// way the outer add is: it is never re-lowered as its own `memref`-incompatible pointer
+/// arithmetic (see `analyze_memory_accesses`'s own use of it). Refuses (`E092`) at the first
+/// operand that does not match, never guessing at what an unrecognized shape might mean — the
+/// same discipline `basalt-spirv::glcompute`'s own `recognize_access` already established for
+/// the identical "no raw address representation" problem under `Logical` addressing.
 fn recognize_access(
     f: &Function,
     ptr: ValRef,
     elem_ty: Scalar,
-) -> Result<(usize, ValRef, InstId), Diag> {
-    const SHAPE_MISMATCH: &str =
-        "load/store address is not the one recognized element-index shape this lowering walks";
-
+) -> Result<(usize, ValRef, InstId, Option<InstId>), Diag> {
     let add_id = match ptr {
         ValRef::Val(id) => id,
         ValRef::Param(_) => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
@@ -284,15 +430,16 @@ fn recognize_access(
         Op::Bin(BinOp::Add, base, off) => (base, off),
         _ => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
     };
-    let param_index = match base {
-        ValRef::Param(i) => i as usize,
-        _ => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
+    let param_index = resolve_base(f, base)?;
+    let base_id = match base {
+        ValRef::Val(id) => Some(id),
+        ValRef::Param(_) => None,
     };
     let off_id = match off {
         ValRef::Val(id) => id,
         ValRef::Param(_) => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
     };
-    let (sext_val, stride) = match f.insts[off_id.0 as usize].op {
+    let (index_val, stride) = match f.insts[off_id.0 as usize].op {
         Op::Bin(BinOp::Mul, a, b) => (a, b),
         _ => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
     };
@@ -309,35 +456,24 @@ fn recognize_access(
             "load/store address's byte stride does not match the accessed type's size",
         ));
     }
-    let sext_id = match sext_val {
-        ValRef::Val(id) => id,
-        ValRef::Param(_) => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
-    };
-    // `Op::Cast`'s own `Ty` field is the *source* type (`Inst::ty` carries the destination —
-    // see `basalt-bir/src/ir.rs`'s own doc comment on `Op::Cast`), so both must be checked:
-    // the instruction's result is `i64` and the cast narrows from `i32`.
-    let sext_inst = &f.insts[sext_id.0 as usize];
-    if sext_inst.ty != Ty::Scalar(Scalar::I64) {
-        return Err(unsupported_addr_space(SHAPE_MISMATCH));
-    }
-    let inner = match sext_inst.op {
-        Op::Cast(CastOp::Sext, Ty::Scalar(Scalar::I32), inner) => inner,
-        _ => return Err(unsupported_addr_space(SHAPE_MISMATCH)),
-    };
-    Ok((param_index, inner, add_id))
+    let inner = resolve_index(f, index_val)?;
+    Ok((param_index, inner, add_id, base_id))
 }
 
-/// First pass over a function's instructions: derives each `Ty::Ptr(Global)` parameter's
-/// `memref` element type from the recognized accesses that use it (mirroring
+/// First pass over a function's `Global`-space instructions: derives each `Ty::Ptr(Global)`
+/// parameter's `memref` element type from the recognized accesses that use it (mirroring
 /// `basalt-spirv::glcompute::resolve_binding_elem_tys`'s identical need), and collects the
 /// set of "outer add" instructions a recognized access consumes so the second (codegen)
 /// pass skips them rather than attempting arithmetic `memref` has no representation for.
+/// Local/shared/constant/param-space traffic is a different storage model entirely (a
+/// synthesized per-slot key, not a real dereference) and is left untouched here — see
+/// `analyze_local_slots`/`build_local_slots` below.
 fn analyze_memory_accesses(f: &Function) -> Result<(Vec<Option<Scalar>>, HashSet<u32>), Diag> {
     let mut elem_ty_of_param: Vec<Option<Scalar>> = vec![None; f.params.len()];
     let mut skip = HashSet::new();
 
     let mut record = |ptr: ValRef, elem_ty: Scalar| -> Result<(), Diag> {
-        let (param_index, _inner, add_id) = recognize_access(f, ptr, elem_ty)?;
+        let (param_index, _inner, add_id, base_id) = recognize_access(f, ptr, elem_ty)?;
         match elem_ty_of_param[param_index] {
             Some(prev) if prev != elem_ty => {
                 return Err(unsupported_addr_space(
@@ -347,26 +483,19 @@ fn analyze_memory_accesses(f: &Function) -> Result<(Vec<Option<Scalar>>, HashSet
             _ => elem_ty_of_param[param_index] = Some(elem_ty),
         }
         skip.insert(add_id.0);
+        if let Some(id) = base_id {
+            skip.insert(id.0);
+        }
         Ok(())
     };
 
     for inst in &f.insts {
         match &inst.op {
-            Op::Load { ptr, space, .. } => {
-                if *space != AddrSpace::Global {
-                    return Err(unsupported_addr_space(
-                        "load from a non-global address space is out of scope for this lowering",
-                    ));
-                }
+            Op::Load { ptr, space, .. } if *space == AddrSpace::Global => {
                 let elem_ty = as_scalar(inst.ty, "loaded value must be a plain scalar")?;
                 record(*ptr, elem_ty)?;
             }
-            Op::Store { ptr, ty, space, .. } => {
-                if *space != AddrSpace::Global {
-                    return Err(unsupported_addr_space(
-                        "store to a non-global address space is out of scope for this lowering",
-                    ));
-                }
+            Op::Store { ptr, ty, space, .. } if *space == AddrSpace::Global => {
                 let elem_ty = as_scalar(*ty, "stored value must be a plain scalar")?;
                 record(*ptr, elem_ty)?;
             }
@@ -393,6 +522,123 @@ fn analyze_memory_accesses(f: &Function) -> Result<(Vec<Option<Scalar>>, HashSet
     }
 
     Ok((elem_ty_of_param, skip))
+}
+
+/// Tag `basalt-llvm`'s own `space_tag` also uses, for a `HashMap` key (`AddrSpace` has no
+/// `Hash`/`Ord` impl of its own). `Global` is never a slot key — see `is_local_like`.
+fn space_tag(space: AddrSpace) -> u8 {
+    match space {
+        AddrSpace::Global => 0,
+        AddrSpace::Shared => 1,
+        AddrSpace::Constant => 2,
+        AddrSpace::Local => 3,
+        AddrSpace::Param => 4,
+    }
+}
+
+/// Whether `space` is one of `basalt-sema`'s synthesized address spaces, whose
+/// `const.i ptr.<space> N` values are opaque per-function slot keys rather than real
+/// addresses — see `build_local_slots`. `Global` pointers are real addresses from the moment
+/// they arrive (a function parameter, or arithmetic on one) and never take this path.
+fn is_local_like(space: AddrSpace) -> bool {
+    matches!(
+        space,
+        AddrSpace::Local | AddrSpace::Param | AddrSpace::Shared | AddrSpace::Constant
+    )
+}
+
+type SlotKey = (u8, i64);
+
+/// Derives each local-like slot's element scalar type from every `Load`/`Store` that touches
+/// it, the same "every use must agree" discipline `analyze_memory_accesses` already applies
+/// per `Global` parameter. Unlike a `Global` pointer parameter (which BIR never lets hold
+/// anything but a real dereferenceable address), `basalt-sema` can spill an arbitrary
+/// previously-computed value — including a pointer — through this same slot idiom; a slot
+/// found to carry a non-scalar value is refused (`E092`) rather than guessed at, since
+/// `memref`'s element type must be a concrete scalar (or another shaped type this lowering
+/// does not attempt) and there is no representation here for "whatever type happens to show
+/// up."
+fn analyze_local_slots(f: &Function) -> Result<HashMap<SlotKey, Scalar>, Diag> {
+    let mut tys: HashMap<SlotKey, Scalar> = HashMap::new();
+
+    let mut record = |space: AddrSpace, n: i64, ty: Ty| -> Result<(), Diag> {
+        let elem_ty = as_scalar(
+            ty,
+            "local/shared/constant/param slot holds a non-scalar (pointer or vector) value, \
+             which has no memref element-type representation in this lowering",
+        )?;
+        let key = (space_tag(space), n);
+        match tys.get(&key) {
+            Some(prev) if *prev != elem_ty => {
+                return Err(unsupported_addr_space(
+                    "local/shared/constant/param slot accessed at two different types",
+                ))
+            }
+            _ => {
+                tys.insert(key, elem_ty);
+            }
+        }
+        Ok(())
+    };
+
+    let const_slot = |ptr: ValRef, space: AddrSpace| -> Option<i64> {
+        let ValRef::Val(id) = ptr else { return None };
+        let inst = &f.insts[id.0 as usize];
+        match inst.op {
+            Op::ConstInt(n) if inst.ty == Ty::Ptr(space) => Some(n),
+            _ => None,
+        }
+    };
+
+    for inst in &f.insts {
+        match &inst.op {
+            Op::Load { ptr, space, .. } if is_local_like(*space) => {
+                if let Some(n) = const_slot(*ptr, *space) {
+                    record(*space, n, inst.ty)?;
+                }
+            }
+            Op::Store { ptr, ty, space, .. } if is_local_like(*space) => {
+                if let Some(n) = const_slot(*ptr, *space) {
+                    record(*space, n, *ty)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(tys)
+}
+
+/// `basalt-sema`'s lowering has no `alloca`: every local/parameter/shared/constant storage
+/// location is handed a small integer slot id and materialized, wherever BIR needs its
+/// address, as `const.i ptr.<space> (slot_id * SLOT_STRIDE)` — an opaque per-`(space, id)`
+/// key, not a real address (`basalt-x86`'s oracle and `basalt-llvm`'s own `build_local_slots`
+/// both document and handle the identical pattern). This builds one real `memref.alloca` per
+/// distinct key used in `f`, in `f`'s entry block ahead of its own instructions, so
+/// `lower_inst`'s `Op::ConstInt` case has genuine backing storage to hand back instead of
+/// treating the opaque key as a literal pointer value. Every slot is a flat, 0-d memref at
+/// whatever scalar type `analyze_local_slots` derived for it — `memref` is strongly typed, so
+/// (unlike `basalt-llvm`'s uniformly-`i64` `alloca`) this lowering cannot get away with one
+/// fixed width for every slot regardless of what is actually stored there.
+fn build_local_slots<'c, 'a>(
+    context: &'c Context,
+    entry: &'a Block<'c>,
+    loc: Location<'c>,
+    slot_tys: &HashMap<SlotKey, Scalar>,
+) -> HashMap<SlotKey, Value<'c, 'a>> {
+    let mut slots = HashMap::new();
+    // `HashMap` iteration order is not deterministic; sort by key so this lowering's own
+    // "same BIR in, byte-identical text out" invariant holds regardless of hash seed.
+    let mut keys: Vec<&SlotKey> = slot_tys.keys().collect();
+    keys.sort();
+    for &key in &keys {
+        let scalar = slot_tys[key];
+        let mty = MemRefType::new(mlir_scalar_ty(context, scalar), &[], None, None);
+        let built = memref::alloca(context, mty, &[], &[], None, loc);
+        let val: Value<'c, 'a> = result_of(entry.append_operation(built));
+        slots.insert(*key, val);
+    }
+    slots
 }
 
 fn mlir_param_ty<'c>(
@@ -489,6 +735,7 @@ fn lower_inst<'c, 'a>(
     f: &Function,
     params: &[Value<'c, 'a>],
     values: &[Option<Value<'c, 'a>>],
+    local_slots: &HashMap<SlotKey, Value<'c, 'a>>,
     inst: &Inst,
 ) -> Result<Option<Value<'c, 'a>>, Diag> {
     let loc = Location::unknown(context);
@@ -501,11 +748,14 @@ fn lower_inst<'c, 'a>(
                 let built = arith::constant(context, IntegerAttribute::new(ty, *n).into(), loc);
                 result_of(blk.append_operation(built))
             }
+            Ty::Ptr(space) if is_local_like(space) => *local_slots
+                .get(&(space_tag(space), *n))
+                .expect("build_local_slots pre-scans every local-like slot constant"),
             Ty::Ptr(_) => {
                 return Err(unsupported_addr_space(
-                    "opaque local/shared/constant slot constant has no backing storage in \
-                     this lowering (basalt-sema's alloca-needing address-synthesis idiom is \
-                     not yet implemented here)",
+                    "a literal ptr.global constant has no memref representation in this \
+                     lowering (a real global pointer always arrives as a kernel parameter, \
+                     or arithmetic on one)",
                 ))
             }
             Ty::Vec(..) | Ty::Void => return Err(unsupported_type("const.i of a non-scalar type")),
@@ -584,24 +834,36 @@ fn lower_inst<'c, 'a>(
             };
             result_of(blk.append_operation(built))
         }
+        Op::Load { ptr, space, .. } if is_local_like(*space) => {
+            let _ = as_scalar(inst.ty, "loaded value must be a plain scalar")?;
+            let built = memref::load(get(*ptr), &[], loc);
+            result_of(blk.append_operation(built))
+        }
         Op::Load { ptr, .. } => {
             let elem_ty = as_scalar(inst.ty, "loaded value must be a plain scalar")?;
-            let (param_index, inner, _) = recognize_access(f, *ptr, elem_ty)?;
-            let idx_i32 = get(inner);
+            let (param_index, inner, _, _) = recognize_access(f, *ptr, elem_ty)?;
+            let idx_int = get(inner);
             let idx = result_of(blk.append_operation(arith::index_cast(
-                idx_i32,
+                idx_int,
                 Type::index(context),
                 loc,
             )));
             let built = memref::load(params[param_index], &[idx], loc);
             result_of(blk.append_operation(built))
         }
+        Op::Store {
+            ptr, val, space, ..
+        } if is_local_like(*space) => {
+            let built = memref::store(get(*val), get(*ptr), &[], loc);
+            blk.append_operation(built);
+            return Ok(None);
+        }
         Op::Store { ptr, val, ty, .. } => {
             let elem_ty = as_scalar(*ty, "stored value must be a plain scalar")?;
-            let (param_index, inner, _) = recognize_access(f, *ptr, elem_ty)?;
-            let idx_i32 = get(inner);
+            let (param_index, inner, _, _) = recognize_access(f, *ptr, elem_ty)?;
+            let idx_int = get(inner);
             let idx = result_of(blk.append_operation(arith::index_cast(
-                idx_i32,
+                idx_int,
                 Type::index(context),
                 loc,
             )));
@@ -609,12 +871,10 @@ fn lower_inst<'c, 'a>(
             blk.append_operation(built);
             return Ok(None);
         }
-        Op::Phi(_) => {
-            return Err(unsupported_op(
-                "phi has no MLIR block-instruction equivalent; lowering it to a block \
-                 argument plus per-predecessor branch operands is a real, deferred follow-up",
-            ))
-        }
+        Op::Phi(_) => unreachable!(
+            "a phi's value is pre-bound to a block argument by lower_function before any \
+             instruction in its block is lowered; it is never dispatched here"
+        ),
         Op::TidX => gpu_index(context, blk, "gpu.thread_id", "x"),
         Op::TidY => gpu_index(context, blk, "gpu.thread_id", "y"),
         Op::TidZ => gpu_index(context, blk, "gpu.thread_id", "z"),
@@ -662,28 +922,93 @@ fn lower_inst<'c, 'a>(
     }))
 }
 
+/// The leading run of `Op::Phi` instructions in block `bi` — `basalt_passes::construct_ssa`'s
+/// own documented output order (a block's phis, if any, always precede its ordinary body; see
+/// that pass's header) is what makes reading this off as a plain prefix scan sound, with no
+/// need to otherwise search the block's instruction list.
+fn phi_ids(f: &Function, bi: usize) -> Vec<InstId> {
+    f.blocks[bi]
+        .insts
+        .iter()
+        .copied()
+        .take_while(|id| matches!(f.insts[id.0 as usize].op, Op::Phi(_)))
+        .collect()
+}
+
+/// The MLIR block-argument type a phi's own BIR type maps to. Only a scalar phi is attempted
+/// — neither of this task's proof kernels ever produces a pointer- or vector-typed one (every
+/// phi in both is `i64` or `f32`), so there is no real shape yet to confirm a `memref`/
+/// `vector` block-argument mapping against.
+fn phi_arg_ty<'c>(context: &'c Context, ty: Ty) -> Result<Type<'c>, Diag> {
+    match ty {
+        Ty::Scalar(s) => Ok(mlir_scalar_ty(context, s)),
+        Ty::Vec(..) => Err(unsupported_type(
+            "a vector-typed phi has no block-argument mapping attempted by this lowering",
+        )),
+        Ty::Ptr(_) | Ty::Void => Err(unsupported_addr_space(
+            "a pointer-typed phi has no block-argument mapping attempted by this lowering",
+        )),
+    }
+}
+
+/// The branch operands a `cf.br`/`cf.cond_br` from block `pred` to block `target` must carry:
+/// one value per `target`'s own leading phi, in order, each resolved to whichever incoming
+/// value that phi records for `pred`.
+fn branch_args<'c, 'a>(
+    f: &Function,
+    params: &[Value<'c, 'a>],
+    values: &[Option<Value<'c, 'a>>],
+    target: BlockId,
+    pred: BlockId,
+) -> Vec<Value<'c, 'a>> {
+    phi_ids(f, target.0 as usize)
+        .iter()
+        .map(|&id| {
+            let Op::Phi(incoming) = &f.insts[id.0 as usize].op else {
+                unreachable!("phi_ids only ever returns Op::Phi instructions")
+            };
+            let v = incoming
+                .iter()
+                .find(|(b, _)| *b == pred)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "phi {id:?} at block {target:?} has no incoming value recorded for \
+                         predecessor {pred:?} (BIR phi/predecessor invariant violated)"
+                    )
+                })
+                .1;
+            get_val(params, values, v)
+        })
+        .collect()
+}
+
 fn lower_term<'c, 'a>(
     context: &'c Context,
     blk: &'a Block<'c>,
     mlir_blocks: &'a [Block<'c>],
     params: &[Value<'c, 'a>],
     values: &[Option<Value<'c, 'a>>],
+    f: &Function,
+    cur: BlockId,
     term: &Term,
 ) -> Result<(), Diag> {
     let loc = Location::unknown(context);
     match term {
         Term::Br(target) => {
-            blk.append_operation(cf::br(&mlir_blocks[target.0 as usize], &[], loc));
+            let args = branch_args(f, params, values, *target, cur);
+            blk.append_operation(cf::br(&mlir_blocks[target.0 as usize], &args, loc));
         }
         Term::CondBr(cond, t, e) => {
             let c = get_val(params, values, *cond);
+            let t_args = branch_args(f, params, values, *t, cur);
+            let e_args = branch_args(f, params, values, *e, cur);
             blk.append_operation(cf::cond_br(
                 context,
                 c,
                 &mlir_blocks[t.0 as usize],
                 &mlir_blocks[e.0 as usize],
-                &[],
-                &[],
+                &t_args,
+                &e_args,
                 loc,
             ));
         }
@@ -724,11 +1049,16 @@ fn lower_term<'c, 'a>(
 fn check_unsupported_ops(f: &Function) -> Result<(), Diag> {
     for inst in &f.insts {
         match &inst.op {
-            Op::Phi(_) => {
-                return Err(unsupported_op(
-                    "phi has no MLIR block-instruction equivalent; lowering it to a block \
-                     argument plus per-predecessor branch operands is a real, deferred \
-                     follow-up",
+            Op::Phi(_) if matches!(inst.ty, Ty::Vec(..)) => {
+                return Err(unsupported_type(
+                    "a vector-typed phi has no block-argument mapping attempted by this \
+                     lowering",
+                ))
+            }
+            Op::Phi(_) if !matches!(inst.ty, Ty::Scalar(_)) => {
+                return Err(unsupported_addr_space(
+                    "a pointer-typed phi has no block-argument mapping attempted by this \
+                     lowering",
                 ))
             }
             Op::Shuffle(..) => {
@@ -791,8 +1121,21 @@ fn lower_function<'c>(
         ));
     }
     check_unsupported_ops(f)?;
+    if !phi_ids(f, 0).is_empty() {
+        // `basalt_passes::construct_ssa` only ever inserts a phi at a block with more than
+        // one predecessor (see that pass's header); the entry block has none, so this never
+        // fires on real optimizer output — kept as a real, precise refusal rather than an
+        // assert, since a hand-built module could still reach here. A phi here would also
+        // desync `gpu.func`'s own declared `function_type` (built from `param_tys` alone)
+        // from its entry block's actual argument list.
+        return Err(unsupported_op(
+            "a phi in the function's entry block has no incoming value to bind (the entry \
+             block has no predecessor) and is not attempted by this lowering",
+        ));
+    }
 
     let (elem_ty_of_param, skip) = analyze_memory_accesses(f)?;
+    let slot_tys = analyze_local_slots(f)?;
     let param_tys: Vec<Type<'c>> = f
         .params
         .iter()
@@ -801,18 +1144,26 @@ fn lower_function<'c>(
         .collect::<Result<_, _>>()?;
 
     let loc = Location::unknown(context);
+    // Every block gets one MLIR block argument per leading `Op::Phi` (see `phi_ids`), on top
+    // of the function's own parameters for block 0 — see this file's own "Op::Phi" section
+    // above for why this is sound without a topological fixup.
     let mlir_blocks: Vec<Block<'c>> = f
         .blocks
         .iter()
         .enumerate()
         .map(|(i, _)| {
+            let phi_tys: Vec<Type<'c>> = phi_ids(f, i)
+                .iter()
+                .map(|&id| phi_arg_ty(context, f.insts[id.0 as usize].ty))
+                .collect::<Result<_, _>>()?;
+            let mut args: Vec<(Type<'c>, Location<'c>)> = Vec::new();
             if i == 0 {
-                Block::new(&param_tys.iter().map(|&ty| (ty, loc)).collect::<Vec<_>>())
-            } else {
-                Block::new(&[])
+                args.extend(param_tys.iter().map(|&ty| (ty, loc)));
             }
+            args.extend(phi_tys.into_iter().map(|ty| (ty, loc)));
+            Ok(Block::new(&args))
         })
-        .collect();
+        .collect::<Result<Vec<_>, Diag>>()?;
 
     let params: Vec<Value<'c, '_>> = (0..f.params.len())
         .map(|i| {
@@ -822,16 +1173,41 @@ fn lower_function<'c>(
                 .into()
         })
         .collect();
+
+    // Real backing storage for every local/shared/constant/param slot this function's own
+    // `Op::ConstInt`s reference — built into block 0 ahead of its own instructions (appended
+    // here, before the main lowering walk below ever touches block 0), so every later slot
+    // read/write dominates cleanly regardless of which block it is in.
+    let local_slots = build_local_slots(context, &mlir_blocks[0], loc, &slot_tys);
+
     let mut values: Vec<Option<Value<'c, '_>>> = vec![None; f.insts.len()];
+    // Bind every phi's BIR value to its own pre-built block argument before lowering a single
+    // instruction — an operand referencing a phi (from within its own block, or from a block
+    // this one dominates) must already resolve by the time the main walk below reaches it.
+    for (bi, _) in f.blocks.iter().enumerate() {
+        let base = if bi == 0 { param_tys.len() } else { 0 };
+        for (k, id) in phi_ids(f, bi).iter().enumerate() {
+            let arg = mlir_blocks[bi]
+                .argument(base + k)
+                .expect("declared phi block argument");
+            values[id.0 as usize] = Some(arg.into());
+        }
+    }
 
     for (bi, bir_block) in f.blocks.iter().enumerate() {
         let blk = &mlir_blocks[bi];
         for &inst_id in &bir_block.insts {
+            let inst = &f.insts[inst_id.0 as usize];
+            // A phi's value is already bound above; it is never itself dispatched to
+            // `lower_inst`.
+            if matches!(inst.op, Op::Phi(_)) {
+                continue;
+            }
             if skip.contains(&inst_id.0) {
                 continue;
             }
-            let inst = &f.insts[inst_id.0 as usize];
-            values[inst_id.0 as usize] = lower_inst(context, blk, f, &params, &values, inst)?;
+            values[inst_id.0 as usize] =
+                lower_inst(context, blk, f, &params, &values, &local_slots, inst)?;
         }
         lower_term(
             context,
@@ -839,6 +1215,8 @@ fn lower_function<'c>(
             &mlir_blocks,
             &params,
             &values,
+            f,
+            BlockId(bi as u32),
             &bir_block.term,
         )?;
     }

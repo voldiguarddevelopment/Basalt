@@ -61,8 +61,14 @@ fn refuses_vector_typed_parameter() {
     assert_eq!(err.code, ECode::UnsupportedType);
 }
 
+/// A scalar-typed phi lowers to a real MLIR block argument (P11-T3), not a refusal — see this
+/// module's own "Op::Phi" section above. `bb1` here has a single predecessor, so this is the
+/// degenerate one-incoming-edge case (a real multi-predecessor merge is exercised by
+/// `vector_add.cu`'s own masked-store diamond, already covered by
+/// `vector_add_lowers_to_a_well_formed_module_via_the_real_pipeline`); it is still real,
+/// non-hypothetical BIR shape and worth its own direct, minimal proof.
 #[test]
-fn refuses_phi() {
+fn phi_lowers_to_a_block_argument() {
     use basalt_bir::{BlockId, Op, ValRef};
 
     let f = Function {
@@ -84,8 +90,19 @@ fn refuses_phi() {
             op: Op::Phi(vec![(BlockId(0), ValRef::Param(0))]),
         }],
     };
-    let err = lower_to_text(&wrap(f)).unwrap_err();
-    assert_eq!(err.code, ECode::UnsupportedOp);
+    let text = lower_to_text(&wrap(f)).expect("a scalar-typed phi lowers to a block argument");
+
+    let context = super_test_context();
+    let reparsed =
+        melior::ir::Module::parse(&context, &text).expect("emitted text re-parses as valid MLIR");
+    assert!(
+        melior::ir::operation::OperationLike::verify(&reparsed.as_operation()),
+        "re-parsed module fails melior's own verifier"
+    );
+
+    // bb1 takes the phi as a real block argument, fed by bb0's own branch operand.
+    assert!(text.contains("cf.br ^bb1(%arg0"));
+    assert!(text.contains("^bb1(%0: i32):"));
 }
 
 #[test]
@@ -302,4 +319,68 @@ fn super_test_context() -> melior::Context {
     context.append_dialect_registry(&registry);
     context.load_all_available_dialects();
     context
+}
+
+// ---- real pipeline: tests/kernels/tri_vadd.py (masked Triton vector-add), P11-T3 ------------
+//
+// See this module's own "Local/shared/constant/param storage", "Op::Phi", and especially
+// "Known gap" sections above: this is the real, `mlir-opt`-checked proof that P11-T3's actual
+// blocker for `tri_vadd.py` is neither local-slot storage nor `Op::Phi` (both are implemented
+// and exercised by this test's own BIR) but `basalt-sema::triton_lower`'s tile-scratch reuse
+// of the kernel's own last pointer parameter (`c_ptr`) at more than one element type, which
+// this lowering's `memref`-per-parameter model has no representation for. This test asserts
+// the honest current outcome — a stable, precise refusal — rather than a guessed-at success.
+
+const TRI_VADD_SRC: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/kernels/tri_vadd.py"
+));
+
+/// Runs the real `parse -> check_triton -> lower_triton -> basalt_passes::optimize` pipeline
+/// over `src`, asserting no diagnostics at any stage, and returns the optimized BIR module —
+/// mirrors `crates/basalt-x86/tests/triton_link_and_run.rs`'s own `compile_triton` helper.
+fn compile_triton(src: &str) -> BirModule {
+    let (module, parse_diags) = basalt_frontend_triton::parse(src);
+    assert!(
+        parse_diags.is_empty(),
+        "parsing produced diagnostics: {:?}",
+        parse_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let (shapes, check_diags) = basalt_sema::check_triton(&module);
+    assert!(
+        check_diags.is_empty(),
+        "check_triton produced diagnostics: {:?}",
+        check_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let (bir, lower_diags) = basalt_sema::lower_triton(&module, &shapes);
+    assert!(
+        lower_diags.is_empty(),
+        "lower_triton produced diagnostics: {:?}",
+        lower_diags
+            .iter()
+            .map(|d| (d.code, d.args.clone()))
+            .collect::<Vec<_>>()
+    );
+    basalt_passes::optimize(&bir)
+}
+
+#[test]
+fn tri_vadd_refuses_on_a_stable_e_code_pending_a_byte_addressed_memref_layer() {
+    let module = compile_triton(TRI_VADD_SRC);
+    let err = lower_to_text(&module).expect_err(
+        "tri_vadd.py's scratch-sharing parameter (c_ptr, read/written at i64/i1/f32 through \
+         basalt-sema's tile-scratch reuse) is not yet representable by this lowering's \
+         one-memref-type-per-parameter model — see this module's own \"Known gap\" section",
+    );
+    assert_eq!(err.code, ECode::UnsupportedAddressSpace);
+}
+
+#[test]
+fn tri_vadd_refusal_is_deterministic() {
+    let module = compile_triton(TRI_VADD_SRC);
+    let a = lower_to_text(&module).unwrap_err();
+    let b = lower_to_text(&module).unwrap_err();
+    assert_eq!(a.code, b.code);
 }
