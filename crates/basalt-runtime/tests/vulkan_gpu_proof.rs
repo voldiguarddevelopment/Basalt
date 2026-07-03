@@ -1,18 +1,20 @@
 // The real GPU proof for the Vulkan runtime — the Vulkan counterpart to `ptx_gpu_proof.rs`'s
-// CUDA one, but with a real, load-bearing complication that file doesn't have: `basalt-spirv`
-// targets SPIR-V's `Kernel` execution model (see `crates/basalt-spirv/src/emit.rs`'s own header),
-// while Vulkan's compute pipeline API requires `GLCompute`. This file exercises both halves of
-// `basalt_runtime::vulkan`'s empirically-confirmed finding on that mismatch (see
-// `src/vulkan/mod.rs`'s header for the full account):
+// CUDA one, but with a real, load-bearing complication that file doesn't have: `basalt-spirv`'s
+// *default* path targets SPIR-V's `Kernel` execution model (see
+// `crates/basalt-spirv/src/emit.rs`'s own header), while Vulkan's compute pipeline API requires
+// `GLCompute`. This file exercises three things about that mismatch (see `src/vulkan/mod.rs`'s
+// header for the original account, and `crates/basalt-spirv/src/emit/glcompute.rs`'s own header
+// for the real second path that closed it):
 //
 //   1. `kernel_model_shader_module_loads_but_pipeline_creation_fails` compiles
 //      `tests/kernels/vector_add.cu` through this project's real frontend/sema/passes/
 //      `basalt-spirv` pipeline — unconditionally, not hardware-gated, same as
 //      `ptx_gpu_proof.rs`'s own `compile_vector_add_to_ptx` — and proves, against a real Vulkan
 //      loader/driver, that the resulting `Kernel`-model module loads via `vkCreateShaderModule`
-//      but is refused by `vkCreateComputePipelines` with a specific, stable `VkResult`. This is
-//      the honest, current boundary of what `basalt-spirv`'s output can do in a Vulkan compute
-//      pipeline: not a bug in `basalt_runtime::vulkan`, and not something this file works around.
+//      but is refused by `vkCreateComputePipelines` with a specific, stable `VkResult`. This
+//      remains an honest, permanent property of the `Kernel` path specifically (Vulkan's compute
+//      pipeline creation requires `GLCompute` unconditionally, by spec) — not a bug in
+//      `basalt_runtime::vulkan`, and not something this file works around.
 //
 //   2. `vector_add_dispatches_through_real_vulkan_runtime_via_glcompute_stand_in` proves the
 //      *runtime* itself — buffer allocation, descriptor sets, push constants, command buffer
@@ -20,13 +22,19 @@
 //      hardware, using `GLCOMPUTE_VECTOR_ADD_SPV`: a hand-written `GLCompute`-execution-model
 //      SPIR-V module, semantically identical to `vector_add.cu`, compiled offline via
 //      `glslangValidator` from the GLSL source quoted in that constant's own doc comment and
-//      confirmed valid via `spirv-val`. It is emphatically **not** `basalt-spirv`'s output —
-//      `basalt-spirv` cannot produce a `GLCompute` module today (see finding above) — this
-//      constant exists solely to give the runtime itself something it can actually build a
-//      pipeline from, so that everything downstream of pipeline creation can be proven for real
-//      rather than left an assertion this crate cannot back up.
+//      confirmed valid via `spirv-val`. It is deliberately **not** `basalt-spirv`'s output — this
+//      constant and test predate `basalt-spirv`'s `GLCompute` path and are kept exactly as they
+//      were (see #3 below for what runs the real thing) to independently document the runtime's
+//      own correctness without depending on any particular backend's output.
 //
-// Both tests follow `cuda_driver.rs`/`ptx_gpu_proof.rs`'s own "compile the pipeline
+//   3. `vector_add_dispatches_through_real_vulkan_runtime_via_real_glcompute_backend` is the
+//      actual proof P9-T3 exists for: `basalt-spirv`'s own real `GLCompute`-model output for
+//      `vector_add.cu` (via `EmitOpts::target_variant == Some("glcompute")`, see
+//      `compile_vector_add_to_glcompute_spirv_words` and `emit/glcompute.rs`), dispatched
+//      through this same runtime and compared bit-exact against the host-computed oracle — no
+//      hand-written stand-in involved.
+//
+// All three follow `cuda_driver.rs`/`ptx_gpu_proof.rs`'s own "compile the pipeline
 // unconditionally, gate everything hardware-touching on driver presence" pattern via
 // `open_instance_or_skip`.
 
@@ -44,13 +52,10 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root exists")
 }
 
-/// Runs the real lex/preprocess/parse/check/lower/optimize/emit pipeline over
-/// `tests/kernels/vector_add.cu` through `basalt-spirv`, returning its emitted SPIR-V as `u32`
-/// words (`VkShaderModuleCreateInfo`'s own native unit, and the unit `Assemble::assemble`
-/// produces internally before `emit.rs` serializes it to little-endian bytes — reversed here via
-/// plain `u32::from_le_bytes` rather than an alignment-sensitive pointer cast, since a `Vec<u8>`
-/// carries no alignment guarantee a `*const u32` reinterpretation could rely on).
-fn compile_vector_add_to_spirv_words() -> Vec<u32> {
+/// Runs the real lex/preprocess/parse/check/lower/optimize pipeline over
+/// `tests/kernels/vector_add.cu`, shared by both the `Kernel`-model and `GLCompute`-model
+/// compilation helpers below — the two differ only in which `EmitOpts` they hand `basalt-spirv`.
+fn lower_vector_add_module() -> basalt_bir::Module {
     let root = workspace_root();
     let src_path = root.join("tests/kernels/vector_add.cu");
     let src = std::fs::read_to_string(&src_path)
@@ -94,11 +99,18 @@ fn compile_vector_add_to_spirv_words() -> Vec<u32> {
         lower_diags.iter().map(|d| d.code).collect::<Vec<_>>()
     );
 
-    let module = basalt_passes::optimize(&module);
+    basalt_passes::optimize(&module)
+}
 
-    assert_eq!(Spirv.supports(&module), Support::Supported);
+/// Emits `module` through `basalt-spirv` under `opts`, returning the result as `u32` words
+/// (`VkShaderModuleCreateInfo`'s own native unit, and the unit `Assemble::assemble` produces
+/// internally before `emit.rs` serializes it to little-endian bytes — reversed here via plain
+/// `u32::from_le_bytes` rather than an alignment-sensitive pointer cast, since a `Vec<u8>` carries
+/// no alignment guarantee a `*const u32` reinterpretation could rely on).
+fn emit_spirv_words(module: &basalt_bir::Module, opts: &EmitOpts) -> Vec<u32> {
+    assert_eq!(Spirv.supports(module), Support::Supported);
     let artifact = Spirv
-        .emit(&module, &EmitOpts::default())
+        .emit(module, opts)
         .expect("SPIR-V emit succeeds for vector_add");
     let bytes = artifact
         .as_bytes()
@@ -113,6 +125,25 @@ fn compile_vector_add_to_spirv_words() -> Vec<u32> {
         .chunks_exact(4)
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .collect()
+}
+
+/// Runs the real lex/preprocess/parse/check/lower/optimize/emit pipeline over
+/// `tests/kernels/vector_add.cu` through `basalt-spirv`'s default (`Kernel`-model) path,
+/// returning its emitted SPIR-V as `u32` words.
+fn compile_vector_add_to_spirv_words() -> Vec<u32> {
+    emit_spirv_words(&lower_vector_add_module(), &EmitOpts::default())
+}
+
+/// The same real pipeline, but through `basalt-spirv`'s `GLCompute`-model path
+/// (`EmitOpts::target_variant == Some("glcompute")`, see `crates/basalt-spirv/src/emit/
+/// glcompute.rs`) — this crate's own real, hand-rolled `GLCompute` output, not the hand-written
+/// stand-in shader `GLCOMPUTE_VECTOR_ADD_SPV` below exists for.
+fn compile_vector_add_to_glcompute_spirv_words() -> Vec<u32> {
+    let opts = EmitOpts {
+        target_variant: Some("glcompute".to_string()),
+        ..EmitOpts::default()
+    };
+    emit_spirv_words(&lower_vector_add_module(), &opts)
 }
 
 /// Opens the Vulkan loader, or reports why it can't and lets the caller skip the rest of the
@@ -385,6 +416,109 @@ fn vector_add_dispatches_through_real_vulkan_runtime_via_glcompute_stand_in() {
     println!(
         "PASS: vector_add-equivalent dispatch on real Vulkan device {:?}, {N} elements bit-exact \
          (sample: c[0]={} c[1]={} c[{}]={} c[{}]={})",
+        device.physical().name,
+        c[0],
+        c[1],
+        N / 2,
+        c[N / 2],
+        N - 1,
+        c[N - 1]
+    );
+}
+
+/// The actual proof P9-T3 exists for: `basalt-spirv`'s own real `GLCompute`-model output for
+/// `vector_add.cu` (not a hand-written stand-in — see `compile_vector_add_to_glcompute_spirv_words`
+/// and `crates/basalt-spirv/src/emit/glcompute.rs`) dispatched through this crate's real Vulkan
+/// runtime and compared bit-exact against the host-computed oracle. This closes the gap
+/// `kernel_model_shader_module_loads_but_pipeline_creation_fails` (above) and this crate's own
+/// header documented: `basalt-spirv`'s `Kernel`-model output cannot cross `vkCreateComputePipelines`,
+/// but its `GLCompute`-model output — a real second emission path, not a stand-in — now can.
+///
+/// This path's fixed work-group size is `(1, 1, 1)` (see `glcompute.rs`'s header), so — unlike
+/// the stand-in shader's `local_size_x = 64` — each dispatched workgroup computes exactly one
+/// element and `group_counts` is `(N, 1, 1)`, not `(N / 64, 1, 1)`.
+#[test]
+fn vector_add_dispatches_through_real_vulkan_runtime_via_real_glcompute_backend() {
+    // The frontend-through-SPIR-V-emission half is real compiler work, not hardware-gated, and
+    // runs unconditionally on every machine — only what follows (touching a real Vulkan loader)
+    // is allowed to self-skip.
+    let words = compile_vector_add_to_glcompute_spirv_words();
+
+    let Some(instance) = open_instance_or_skip(
+        "vector_add_dispatches_through_real_vulkan_runtime_via_real_glcompute_backend",
+    ) else {
+        return;
+    };
+    let Some(device) = open_device_or_skip(
+        &instance,
+        "vector_add_dispatches_through_real_vulkan_runtime_via_real_glcompute_backend",
+    ) else {
+        return;
+    };
+
+    // `vector_add`'s BIR parameter list is `(a, b, c, n)`: three `Ty::Ptr(Global)` arguments
+    // (storage-buffer bindings 0/1/2, in that order) and one `i32` scalar (the whole 4-byte
+    // push-constant block) — see `glcompute.rs`'s header for this ABI.
+    let pipeline = VulkanComputePipeline::create(&device, &words, "vector_add", 3, 4).expect(
+        "creating a compute pipeline from basalt-spirv's own real GLCompute output must succeed",
+    );
+
+    const N: usize = 1024;
+    // Same bit-exactness rationale as the stand-in test above: `i` and `i * 2` are both small
+    // non-negative integers, exactly representable in f32, so the host- and device-computed sums
+    // are bit-identical with no ULP tolerance needed.
+    let a: Vec<f32> = (0..N).map(|i| i as f32).collect();
+    let b: Vec<f32> = (0..N).map(|i| (i * 2) as f32).collect();
+    let byte_len = N * std::mem::size_of::<f32>();
+
+    let a_buf = device
+        .alloc_host_buffer(byte_len)
+        .expect("allocating buffer a");
+    let b_buf = device
+        .alloc_host_buffer(byte_len)
+        .expect("allocating buffer b");
+    let c_buf = device
+        .alloc_host_buffer(byte_len)
+        .expect("allocating buffer c");
+
+    let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    a_buf.copy_from_host(&a_bytes).expect("copying a to device");
+    b_buf.copy_from_host(&b_bytes).expect("copying b to device");
+
+    let n: i32 = N as i32;
+
+    pipeline
+        .dispatch(
+            &[&a_buf, &b_buf, &c_buf],
+            &n.to_ne_bytes(),
+            (N as u32, 1, 1),
+        )
+        .expect("dispatching basalt-spirv's real GLCompute vector_add on the real Vulkan device");
+
+    let mut c_bytes = vec![0u8; byte_len];
+    c_buf
+        .copy_to_host(&mut c_bytes)
+        .expect("copying c from device");
+    let c: Vec<f32> = c_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("4-byte chunk")))
+        .collect();
+
+    for i in 0..N {
+        assert_eq!(
+            c[i],
+            a[i] + b[i],
+            "mismatch at index {i}: {} + {} != {}",
+            a[i],
+            b[i],
+            c[i]
+        );
+    }
+
+    println!(
+        "PASS: basalt-spirv's own real GLCompute vector_add dispatched on real Vulkan device \
+         {:?}, {N} elements bit-exact (sample: c[0]={} c[1]={} c[{}]={} c[{}]={})",
         device.physical().name,
         c[0],
         c[1],

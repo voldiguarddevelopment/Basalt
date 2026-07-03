@@ -162,6 +162,21 @@
 // specific modules listed above, on this development machine**, in addition to (not instead of)
 // oracle-validated BIR semantics — it has not been run on real driver/hardware or a software
 // Vulkan/Level-Zero runtime (that is P9-T2's job, named explicitly out of scope for this task).
+//
+// # A second path: `GLCompute` (`EmitOpts::target_variant == Some("glcompute")`)
+//
+// Everything above this point describes this backend's *default* behavior, unconditionally
+// unchanged by the second path below: `target_variant == None` (or any string other than
+// `"glcompute"`) always takes the `Kernel` path exactly as documented above. P9-T2
+// (`basalt-runtime`'s Vulkan loader; see `crates/basalt-runtime/src/vulkan/mod.rs`) confirmed,
+// against real `llvmpipe`, that `vkCreateComputePipelines` refuses this backend's `Kernel`-model
+// output unconditionally — Vulkan's compute pipeline API requires `GLCompute` by spec, not by
+// driver quirk. `glcompute.rs` (a child module of this one — see its own header for the full
+// resource-binding ABI and pointer-arithmetic-to-`OpAccessChain` recognition it adds) is a real,
+// second, opt-in emission path for exactly that model, selected only by an explicit
+// `target_variant`, reusing this file's own arithmetic/cast/compare/control-flow/GPU-index
+// lowering verbatim wherever the underlying SPIR-V shape is genuinely execution-model-agnostic
+// (confirmed, not assumed — see `glcompute.rs`'s own validation-tier section).
 
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
@@ -408,15 +423,12 @@ impl Ctx {
     }
 }
 
-fn new_ctx() -> Ctx {
-    let mut b = Builder::new();
-    b.set_version(1, 4);
-    b.capability(Capability::Kernel);
-    b.capability(Capability::Addresses);
-    b.capability(Capability::Int64);
-    b.capability(Capability::Float64);
-    b.memory_model(AddressingModel::Physical64, MemoryModel::OpenCL);
-
+/// Declares the three real `Input` builtin variables every kernel in the module shares
+/// (workgroup id, local invocation id, num workgroups) — identical under the `Kernel` and
+/// `GLCompute` execution models alike (confirmed via `spirv-val` for both; see this file's
+/// header and `glcompute.rs`'s own header), so both execution models' context constructors
+/// share this one declaration site rather than each hand-rolling it.
+fn declare_index_builtins(b: &mut Builder) -> (Word, Word, Word) {
     let uint_ty = b.type_int(32, 0);
     let uint3_ty = b.type_vector(uint_ty, 3);
     let ptr_input_uint3 = b.type_pointer(None, StorageClass::Input, uint3_ty);
@@ -441,6 +453,20 @@ fn new_ctx() -> Ctx {
         Decoration::BuiltIn,
         vec![Operand::BuiltIn(BuiltIn::NumWorkgroups)],
     );
+
+    (workgroup_id, local_invocation_id, num_workgroups)
+}
+
+fn new_ctx() -> Ctx {
+    let mut b = Builder::new();
+    b.set_version(1, 4);
+    b.capability(Capability::Kernel);
+    b.capability(Capability::Addresses);
+    b.capability(Capability::Int64);
+    b.capability(Capability::Float64);
+    b.memory_model(AddressingModel::Physical64, MemoryModel::OpenCL);
+
+    let (workgroup_id, local_invocation_id, num_workgroups) = declare_index_builtins(&mut b);
 
     Ctx {
         b,
@@ -945,19 +971,30 @@ impl Backend for Spirv {
     }
 
     fn supports(&self, module: &Module) -> Support {
+        // `Support::supports` has no `EmitOpts` of its own to read (the trait signature is
+        // shared by every backend, see `basalt-backend`), so it only ever checks this backend's
+        // default (`Kernel`) coverage, matching `basalt-amdgpu`'s identical stance on its own
+        // `EmitOpts::target_variant` — `glcompute`-specific coverage (the resource-binding ABI,
+        // the recognized address-computation shape) is checked in `emit`, which does receive
+        // `EmitOpts`, via `glcompute::check_module_glcompute`.
         match check_module(module) {
             Ok(()) => Support::Supported,
             Err(diag) => Support::Unsupported(diag.code),
         }
     }
 
-    fn emit(&self, module: &Module, _opts: &EmitOpts) -> Result<Artifact, Diag> {
+    fn emit(&self, module: &Module, opts: &EmitOpts) -> Result<Artifact, Diag> {
+        if glcompute::is_glcompute_variant(opts) {
+            return glcompute::emit_glcompute(module);
+        }
         check_module(module)?;
         let ssa_module = construct_ssa(module);
         let bytes = emit_module(&ssa_module);
         Ok(Artifact::bytes(ArtifactKind::SpirV, bytes))
     }
 }
+
+mod glcompute;
 
 #[cfg(test)]
 mod tests;

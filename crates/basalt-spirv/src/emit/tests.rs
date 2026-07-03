@@ -69,6 +69,404 @@ fn only_fn(m: &dr::Module) -> &dr::Function {
     &m.functions[0]
 }
 
+// ---- glcompute path -------------------------------------------------------------------------
+
+fn glcompute_opts() -> EmitOpts {
+    EmitOpts {
+        target_variant: Some("glcompute".to_string()),
+        ..EmitOpts::default()
+    }
+}
+
+fn emit_glcompute_bytes(module: &Module) -> Vec<u8> {
+    let artifact = Spirv
+        .emit(module, &glcompute_opts())
+        .expect("glcompute emit succeeds for a supported module");
+    artifact
+        .as_bytes()
+        .expect("the SPIR-V backend emits a bytes payload, never text")
+        .to_vec()
+}
+
+fn emit_and_parse_glcompute(module: &Module) -> dr::Module {
+    let bytes = emit_glcompute_bytes(module);
+    dr::load_bytes(&bytes)
+        .expect("this backend's glcompute output must parse back as well-formed SPIR-V")
+}
+
+/// Builds the exact four-instruction shape `basalt-sema`'s `lower_index_lvalue` produces for
+/// `base[index]` at `elem_ty` (see `emit/glcompute.rs`'s header): widen `index_param` (an `i32`
+/// parameter) to `i64`, multiply by `elem_ty`'s real byte size, add to `base_param` (a
+/// `Ty::Ptr(Global)` parameter). The four instructions land at `InstId`s `base_id..base_id + 4`;
+/// the last (`base_id + 3`) is the address a `Load`/`Store` should reference.
+fn index_addr_insts(base_id: u32, base_param: u32, index_param: u32, elem_ty: Ty) -> Vec<Inst> {
+    let i64t = Ty::Scalar(Scalar::I64);
+    let ptrt = Ty::Ptr(AddrSpace::Global);
+    let stride = match elem_ty {
+        Ty::Scalar(Scalar::I32 | Scalar::F32) => 4,
+        Ty::Scalar(Scalar::I64 | Scalar::F64) => 8,
+        _ => panic!("index_addr_insts only supports i32/i64/f32/f64 element types"),
+    };
+    vec![
+        Inst {
+            ty: i64t,
+            op: Op::Cast(
+                CastOp::Sext,
+                Ty::Scalar(Scalar::I32),
+                ValRef::Param(index_param),
+            ),
+        },
+        Inst {
+            ty: i64t,
+            op: Op::ConstInt(stride),
+        },
+        Inst {
+            ty: i64t,
+            op: Op::Bin(
+                BinOp::Mul,
+                ValRef::Val(InstId(base_id)),
+                ValRef::Val(InstId(base_id + 1)),
+            ),
+        },
+        Inst {
+            ty: ptrt,
+            op: Op::Bin(
+                BinOp::Add,
+                ValRef::Param(base_param),
+                ValRef::Val(InstId(base_id + 2)),
+            ),
+        },
+    ]
+}
+
+fn decoration_targets(
+    m: &dr::Module,
+    decoration: rspirv::spirv::Decoration,
+) -> Vec<(u32, Vec<dr::Operand>)> {
+    m.annotations
+        .iter()
+        .filter(|i| {
+            i.class.opcode == SOp::Decorate
+                && i.operands.get(1) == Some(&dr::Operand::Decoration(decoration))
+        })
+        .map(|i| {
+            let target = match i.operands[0] {
+                dr::Operand::IdRef(id) => id,
+                _ => unreachable!(),
+            };
+            (target, i.operands[2..].to_vec())
+        })
+        .collect()
+}
+
+/// `OpMemberDecorate` targets — a distinct opcode from `OpDecorate` (see `decoration_targets`),
+/// used for `Offset` (both storage-buffer and push-constant struct members).
+fn member_decoration_targets(
+    m: &dr::Module,
+    decoration: rspirv::spirv::Decoration,
+) -> Vec<(u32, u32, Vec<dr::Operand>)> {
+    m.annotations
+        .iter()
+        .filter(|i| {
+            i.class.opcode == SOp::MemberDecorate
+                && i.operands.get(2) == Some(&dr::Operand::Decoration(decoration))
+        })
+        .map(|i| {
+            let target = match i.operands[0] {
+                dr::Operand::IdRef(id) => id,
+                _ => unreachable!(),
+            };
+            let member = match i.operands[1] {
+                dr::Operand::LiteralBit32(n) => n,
+                _ => unreachable!(),
+            };
+            (target, member, i.operands[3..].to_vec())
+        })
+        .collect()
+}
+
+fn variables_with_storage_class(m: &dr::Module, class: rspirv::spirv::StorageClass) -> Vec<u32> {
+    m.types_global_values
+        .iter()
+        .filter(|i| {
+            i.class.opcode == SOp::Variable
+                && i.operands.first() == Some(&dr::Operand::StorageClass(class))
+        })
+        .map(|i| i.result_id.unwrap())
+        .collect()
+}
+
+#[test]
+fn glcompute_variant_none_and_other_strings_keep_the_kernel_path_byte_identical() {
+    let module = lower_vector_add();
+    let kernel_bytes = emit_bytes(&module);
+    let other_variant = Spirv
+        .emit(
+            &module,
+            &EmitOpts {
+                target_variant: Some("not-glcompute".to_string()),
+                ..EmitOpts::default()
+            },
+        )
+        .expect("emit succeeds")
+        .as_bytes()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        kernel_bytes, other_variant,
+        "only target_variant == Some(\"glcompute\") may change this backend's output"
+    );
+}
+
+#[test]
+fn glcompute_module_declares_shader_capability_logical_addressing_and_glsl450() {
+    let f = simple_fn("empty", vec![], vec![], Term::Ret(None));
+    let module = emit_and_parse_glcompute(&wrap(f));
+    let caps: Vec<_> = module
+        .capabilities
+        .iter()
+        .map(|i| match i.operands[0] {
+            dr::Operand::Capability(c) => c,
+            _ => unreachable!(),
+        })
+        .collect();
+    for want in [
+        rspirv::spirv::Capability::Shader,
+        rspirv::spirv::Capability::Int64,
+        rspirv::spirv::Capability::Float64,
+    ] {
+        assert!(caps.contains(&want), "missing capability {want:?}");
+    }
+    assert!(
+        !caps.contains(&rspirv::spirv::Capability::Kernel),
+        "glcompute must not declare the Kernel-path capability"
+    );
+    let mm = module
+        .memory_model
+        .expect("memory model instruction present");
+    assert_eq!(
+        mm.operands[0],
+        dr::Operand::AddressingModel(rspirv::spirv::AddressingModel::Logical)
+    );
+    assert_eq!(
+        mm.operands[1],
+        dr::Operand::MemoryModel(rspirv::spirv::MemoryModel::GLSL450)
+    );
+    assert_eq!(module.entry_points.len(), 1);
+    assert_eq!(
+        module.entry_points[0].operands[0],
+        dr::Operand::ExecutionModel(rspirv::spirv::ExecutionModel::GLCompute)
+    );
+}
+
+#[test]
+fn glcompute_resource_binding_abi_binds_pointers_in_order_and_packs_the_scalar_push_constant() {
+    let ptrt = Ty::Ptr(AddrSpace::Global);
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f32t = Ty::Scalar(Scalar::F32);
+    // params: (a: ptr, b: ptr, n: i32) — two storage-buffer bindings, one push-constant scalar.
+    let mut insts = index_addr_insts(0, 0, 2, f32t);
+    insts.push(Inst {
+        ty: f32t,
+        op: Op::Load {
+            ptr: ValRef::Val(InstId(3)),
+            space: AddrSpace::Global,
+            align: 4,
+            volatile: false,
+        },
+    });
+    insts.extend(index_addr_insts(5, 1, 2, f32t));
+    insts.push(Inst {
+        ty: f32t,
+        op: Op::Load {
+            ptr: ValRef::Val(InstId(8)),
+            space: AddrSpace::Global,
+            align: 4,
+            volatile: false,
+        },
+    });
+    let f = simple_fn(
+        "two_bindings",
+        vec![ptrt, ptrt, i32t],
+        insts,
+        Term::Ret(None),
+    );
+    let module = emit_and_parse_glcompute(&wrap(f));
+
+    let storage_vars = variables_with_storage_class(&module, rspirv::spirv::StorageClass::Uniform);
+    assert_eq!(
+        storage_vars.len(),
+        2,
+        "expected exactly two storage-buffer bindings"
+    );
+    let push_const_vars =
+        variables_with_storage_class(&module, rspirv::spirv::StorageClass::PushConstant);
+    assert_eq!(
+        push_const_vars.len(),
+        1,
+        "expected exactly one push-constant block"
+    );
+
+    let descriptor_sets = decoration_targets(&module, rspirv::spirv::Decoration::DescriptorSet);
+    for &var in &storage_vars {
+        let (_, ops) = descriptor_sets
+            .iter()
+            .find(|&&(t, _)| t == var)
+            .expect("every storage-buffer variable has a DescriptorSet decoration");
+        assert_eq!(ops[0], dr::Operand::LiteralBit32(0));
+    }
+    let bindings = decoration_targets(&module, rspirv::spirv::Decoration::Binding);
+    let mut binding_numbers: Vec<u32> = storage_vars
+        .iter()
+        .map(|&var| {
+            let (_, ops) = bindings.iter().find(|&&(t, _)| t == var).unwrap();
+            match ops[0] {
+                dr::Operand::LiteralBit32(n) => n,
+                _ => unreachable!(),
+            }
+        })
+        .collect();
+    binding_numbers.sort_unstable();
+    assert_eq!(
+        binding_numbers,
+        vec![0, 1],
+        "the two pointer parameters must be bound at 0 and 1, in declared order"
+    );
+
+    let array_strides = decoration_targets(&module, rspirv::spirv::Decoration::ArrayStride);
+    assert!(
+        array_strides
+            .iter()
+            .any(|(_, ops)| ops[0] == dr::Operand::LiteralBit32(4)),
+        "the f32 buffer element must be declared ArrayStride 4"
+    );
+    let offsets = member_decoration_targets(&module, rspirv::spirv::Decoration::Offset);
+    assert!(
+        offsets
+            .iter()
+            .any(|&(_, member, ref ops)| member == 0 && ops[0] == dr::Operand::LiteralBit32(0)),
+        "the push-constant scalar's one member must be packed at offset 0: {offsets:?}"
+    );
+}
+
+#[test]
+fn glcompute_recognizes_the_sema_index_shape_and_lowers_to_a_real_access_chain() {
+    let ptrt = Ty::Ptr(AddrSpace::Global);
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f32t = Ty::Scalar(Scalar::F32);
+    let mut insts = index_addr_insts(0, 0, 1, f32t);
+    insts.push(Inst {
+        ty: f32t,
+        op: Op::Load {
+            ptr: ValRef::Val(InstId(3)),
+            space: AddrSpace::Global,
+            align: 4,
+            volatile: false,
+        },
+    });
+    let f = simple_fn("recognized_load", vec![ptrt, i32t], insts, Term::Ret(None));
+    let module = wrap(f);
+    assert!(
+        Spirv.emit(&module, &glcompute_opts()).is_ok(),
+        "the exact shape basalt-sema's lower_index_lvalue produces must be recognized"
+    );
+    let parsed = emit_and_parse_glcompute(&module);
+    let ops = all_opcodes(only_fn(&parsed));
+    assert!(ops.contains(&SOp::AccessChain), "missing {ops:?}");
+    assert!(
+        !ops.contains(&SOp::ConvertUToPtr) && !ops.contains(&SOp::ConvertPtrToU),
+        "glcompute has no raw-address representation to convert to/from: {ops:?}"
+    );
+}
+
+#[test]
+fn glcompute_refuses_an_unrecognized_address_shape_not_a_guess() {
+    let ptrt = Ty::Ptr(AddrSpace::Global);
+    let f32t = Ty::Scalar(Scalar::F32);
+    // A bare parameter used directly as an address — no Bin::Add/Bin::Mul index computation at
+    // all. Perfectly fine under the Kernel path's raw-integer pointer model (`supports()` still
+    // reports this module as Supported); not a shape glcompute recognizes.
+    let f = simple_fn(
+        "bare_address",
+        vec![ptrt],
+        vec![Inst {
+            ty: f32t,
+            op: Op::Load {
+                ptr: ValRef::Param(0),
+                space: AddrSpace::Global,
+                align: 4,
+                volatile: false,
+            },
+        }],
+        Term::Ret(None),
+    );
+    let module = wrap(f);
+    assert_eq!(
+        Spirv.supports(&module),
+        Support::Supported,
+        "the Kernel path's own supports() is unaffected by glcompute-specific shape rules"
+    );
+    let err = Spirv
+        .emit(&module, &glcompute_opts())
+        .expect_err("an address that isn't the recognized Add(ptr_param, Mul(idx, stride)) shape must be refused, not guessed");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedFeature);
+}
+
+#[test]
+fn glcompute_refuses_a_pointer_parameter_after_a_scalar_parameter() {
+    let ptrt = Ty::Ptr(AddrSpace::Global);
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f = simple_fn("bad_order", vec![i32t, ptrt], vec![], Term::Ret(None));
+    let module = wrap(f);
+    let err = Spirv
+        .emit(&module, &glcompute_opts())
+        .expect_err("a pointer parameter after a scalar parameter breaks this ABI's push-constant/binding split");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedFeature);
+}
+
+#[test]
+fn glcompute_refuses_a_wrong_stride_not_a_guess() {
+    let ptrt = Ty::Ptr(AddrSpace::Global);
+    let i32t = Ty::Scalar(Scalar::I32);
+    let f32t = Ty::Scalar(Scalar::F32);
+    // Same shape as `index_addr_insts`, but the stride constant (8) does not match f32's real
+    // size (4) — a mismatch this backend must catch rather than trust.
+    let i64t = Ty::Scalar(Scalar::I64);
+    let insts = vec![
+        Inst {
+            ty: i64t,
+            op: Op::Cast(CastOp::Sext, i32t, ValRef::Param(1)),
+        },
+        Inst {
+            ty: i64t,
+            op: Op::ConstInt(8),
+        },
+        Inst {
+            ty: i64t,
+            op: Op::Bin(BinOp::Mul, ValRef::Val(InstId(0)), ValRef::Val(InstId(1))),
+        },
+        Inst {
+            ty: ptrt,
+            op: Op::Bin(BinOp::Add, ValRef::Param(0), ValRef::Val(InstId(2))),
+        },
+        Inst {
+            ty: f32t,
+            op: Op::Load {
+                ptr: ValRef::Val(InstId(3)),
+                space: AddrSpace::Global,
+                align: 4,
+                volatile: false,
+            },
+        },
+    ];
+    let f = simple_fn("wrong_stride", vec![ptrt, i32t], insts, Term::Ret(None));
+    let module = wrap(f);
+    let err = Spirv.emit(&module, &glcompute_opts()).expect_err(
+        "a stride constant that does not match the accessed type's real size must be refused",
+    );
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedFeature);
+}
+
 #[test]
 fn magic_number_and_header_are_well_formed() {
     let f = simple_fn("empty", vec![], vec![], Term::Ret(None));
@@ -856,5 +1254,59 @@ fn vector_add_emit_is_deterministic_through_the_real_pipeline() {
     let module = lower_vector_add();
     let a = emit_bytes(&module);
     let b = emit_bytes(&module);
+    assert_eq!(a, b);
+}
+
+// ---- real pipeline through the glcompute path, mirroring the two tests above ---------------
+
+#[test]
+fn vector_add_lowers_to_a_well_formed_glcompute_spirv_module_via_the_real_pipeline() {
+    let module = lower_vector_add();
+    let parsed = emit_and_parse_glcompute(&module);
+
+    assert_eq!(parsed.entry_points.len(), 1);
+    assert_eq!(
+        parsed.entry_points[0].operands[2],
+        dr::Operand::LiteralString("vector_add".to_string())
+    );
+    assert_eq!(
+        parsed.entry_points[0].operands[0],
+        dr::Operand::ExecutionModel(rspirv::spirv::ExecutionModel::GLCompute)
+    );
+
+    let storage_vars = variables_with_storage_class(&parsed, rspirv::spirv::StorageClass::Uniform);
+    assert_eq!(
+        storage_vars.len(),
+        3,
+        "vector_add's a/b/c pointer parameters must become three storage-buffer bindings"
+    );
+    let push_const_vars =
+        variables_with_storage_class(&parsed, rspirv::spirv::StorageClass::PushConstant);
+    assert_eq!(
+        push_const_vars.len(),
+        1,
+        "vector_add's n parameter must become the one push-constant block"
+    );
+
+    let ops = all_opcodes(only_fn(&parsed));
+    assert!(ops.contains(&SOp::AccessChain));
+    assert!(ops.contains(&SOp::Load));
+    assert!(ops.contains(&SOp::Store));
+    assert!(ops.contains(&SOp::IMul));
+    assert!(ops.contains(&SOp::IAdd));
+    assert!(ops.contains(&SOp::SLessThan));
+    assert!(ops.contains(&SOp::BranchConditional));
+    assert!(ops.contains(&SOp::FAdd));
+    assert!(
+        !ops.contains(&SOp::ConvertUToPtr) && !ops.contains(&SOp::ConvertPtrToU),
+        "the glcompute path has no raw-address representation, unlike the Kernel path: {ops:?}"
+    );
+}
+
+#[test]
+fn vector_add_glcompute_emit_is_deterministic_through_the_real_pipeline() {
+    let module = lower_vector_add();
+    let a = emit_glcompute_bytes(&module);
+    let b = emit_glcompute_bytes(&module);
     assert_eq!(a, b);
 }
