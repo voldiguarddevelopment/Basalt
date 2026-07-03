@@ -4,3 +4,15 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+basalt-bir = { path = "../basalt-bir" }
+basalt-backend = { path = "../basalt-backend" }
+basalt-diag = { path = "../basalt-diag" }
+melior = { version = "0.27.2", optional = true }
+
+[dev-dependencies]
+basalt-frontend-c = { path = "../basalt-frontend-c" }
+basalt-sema = { path = "../basalt-sema" }
+basalt-passes = { path = "../basalt-passes" }
+
+[features]
+mlir = ["dep:melior"]
