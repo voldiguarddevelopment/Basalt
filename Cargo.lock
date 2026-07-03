@@ -145,6 +145,7 @@ dependencies = [
  "basalt-diag",
  "basalt-frontend-c",
  "basalt-passes",
+ "basalt-runtime",
  "basalt-sema",
  "melior",
 ]

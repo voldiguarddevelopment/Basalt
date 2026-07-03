@@ -6,7 +6,11 @@
 // toolchain present. With the feature off this crate is empty.
 
 #[cfg(feature = "mlir")]
+mod emit;
+#[cfg(feature = "mlir")]
 mod lower;
 
+#[cfg(feature = "mlir")]
+pub use emit::emit_ptx_text;
 #[cfg(feature = "mlir")]
 pub use lower::{lower_module, lower_to_text};

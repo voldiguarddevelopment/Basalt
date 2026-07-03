@@ -155,6 +155,52 @@ $stdout_ra"
 
   echo "  oracle and regalloc agree: $name"
 
+  # MLIR/NVPTX lane, vector_add only: `basalt-mlir`'s own gpu/arith/memref/cf-through-mlir-opt
+  # NVPTX path (crates/basalt-mlir/src/emit.rs) is a second, independent way to reach real PTX
+  # for this exact kernel, JIT-loaded and launched on real hardware via basalt-runtime's CUDA
+  # driver loader (crates/basalt-mlir/tests/nvptx_gpu_proof.rs), exactly as basalt-ptx's own
+  # hand-rolled path already is in ptx_gpu_proof.rs. Unlike stress's single-float comparison
+  # below, vector_add's own oracle check (examples/cpu_launch_vadd.c, captured above in
+  # $actual) compares 1024 elements one at a time, which is not practical to re-diff at the
+  # shell level here — nvptx_gpu_proof.rs instead re-derives the identical reference (the same
+  # a[i]=i / b[i]=i*2 generator and the same a[i]+b[i] equality, bit-exact, no ULP tolerance)
+  # and checks it itself; this lane's job is only to confirm that check actually ran and
+  # passed, or cleanly self-skipped, never to fail the default run when the toolchain or
+  # hardware is absent. This lane needs `mlir-opt` on PATH (installed only alongside a real
+  # LLVM/MLIR 22.1.6 toolchain build) plus `--features mlir` buildable plus a working CUDA
+  # driver and device; any of those missing is a clean skip. Note: an earlier draft of this
+  # lane assumed `mlir-translate`/`llc` would also be needed, mirroring basalt-llvm's own
+  # TargetMachine finish; `emit.rs`'s own module header documents why that assumption did not
+  # hold on the real toolchain (`-gpu-module-to-binary` reaches the identical NVPTX backend
+  # from inside `mlir-opt` itself), so only `mlir-opt`'s presence is checked below.
+  if [ "$name" = "vector_add" ]; then
+    if ! command -v mlir-opt >/dev/null 2>&1; then
+      echo "  skip: mlir-nvptx (no mlir-opt — --features mlir's toolchain is not installed here)"
+    elif ! cargo build --locked --quiet --features mlir -p basalt-mlir 2>"$tmpdir/$name.mlirbuild.log"; then
+      echo "  skip: mlir-nvptx (--features mlir build failed)"
+      sed 's/^/    /' "$tmpdir/$name.mlirbuild.log"
+    else
+      mlir_test_out="$tmpdir/$name.mlir-nvptx.out"
+      if cargo test --locked --quiet --features mlir -p basalt-mlir --test nvptx_gpu_proof \
+        -- --nocapture >"$mlir_test_out" 2>&1; then
+        if grep -q "^PASS: vector_add via basalt-mlir's NVPTX lane" "$mlir_test_out"; then
+          echo "  mlir-nvptx matches oracle: $name ($(grep '^PASS:' "$mlir_test_out"))"
+        elif grep -q "skipping vector_add_via_mlir_nvptx_runs_on_real_hardware" "$mlir_test_out"; then
+          skip_reason="$(grep -o 'skipping vector_add_via_mlir_nvptx_runs_on_real_hardware:.*' "$mlir_test_out" | head -1)"
+          echo "  skip: mlir-nvptx ($skip_reason)"
+        else
+          echo "  FAIL: mlir-nvptx test exited 0 but produced neither a PASS nor a recognized skip line:" >&2
+          sed 's/^/    /' "$mlir_test_out" >&2
+          fail=1
+        fi
+      else
+        echo "  FAIL: mlir-nvptx test (cargo test -p basalt-mlir --test nvptx_gpu_proof) failed:" >&2
+        sed 's/^/    /' "$mlir_test_out" >&2
+        fail=1
+      fi
+    fi
+  fi
+
   # AMDGCN-via-emulator lanes, stress only: two independent backends can turn this kernel into
   # a real RDNA3 artifact — the LLVM backend's AMDGCN object-emission path (`--llvm
   # --amdgpu-bin`) and the hand-rolled `basalt-amdgpu` backend (plain `--amdgpu-bin`, the "no

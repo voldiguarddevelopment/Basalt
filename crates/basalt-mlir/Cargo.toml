@@ -13,6 +13,7 @@ melior = { version = "0.27.2", optional = true }
 basalt-frontend-c = { path = "../basalt-frontend-c" }
 basalt-sema = { path = "../basalt-sema" }
 basalt-passes = { path = "../basalt-passes" }
+basalt-runtime = { path = "../basalt-runtime" }
 
 [features]
 mlir = ["dep:melior"]
