@@ -646,6 +646,7 @@ fn rebuild(f: &Function, plans: &[HoistPlan], owner: &[Option<BlockId>]) -> Func
 
     Function {
         name: f.name.clone(),
+        is_kernel: f.is_kernel,
         params: f.params.clone(),
         ret: f.ret,
         blocks: final_blocks,
@@ -666,6 +667,7 @@ mod tests {
     fn func(name: &str, params: Vec<Ty>, blocks: Vec<Block>, insts: Vec<Inst>) -> Function {
         Function {
             name: name.to_string(),
+            is_kernel: true,
             params,
             ret: Ty::Void,
             blocks,

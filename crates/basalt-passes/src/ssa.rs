@@ -713,6 +713,7 @@ impl<'a> Ctx<'a> {
 
         Function {
             name: f.name.clone(),
+            is_kernel: f.is_kernel,
             params: f.params.clone(),
             ret: f.ret,
             blocks: new_blocks,

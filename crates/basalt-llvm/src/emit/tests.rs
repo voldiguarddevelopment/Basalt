@@ -29,6 +29,7 @@ fn wrap(f: Function) -> Module {
 fn add_i32_module() -> Module {
     let i32t = Ty::Scalar(Scalar::I32);
     wrap(Function {
+        is_kernel: true,
         name: "add_i32".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -106,6 +107,7 @@ fn emit_object_runs_module_verify_before_codegen() {
     // than papering over it and handing an unverified/incomplete module to a TargetMachine.
     let vecty = Ty::Vec(Scalar::F32, 4);
     let f = Function {
+        is_kernel: true,
         name: "usesvec".into(),
         params: vec![vecty],
         ret: Ty::Void,
@@ -141,6 +143,7 @@ fn llvm_amdgcn_backend_supports_and_emits_a_trivial_module() {
 fn llvm_amdgcn_backend_refuses_mma_cleanly() {
     let ptr_global = Ty::Ptr(AddrSpace::Global);
     let module = wrap(Function {
+        is_kernel: true,
         name: "usesmma".into(),
         params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
         ret: Ty::Void,
@@ -209,6 +212,7 @@ fn nvptx_canonical_wmma_produces_real_wmma_ptx_mnemonics() {
     let ptr_global = basalt_bir::AddrSpace::Global;
     let ptrt = Ty::Ptr(ptr_global);
     let module = wrap(Function {
+        is_kernel: true,
         name: "matmul_tile".into(),
         params: vec![ptrt, ptrt, ptrt, ptrt],
         ret: Ty::Void,

@@ -449,6 +449,10 @@ pub(crate) fn check_module(module: &Module) -> Result<(), Diag> {
         ));
     }
     let f = &module.funcs[0];
+    if !f.is_kernel {
+        return Err(Diag::new(ECode::UnsupportedOp)
+            .with_arg("host/non-kernel function compilation is not yet implemented"));
+    }
     if ty_has_f16(f.ret) {
         return Err(f16_refusal("return type"));
     }

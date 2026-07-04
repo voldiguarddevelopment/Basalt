@@ -183,6 +183,7 @@ fn load_and_store_on_the_same_pointer_param_refuses() {
         },
     ];
     let f = Function {
+        is_kernel: true,
         name: "inplace".into(),
         params: vec![ptrt],
         ret: Ty::Void,
@@ -203,6 +204,7 @@ fn load_and_store_on_the_same_pointer_param_refuses() {
 fn a_kernel_with_no_pointer_params_still_fissions_with_no_channels() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "scalar_only".into(),
         params: vec![i32t],
         ret: Ty::Void,

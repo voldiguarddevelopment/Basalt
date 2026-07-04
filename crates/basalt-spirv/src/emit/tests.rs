@@ -31,6 +31,7 @@ fn wrap(f: Function) -> Module {
 fn simple_fn(name: &str, params: Vec<Ty>, insts: Vec<Inst>, term: Term) -> Function {
     let ids = (0..insts.len() as u32).map(InstId).collect();
     Function {
+        is_kernel: true,
         name: name.into(),
         params,
         ret: Ty::Void,
@@ -889,6 +890,7 @@ fn if_then_emits_selection_merge_and_branch_conditional() {
         },
     ];
     let f = Function {
+        is_kernel: true,
         name: "guarded".into(),
         params: vec![i32t, i32t],
         ret: Ty::Void,
@@ -941,6 +943,7 @@ fn if_else_phi_resolves_via_a_real_op_phi() {
         },
     ];
     let f = Function {
+        is_kernel: true,
         name: "phi_fn".into(),
         params: vec![i32t, i32t],
         ret: Ty::Void,
@@ -974,6 +977,7 @@ fn if_else_phi_resolves_via_a_real_op_phi() {
 fn switch_is_refused_not_guessed() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "hasswitch".into(),
         params: vec![i32t],
         ret: Ty::Void,
@@ -999,6 +1003,7 @@ fn switch_is_refused_not_guessed() {
 #[test]
 fn a_back_edge_loop_is_refused_not_guessed() {
     let f = Function {
+        is_kernel: true,
         name: "hasloop".into(),
         params: vec![],
         ret: Ty::Void,
@@ -1019,6 +1024,7 @@ fn a_back_edge_loop_is_refused_not_guessed() {
 fn non_reconverging_branch_arms_are_refused_not_guessed() {
     let i1t = Ty::Scalar(Scalar::I1);
     let f = Function {
+        is_kernel: true,
         name: "divergent".into(),
         params: vec![i1t],
         ret: Ty::Void,
@@ -1165,6 +1171,35 @@ fn mma_is_refused_not_guessed() {
         .emit(&module, &EmitOpts::default())
         .expect_err("emit must refuse what supports() refuses, not guess");
     assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
+}
+
+#[test]
+fn non_kernel_function_is_refused_not_silently_emitted_as_an_entry_point() {
+    // The live gap this test guards: every function in a module becomes its own
+    // `OpEntryPoint` (see `emit_module`), so a non-kernel function must be refused rather
+    // than silently miscompiled as a launchable one.
+    let mut f = simple_fn("host_fn", vec![], vec![], Term::Ret(None));
+    f.is_kernel = false;
+    let module = wrap(f);
+    assert_eq!(
+        Spirv.supports(&module),
+        Support::Unsupported(basalt_diag::ECode::UnsupportedFeature)
+    );
+    let err = Spirv
+        .emit(&module, &EmitOpts::default())
+        .expect_err("emit must refuse what supports() refuses, not guess");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedFeature);
+}
+
+#[test]
+fn glcompute_refuses_a_non_kernel_function_too() {
+    let mut f = simple_fn("host_fn", vec![], vec![], Term::Ret(None));
+    f.is_kernel = false;
+    let module = wrap(f);
+    let err = Spirv
+        .emit(&module, &glcompute_opts())
+        .expect_err("glcompute must refuse a non-kernel function, not guess");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedFeature);
 }
 
 #[test]

@@ -20,6 +20,7 @@ fn wrap(f: Function) -> Module {
 fn simple_fn(name: &str, params: Vec<Ty>, insts: Vec<Inst>, term: Term) -> Function {
     let ids = (0..insts.len() as u32).map(InstId).collect();
     Function {
+        is_kernel: true,
         name: name.into(),
         params,
         ret: Ty::Void,
@@ -585,6 +586,7 @@ fn phi_resolves_via_a_mov_per_predecessor_edge() {
         },
     ];
     let f = Function {
+        is_kernel: true,
         name: "phi_fn".into(),
         params: vec![i32t],
         ret: Ty::Void,
@@ -680,6 +682,24 @@ fn mma_is_refused_not_guessed() {
         .emit(&module, &EmitOpts::default())
         .expect_err("emit must refuse what supports() refuses, not guess");
     assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
+}
+
+#[test]
+fn non_kernel_function_is_refused_not_silently_emitted_as_a_kernel() {
+    // The live gap this test guards: every function in a module is emitted as its own
+    // `.visible .entry` kernel (see `emit_module`), so a non-kernel function must be refused
+    // rather than silently miscompiled as a launchable one.
+    let mut f = simple_fn("host_fn", vec![], vec![], Term::Ret(None));
+    f.is_kernel = false;
+    let module = wrap(f);
+    assert_eq!(
+        Ptx.supports(&module),
+        Support::Unsupported(basalt_diag::ECode::UnsupportedFeature)
+    );
+    let err = Ptx
+        .emit(&module, &EmitOpts::default())
+        .expect_err("emit must refuse what supports() refuses, not guess");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedFeature);
 }
 
 #[test]

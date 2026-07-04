@@ -438,9 +438,19 @@ pub struct Block {
 
 /// A function: typed params, a return type, and the block/instruction arenas that make up
 /// its body. Block 0 is the entry block.
+///
+/// `is_kernel` is `true` for a function that originated from a `__global__`-qualified
+/// declaration (a real, launchable GPU entry point) and `false` for everything else — plain,
+/// `__host__`, `__device__`, or `__host__ __device__` functions are never launchable, even
+/// though today's frontends only ever lower a `__global__` body into BIR. This is a genuine
+/// BIR-level barrier, not a backend concern: a hand-rolled GPU backend that iterates every
+/// function in a module must not treat a non-kernel one as a second entry point (see
+/// `print.rs`/`parse.rs` for the textual spelling, and each backend's own `check_module` for
+/// the refusal this field exists to make possible).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
+    pub is_kernel: bool,
     pub params: Vec<Ty>,
     pub ret: Ty,
     pub blocks: Vec<Block>,

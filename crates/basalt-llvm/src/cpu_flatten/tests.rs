@@ -23,6 +23,7 @@ fn tidx_bump_module() -> Module {
     let i32t = I32;
     let ptrt = Ty::Ptr(AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "bump".into(),
         params: vec![ptrt],
         ret: Ty::Void,
@@ -68,6 +69,7 @@ fn tidx_bump_module() -> Module {
 fn a_module_with_no_gpu_index_op_is_not_flagged_for_flattening() {
     let i32t = I32;
     let f = Function {
+        is_kernel: true,
         name: "add_i32".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -106,6 +108,7 @@ fn tid_x_module_is_flagged_and_flattens_to_a_loop_with_a_trailing_nthreads_param
 fn non_void_return_is_refused_not_guessed_at() {
     let i32t = I32;
     let f = Function {
+        is_kernel: true,
         name: "usestid".into(),
         params: vec![],
         ret: i32t,
@@ -127,6 +130,7 @@ fn non_void_return_is_refused_not_guessed_at() {
 fn warp_collective_op_is_refused_not_guessed_at() {
     let i32t = I32;
     let f = Function {
+        is_kernel: true,
         name: "usesshuffle".into(),
         params: vec![i32t, i32t],
         ret: Ty::Void,

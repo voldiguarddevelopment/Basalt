@@ -477,8 +477,18 @@ fn check_no_mma(inst: &Inst) -> Result<(), Diag> {
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
 /// `emit()`. Run once, on the module as originally handed in — `construct_ssa` never introduces
 /// an op/type shape this pass didn't already see, so re-checking after it would be redundant.
+///
+/// Every function in the module is emitted as its own `.visible .entry` kernel (see
+/// `emit_module`), so a non-kernel function (`is_kernel == false` — a plain/`__host__`/
+/// `__device__` function) has no honest lowering here yet: nothing distinguishes a real
+/// `__global__` kernel from a host-side helper function that happened to be lowered into the
+/// same module. Refuse rather than silently emitting the latter as if it were launchable.
 fn check_module(module: &Module) -> Result<(), Diag> {
     for f in &module.funcs {
+        if !f.is_kernel {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("host/non-kernel function compilation is not yet implemented"));
+        }
         if ty_has_f16(f.ret) {
             return Err(f16_refusal());
         }

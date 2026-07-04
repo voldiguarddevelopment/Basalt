@@ -46,6 +46,7 @@ impl FnB {
             "fixture bug: last block never closed with a terminator"
         );
         Function {
+            is_kernel: true,
             name: name.to_string(),
             params,
             ret,

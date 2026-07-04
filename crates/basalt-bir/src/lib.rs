@@ -24,7 +24,9 @@
 //              "shared_mem_bytes" int
 //              "target_dtypes" scalar_ty*
 //
-// func      := "func" "@" ident "(" (ty ("," ty)*)? ")" "->" ty "{" block+ "}"
+// func      := ["host"] "func" "@" ident "(" (ty ("," ty)*)? ")" "->" ty "{" block+ "}"
+//              ; bare "func" (no "host") is a kernel (`is_kernel = true`); "host func" is a
+//              ; non-kernel function (`is_kernel = false`) — see `ir::Function`'s own doc.
 // block     := "bb" int ":" inst* term
 //
 // inst      := ["%" int "="] opcode ...

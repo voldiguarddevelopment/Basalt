@@ -433,6 +433,10 @@ fn resolve_binding_elem_tys(
 /// `emit_glcompute`) and by tests that want to assert a refusal without touching codegen.
 pub(super) fn check_module_glcompute(module: &Module) -> Result<(), Diag> {
     for f in &module.funcs {
+        if !f.is_kernel {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("host/non-kernel function compilation is not yet implemented"));
+        }
         let layout = resource_layout(&f.params)?;
         for inst in &f.insts {
             check_inst(inst)?;

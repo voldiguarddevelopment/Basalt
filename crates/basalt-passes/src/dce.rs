@@ -399,6 +399,7 @@ fn eliminate_dead_code_fn(f: &Function) -> Function {
 
     Function {
         name: f.name.clone(),
+        is_kernel: f.is_kernel,
         params: f.params.clone(),
         ret: f.ret,
         blocks: new_blocks,

@@ -345,7 +345,7 @@ impl<'a> Parser<'a> {
         }
 
         let mut funcs = Vec::new();
-        while self.peek_word() == Some("func") {
+        while matches!(self.peek_word(), Some("func") | Some("host")) {
             funcs.push(self.parse_func()?);
         }
 
@@ -365,7 +365,17 @@ impl<'a> Parser<'a> {
         self.expect_tok(Tok::Eq)
     }
 
+    /// A function's own `is_kernel` marker is spelled as an optional `host` keyword
+    /// immediately before `func`: bare `func` means `is_kernel = true` (every function BIR has
+    /// ever printed before this field existed was a kernel, so this default keeps every prior
+    /// `.bir` fixture parsing unchanged), `host func` means `is_kernel = false`.
     fn parse_func(&mut self) -> Result<Function, ParseError> {
+        let is_kernel = if self.peek_word() == Some("host") {
+            self.bump();
+            false
+        } else {
+            true
+        };
         self.expect_kw("func")?;
         let name_word = self.word()?;
         let name = name_word
@@ -402,6 +412,7 @@ impl<'a> Parser<'a> {
 
         Ok(Function {
             name,
+            is_kernel,
             params,
             ret,
             blocks,

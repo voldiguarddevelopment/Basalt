@@ -176,6 +176,10 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
             .with_arg("multi-function module: ElfObjectSpec names exactly one symbol"));
     }
     let f = &module.funcs[0];
+    if !f.is_kernel {
+        return Err(Diag::new(ECode::UnsupportedFeature)
+            .with_arg("host/non-kernel function compilation is not yet implemented"));
+    }
 
     if matches!(f.ret, Ty::Vec(..)) {
         return Err(Diag::new(ECode::UnsupportedType).with_arg("vector-typed return value"));
@@ -1614,6 +1618,7 @@ mod tests {
     /// ```
     fn func_ret_const() -> Function {
         Function {
+            is_kernel: true,
             name: "ret_const".into(),
             params: vec![],
             ret: Ty::Scalar(Scalar::I32),
@@ -1643,6 +1648,7 @@ mod tests {
     /// ```
     fn func_add_i32() -> Function {
         Function {
+            is_kernel: true,
             name: "add_i32".into(),
             params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
             ret: Ty::Scalar(Scalar::I32),
@@ -1672,6 +1678,7 @@ mod tests {
     /// ```
     fn func_max_i32() -> Function {
         Function {
+            is_kernel: true,
             name: "max_i32".into(),
             params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
             ret: Ty::Scalar(Scalar::I32),
@@ -1708,6 +1715,7 @@ mod tests {
     /// the thread index" case).
     fn func_write_idx() -> Function {
         Function {
+            is_kernel: true,
             name: "write_idx".into(),
             params: vec![Ty::Ptr(AddrSpace::Global)],
             ret: Ty::Void,
@@ -1771,6 +1779,7 @@ mod tests {
     fn func_mma2x2() -> Function {
         let ptr_global = Ty::Ptr(AddrSpace::Global);
         Function {
+            is_kernel: true,
             name: "mma2x2".into(),
             params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
             ret: Ty::Void,
@@ -1803,6 +1812,7 @@ mod tests {
     fn func_mma_i8_i32_colmajor_a() -> Function {
         let ptr_global = Ty::Ptr(AddrSpace::Global);
         Function {
+            is_kernel: true,
             name: "mma_i8i32".into(),
             params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
             ret: Ty::Void,
@@ -1929,6 +1939,7 @@ mod tests {
     #[test]
     fn refuses_shuffle_with_e090() {
         let f = Function {
+            is_kernel: true,
             name: "shuf".into(),
             params: vec![Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -1959,6 +1970,7 @@ mod tests {
             Op::VoteAll(ValRef::Param(0)),
         ] {
             let f = Function {
+                is_kernel: true,
                 name: "vote".into(),
                 params: vec![Ty::Scalar(Scalar::I1)],
                 ret: Ty::Void,
@@ -1981,6 +1993,7 @@ mod tests {
     #[test]
     fn refuses_vector_result_with_e091() {
         let f = Function {
+            is_kernel: true,
             name: "vecty".into(),
             params: vec![],
             ret: Ty::Void,
@@ -2002,6 +2015,7 @@ mod tests {
     #[test]
     fn refuses_vector_return_with_e091() {
         let f = Function {
+            is_kernel: true,
             name: "vecret".into(),
             params: vec![],
             ret: Ty::Vec(Scalar::I32, 4),
@@ -2032,9 +2046,20 @@ mod tests {
     }
 
     #[test]
+    fn refuses_non_kernel_function_with_e093() {
+        let mut f = func_ret_const();
+        f.is_kernel = false;
+        assert_eq!(
+            X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
     fn refuses_too_many_integer_params_with_e093() {
         // 6 integer-class params leaves no register for the trailing `nthreads` argument.
         let f = Function {
+            is_kernel: true,
             name: "toomany".into(),
             params: vec![Ty::Scalar(Scalar::I32); 6],
             ret: Ty::Void,
@@ -2053,6 +2078,7 @@ mod tests {
     #[test]
     fn refuses_f16_arithmetic_with_e091() {
         let f = Function {
+            is_kernel: true,
             name: "halfty".into(),
             params: vec![],
             ret: Ty::Void,
@@ -2142,6 +2168,7 @@ mod tests {
     #[test]
     fn emit_refuses_what_supports_refuses() {
         let f = Function {
+            is_kernel: true,
             name: "shuf".into(),
             params: vec![Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,

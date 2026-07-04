@@ -631,7 +631,7 @@ impl Lowerer {
         };
         self.scopes.declare_value(&f.name, ValueSym::Func(sig));
         if let Some(body) = &f.body {
-            self.lower_function_body(f, ret, &param_tys, body);
+            self.lower_function_body(f, ret, &param_tys, body, f.cuda_quals.is_global);
         }
     }
 
@@ -808,7 +808,14 @@ impl Lowerer {
 // ---- Lowerer: function bodies, blocks, and the stack-slot bookkeeping ----------------------
 
 impl Lowerer {
-    fn lower_function_body(&mut self, f: &FunctionDecl, ret: Ty, param_tys: &[Ty], body: &[Stmt]) {
+    fn lower_function_body(
+        &mut self,
+        f: &FunctionDecl,
+        ret: Ty,
+        param_tys: &[Ty],
+        body: &[Stmt],
+        is_kernel: bool,
+    ) {
         self.insts = Vec::new();
         self.blocks = Vec::new();
         self.insts_by_block = HashMap::new();
@@ -872,6 +879,7 @@ impl Lowerer {
 
         let func = BFunction {
             name,
+            is_kernel,
             params: bir_params,
             ret: to_bir_ty(&ret),
             blocks,

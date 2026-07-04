@@ -160,6 +160,10 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
             .with_arg("multi-function module: ElfObjectSpec names exactly one symbol"));
     }
     let f = &module.funcs[0];
+    if !f.is_kernel {
+        return Err(Diag::new(ECode::UnsupportedFeature)
+            .with_arg("host/non-kernel function compilation is not yet implemented"));
+    }
 
     if matches!(f.ret, Ty::Vec(..)) {
         return Err(Diag::new(ECode::UnsupportedType).with_arg("vector-typed return value"));
@@ -1571,6 +1575,7 @@ mod tests {
 
     fn func_ret_const() -> Function {
         Function {
+            is_kernel: true,
             name: "ret_const".into(),
             params: vec![],
             ret: Ty::Scalar(Scalar::I32),
@@ -1587,6 +1592,7 @@ mod tests {
 
     fn func_add_i32() -> Function {
         Function {
+            is_kernel: true,
             name: "add_i32".into(),
             params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
             ret: Ty::Scalar(Scalar::I32),
@@ -1603,6 +1609,7 @@ mod tests {
 
     fn func_max_i32() -> Function {
         Function {
+            is_kernel: true,
             name: "max_i32".into(),
             params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
             ret: Ty::Scalar(Scalar::I32),
@@ -1637,6 +1644,7 @@ mod tests {
     /// pointer arithmetic, and a `global` store, all inside the per-thread loop.
     fn func_write_idx() -> Function {
         Function {
+            is_kernel: true,
             name: "write_idx".into(),
             params: vec![Ty::Ptr(AddrSpace::Global)],
             ret: Ty::Void,
@@ -1692,6 +1700,7 @@ mod tests {
         let i32t = Ty::Scalar(Scalar::I32);
         let f32t = Ty::Scalar(Scalar::F32);
         Function {
+            is_kernel: true,
             name: "vector_add".into(),
             params: vec![ptr_g, ptr_g, ptr_g, i32t],
             ret: Ty::Void,
@@ -1767,6 +1776,7 @@ mod tests {
 
     fn func_f64_scope_cut() -> Function {
         Function {
+            is_kernel: true,
             name: "f64_add".into(),
             params: vec![Ty::Scalar(Scalar::F64), Ty::Scalar(Scalar::F64)],
             ret: Ty::Scalar(Scalar::F64),
@@ -1801,6 +1811,7 @@ mod tests {
     #[test]
     fn refuses_mma_with_e099() {
         let f = Function {
+            is_kernel: true,
             name: "mma".into(),
             params: vec![Ty::Ptr(AddrSpace::Global); 4],
             ret: Ty::Void,
@@ -1834,6 +1845,7 @@ mod tests {
     #[test]
     fn refuses_shuffle_with_e090() {
         let f = Function {
+            is_kernel: true,
             name: "shuf".into(),
             params: vec![Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -1871,9 +1883,20 @@ mod tests {
     }
 
     #[test]
+    fn refuses_non_kernel_function_with_e093() {
+        let mut f = func_ret_const();
+        f.is_kernel = false;
+        assert_eq!(
+            Rv32.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
     fn refuses_too_many_integer_params_with_e093() {
         // 8 i32 params leaves no register for the trailing nthreads argument.
         let f = Function {
+            is_kernel: true,
             name: "toomany".into(),
             params: vec![Ty::Scalar(Scalar::I32); 8],
             ret: Ty::Void,
@@ -1933,6 +1956,7 @@ mod tests {
     #[test]
     fn emit_refuses_what_supports_refuses() {
         let f = Function {
+            is_kernel: true,
             name: "shuf".into(),
             params: vec![Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -1993,6 +2017,7 @@ mod tests {
             BinOp::Xor,
         ] {
             let f = Function {
+                is_kernel: true,
                 name: "i64bin".into(),
                 params: vec![i64t, i64t],
                 ret: i64t,
@@ -2018,6 +2043,7 @@ mod tests {
         let i64t = Ty::Scalar(Scalar::I64);
         for op in [BinOp::Shl, BinOp::Lshr, BinOp::Ashr, BinOp::Div, BinOp::Rem] {
             let f = Function {
+                is_kernel: true,
                 name: "i64shift".into(),
                 params: vec![i64t, i64t],
                 ret: i64t,

@@ -1263,7 +1263,11 @@ fn check_module(module: &Module) -> Result<(), Diag> {
     if module.funcs.len() != 1 {
         return Err(e_feature());
     }
-    check_function(&module.funcs[0])
+    let f = &module.funcs[0];
+    if !f.is_kernel {
+        return Err(e_feature());
+    }
+    check_function(f)
 }
 
 // ---- code generation --------------------------------------------------------------------------
@@ -2753,6 +2757,7 @@ mod tests {
     /// this backend's declared scope.
     fn func_store_const() -> Function {
         Function {
+            is_kernel: true,
             name: "store_const".into(),
             params: vec![Ty::Ptr(AddrSpace::Global)],
             ret: Ty::Void,
@@ -2784,6 +2789,7 @@ mod tests {
     /// merging both arms, exercising `CondBr`/`Phi`/`Br` together.
     fn func_branch_with_phi() -> Function {
         Function {
+            is_kernel: true,
             name: "branch_phi".into(),
             params: vec![Ty::Ptr(AddrSpace::Global), Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -2966,6 +2972,7 @@ mod tests {
     #[test]
     fn refuses_i8_type_with_e091() {
         let f = Function {
+            is_kernel: true,
             name: "i8_val".into(),
             params: vec![Ty::Scalar(Scalar::I8)],
             ret: Ty::Void,
@@ -2984,6 +2991,7 @@ mod tests {
     #[test]
     fn refuses_integer_div_with_e093() {
         let f = Function {
+            is_kernel: true,
             name: "idiv".into(),
             params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
             ret: Ty::Scalar(Scalar::I32),
@@ -3015,6 +3023,7 @@ mod tests {
             Op::VoteAll(ValRef::Param(0)),
         ] {
             let f = Function {
+                is_kernel: true,
                 name: "warp_op".into(),
                 params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
                 ret: Ty::Void,
@@ -3037,6 +3046,7 @@ mod tests {
     #[test]
     fn refuses_atomic_cas_with_e093() {
         let f = Function {
+            is_kernel: true,
             name: "cas".into(),
             params: vec![
                 Ty::Ptr(AddrSpace::Global),
@@ -3067,6 +3077,7 @@ mod tests {
     #[test]
     fn refuses_switch_terminator_with_e093() {
         let f = Function {
+            is_kernel: true,
             name: "sw".into(),
             params: vec![Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -3095,6 +3106,7 @@ mod tests {
         // parameter, so the refusal under test is `Load`'s own space check, not some earlier,
         // unrelated one.
         let f = Function {
+            is_kernel: true,
             name: "param_load".into(),
             params: vec![Ty::Ptr(AddrSpace::Param)],
             ret: Ty::Scalar(Scalar::I32),
@@ -3129,6 +3141,7 @@ mod tests {
             Op::GdimZ,
         ] {
             let f = Function {
+                is_kernel: true,
                 name: "dims".into(),
                 params: vec![],
                 ret: Ty::Scalar(Scalar::I32),
@@ -3163,8 +3176,19 @@ mod tests {
     }
 
     #[test]
+    fn refuses_non_kernel_function_with_e093() {
+        let mut f = func_store_const();
+        f.is_kernel = false;
+        assert_eq!(
+            Amdgcn.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
     fn refuses_mma_with_e099() {
         let f = Function {
+            is_kernel: true,
             name: "mma".into(),
             params: vec![Ty::Ptr(AddrSpace::Global); 4],
             ret: Ty::Void,
@@ -3200,6 +3224,7 @@ mod tests {
     /// generalized to two runtime values rather than one compile-time constant).
     fn func_wide_mul() -> Function {
         Function {
+            is_kernel: true,
             name: "wide_mul".into(),
             params: vec![Ty::Scalar(Scalar::I64), Ty::Scalar(Scalar::I64)],
             ret: Ty::Scalar(Scalar::I64),
@@ -3230,6 +3255,7 @@ mod tests {
     #[test]
     fn uniform_param_gets_sgpr_home_and_divergent_tid_gets_vgpr_home() {
         let f = Function {
+            is_kernel: true,
             name: "mix".into(),
             params: vec![Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -3267,6 +3293,7 @@ mod tests {
     #[test]
     fn uniform_bin_of_two_uniform_params_gets_sgpr_home_and_lowers_deterministically() {
         let f = Function {
+            is_kernel: true,
             name: "uniform_add".into(),
             params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
             ret: Ty::Scalar(Scalar::I32),
@@ -3310,6 +3337,7 @@ mod tests {
     #[test]
     fn bidx_is_homed_at_its_fixed_preloaded_sgpr() {
         let f = Function {
+            is_kernel: true,
             name: "bidx".into(),
             params: vec![],
             ret: Ty::Scalar(Scalar::I32),
@@ -3350,6 +3378,7 @@ mod tests {
     /// `Term::CondBr`'s scalar-branch form (`s_cmp`/`s_cbranch_scc1`) instead of the `vcc` one.
     fn func_uniform_branch_with_phi() -> Function {
         Function {
+            is_kernel: true,
             name: "uniform_branch".into(),
             params: vec![Ty::Ptr(AddrSpace::Global), Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,
@@ -3444,6 +3473,7 @@ mod tests {
     /// of them are Sgpr-homed.
     fn func_select_divergent_cond_uniform_results() -> Function {
         Function {
+            is_kernel: true,
             name: "select_fallback".into(),
             params: vec![Ty::Ptr(AddrSpace::Global), Ty::Scalar(Scalar::I32)],
             ret: Ty::Void,

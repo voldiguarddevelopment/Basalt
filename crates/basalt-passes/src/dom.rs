@@ -280,6 +280,7 @@ mod tests {
 
     fn func(blocks: Vec<basalt_bir::Block>, insts: Vec<Inst>) -> Function {
         Function {
+            is_kernel: true,
             name: "f".to_string(),
             params: Vec::new(),
             ret: Ty::Void,

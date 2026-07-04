@@ -337,8 +337,17 @@ fn check_cfg(f: &Function) -> Result<(), Diag> {
 
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
 /// `emit()` — see `basalt-ptx/src/emit.rs`'s identically-named function for why this matters.
+///
+/// Every function in the module becomes its own `OpEntryPoint` (see `emit_module`), exactly
+/// like `basalt-ptx`'s one-kernel-per-function stance — so a non-kernel function has the same
+/// live gap `basalt-ptx`'s own header documents: nothing here yet distinguishes a real
+/// `__global__` kernel from a host-side function that landed in the same module.
 fn check_module(module: &Module) -> Result<(), Diag> {
     for f in &module.funcs {
+        if !f.is_kernel {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("host/non-kernel function compilation is not yet implemented"));
+        }
         for &pty in &f.params {
             ty_in_scope(pty)?;
         }

@@ -36,7 +36,11 @@ pub fn print(m: &Module) -> String {
 }
 
 fn print_func(out: &mut String, f: &Function) {
-    out.push_str("\n  func @");
+    out.push_str("\n  ");
+    if !f.is_kernel {
+        out.push_str("host ");
+    }
+    out.push_str("func @");
     out.push_str(&f.name);
     out.push('(');
     for (i, p) in f.params.iter().enumerate() {

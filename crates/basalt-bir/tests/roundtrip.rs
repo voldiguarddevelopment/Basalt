@@ -54,6 +54,7 @@ impl FnB {
             "fixture bug: last block never closed with a terminator"
         );
         Function {
+            is_kernel: true,
             name: name.to_string(),
             params,
             ret,
@@ -385,6 +386,42 @@ fn roundtrip_module_metadata_and_multiple_functions() {
         target_dtypes: vec![Scalar::I32, Scalar::F32, Scalar::F64],
     };
     assert_roundtrip(&m);
+}
+
+/// `is_kernel: false` (a plain/`__host__`/`__device__` function, never a launchable kernel
+/// entry point) must round-trip too, both alone and mixed with a real kernel in the same
+/// module — this is the shape a future host+device task will start producing.
+#[test]
+fn roundtrip_non_kernel_function() {
+    let i32t = Ty::Scalar(Scalar::I32);
+
+    let mut b = FnB::new();
+    let arg0 = ValRef::Param(0);
+    let doubled = b.push(i32t, Op::Bin(BinOp::Add, arg0, arg0));
+    b.end_block(Term::Ret(Some(doubled)));
+    let mut host_fn = b.finish("host_only", vec![i32t], i32t);
+    host_fn.is_kernel = false;
+
+    assert_roundtrip(&module_of(vec![host_fn]));
+}
+
+#[test]
+fn roundtrip_mixed_kernel_and_non_kernel_functions() {
+    let i32t = Ty::Scalar(Scalar::I32);
+
+    let mut b1 = FnB::new();
+    let v = b1.push(i32t, Op::ConstInt(7));
+    b1.end_block(Term::Ret(Some(v)));
+    let kernel_fn = b1.finish("kernel_fn", vec![], i32t);
+
+    let mut b2 = FnB::new();
+    let a = ValRef::Param(0);
+    let doubled = b2.push(i32t, Op::Bin(BinOp::Add, a, a));
+    b2.end_block(Term::Ret(Some(doubled)));
+    let mut host_fn = b2.finish("host_fn", vec![i32t], i32t);
+    host_fn.is_kernel = false;
+
+    assert_roundtrip(&module_of(vec![kernel_fn, host_fn]));
 }
 
 #[test]

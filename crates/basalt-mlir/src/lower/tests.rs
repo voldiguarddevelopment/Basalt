@@ -33,6 +33,7 @@ fn wrap(f: Function) -> BirModule {
 fn one_block_fn(name: &str, params: Vec<Ty>, ret: Ty, insts: Vec<Inst>, term: Term) -> Function {
     let inst_ids = (0..insts.len() as u32).map(InstId).collect();
     Function {
+        is_kernel: true,
         name: name.to_string(),
         params,
         ret,
@@ -72,6 +73,7 @@ fn phi_lowers_to_a_block_argument() {
     use basalt_bir::{BlockId, Op, ValRef};
 
     let f = Function {
+        is_kernel: true,
         name: "k".to_string(),
         params: vec![Ty::Scalar(basalt_bir::Scalar::I32)],
         ret: Ty::Void,
@@ -140,6 +142,7 @@ fn refuses_switch_terminator() {
     use basalt_bir::{BlockId, ValRef};
 
     let f = Function {
+        is_kernel: true,
         name: "k".to_string(),
         params: vec![Ty::Scalar(basalt_bir::Scalar::I32)],
         ret: Ty::Void,

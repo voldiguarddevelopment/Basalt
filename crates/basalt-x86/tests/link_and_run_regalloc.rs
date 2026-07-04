@@ -137,6 +137,7 @@ fn vector_add_links_and_runs_via_full_pipeline() {
 /// everything the vector_add proof already covers.
 fn hand_built_add_i32() -> Module {
     let f = Function {
+        is_kernel: true,
         name: "add_i32".into(),
         params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
         ret: Ty::Scalar(Scalar::I32),
@@ -214,6 +215,7 @@ fn hand_built_spill_heavy_sum() -> Module {
     ];
 
     let f = Function {
+        is_kernel: true,
         name: "spill_heavy_sum".into(),
         params,
         ret: Ty::Scalar(Scalar::I32),
@@ -268,6 +270,7 @@ fn spill_heavy_sum_links_and_runs_correctly() {
 /// just structural inspection.
 fn hand_built_max_i32_via_phi() -> Module {
     let f = Function {
+        is_kernel: true,
         name: "max_i32".into(),
         params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
         ret: Ty::Scalar(Scalar::I32),

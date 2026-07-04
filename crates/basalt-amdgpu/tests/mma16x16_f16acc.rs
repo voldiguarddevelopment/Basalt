@@ -40,6 +40,7 @@ fn python_available(python: &str) -> bool {
 fn build_single_mma_f16acc(name: &str) -> Module {
     let ptr_global = Ty::Ptr(AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: name.into(),
         params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
         ret: Ty::Void,

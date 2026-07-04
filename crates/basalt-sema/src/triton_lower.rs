@@ -595,6 +595,7 @@ impl<'a> Lowerer<'a> {
         );
         BFunction {
             name: k.name.clone(),
+            is_kernel: true,
             params: bir_params,
             ret: BTy::Void,
             blocks: blocks.into_iter().map(|b| b.expect("linearized")).collect(),

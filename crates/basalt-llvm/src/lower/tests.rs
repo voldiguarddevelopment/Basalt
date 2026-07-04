@@ -25,6 +25,7 @@ fn ids(n: usize) -> Vec<InstId> {
 fn trivial_function_returns_a_constant() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "answer".into(),
         params: vec![],
         ret: i32t,
@@ -50,6 +51,7 @@ fn trivial_function_returns_a_constant() {
 fn arithmetic_and_return() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "add".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -84,6 +86,7 @@ fn signed_div_and_rem_use_the_signed_convention() {
         },
     ];
     let f = Function {
+        is_kernel: true,
         name: "divrem".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -159,6 +162,7 @@ fn if_else_with_merge_block_phi() {
         },
     ];
     let f = Function {
+        is_kernel: true,
         name: "branchy".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -228,6 +232,7 @@ fn every_cast_op_variant_lowers_and_verifies() {
     ];
     let n = insts.len();
     let f = Function {
+        is_kernel: true,
         name: "casts".into(),
         params,
         ret: Ty::Void,
@@ -257,6 +262,7 @@ fn bitcast_between_identical_llvm_types_is_a_value_passthrough() {
     let global_ptr = Ty::Ptr(basalt_bir::AddrSpace::Global);
     let shared_ptr = Ty::Ptr(basalt_bir::AddrSpace::Shared);
     let f = Function {
+        is_kernel: true,
         name: "ptrcast".into(),
         params: vec![global_ptr],
         ret: Ty::Void,
@@ -280,6 +286,7 @@ fn load_and_store_round_trip() {
     let i32t = Ty::Scalar(Scalar::I32);
     let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "memcopy".into(),
         params: vec![ptrt],
         ret: Ty::Void,
@@ -323,6 +330,7 @@ fn load_and_store_round_trip() {
 fn out_of_scope_vector_type_is_a_clean_refusal_not_a_panic() {
     let vecty = Ty::Vec(Scalar::F32, 4);
     let f = Function {
+        is_kernel: true,
         name: "usesvec".into(),
         params: vec![vecty],
         ret: Ty::Void,
@@ -341,6 +349,7 @@ fn out_of_scope_vector_type_is_a_clean_refusal_not_a_panic() {
 
 fn tid_x_fn(i32t: Ty) -> Function {
     Function {
+        is_kernel: true,
         name: "usesthreadidx".into(),
         params: vec![],
         ret: i32t,
@@ -387,6 +396,7 @@ fn amdgpu_tid_x_lowers_to_the_amdgcn_workitem_intrinsic() {
 fn amdgpu_block_dim_is_a_clean_refusal_not_a_panic() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "usesblockdim".into(),
         params: vec![],
         ret: i32t,
@@ -420,6 +430,7 @@ fn mma_fn(
 ) -> Function {
     let ptr_global = Ty::Ptr(AddrSpace::Global);
     Function {
+        is_kernel: true,
         name: "usesmma".into(),
         params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
         ret: Ty::Void,
@@ -570,6 +581,7 @@ fn nvptx_canonical_wmma_f16_accumulator_lowers_and_verifies() {
 #[test]
 fn nvptx_barrier_lowers_to_barrier0() {
     let f = Function {
+        is_kernel: true,
         name: "syncs".into(),
         params: vec![],
         ret: Ty::Void,
@@ -593,6 +605,7 @@ fn nvptx_barrier_lowers_to_barrier0() {
 #[test]
 fn amdgpu_barrier_lowers_to_s_barrier() {
     let f = Function {
+        is_kernel: true,
         name: "syncs".into(),
         params: vec![],
         ret: Ty::Void,
@@ -620,6 +633,7 @@ fn amdgpu_barrier_lowers_to_s_barrier() {
 fn nvptx_shuffle_idx_lowers_to_shfl_sync() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "shuf".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -647,6 +661,7 @@ fn nvptx_shuffle_idx_lowers_to_shfl_sync() {
 fn amdgpu_shuffle_is_a_clean_refusal_not_a_panic() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "shuf".into(),
         params: vec![i32t, i32t],
         ret: i32t,
@@ -668,6 +683,7 @@ fn amdgpu_shuffle_is_a_clean_refusal_not_a_panic() {
 
 fn ballot_fn(i32t: Ty) -> Function {
     Function {
+        is_kernel: true,
         name: "votes".into(),
         params: vec![i32t],
         ret: i32t,
@@ -713,6 +729,7 @@ fn amdgpu_ballot_lowers_to_amdgcn_ballot_at_the_requested_width() {
 fn nvptx_vote_any_and_all_lower_and_verify() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "votes".into(),
         params: vec![i32t],
         ret: i32t,
@@ -748,6 +765,7 @@ fn nvptx_vote_any_and_all_lower_and_verify() {
 fn amdgpu_vote_any_is_a_clean_refusal_not_a_panic() {
     let i32t = Ty::Scalar(Scalar::I32);
     let f = Function {
+        is_kernel: true,
         name: "votes".into(),
         params: vec![i32t],
         ret: i32t,
@@ -774,6 +792,7 @@ fn atomic_add_lowers_identically_regardless_of_dialect() {
     let i32t = Ty::Scalar(Scalar::I32);
     let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "bump".into(),
         params: vec![ptrt],
         ret: i32t,
@@ -812,6 +831,7 @@ fn atomic_min_uses_the_signed_atomicrmw_variant() {
     let i32t = Ty::Scalar(Scalar::I32);
     let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "clampmin".into(),
         params: vec![ptrt, i32t],
         ret: i32t,
@@ -842,6 +862,7 @@ fn atomic_rmw_on_a_float_type_is_a_clean_refusal_not_a_panic() {
     let f32t = Ty::Scalar(Scalar::F32);
     let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "faddatomic".into(),
         params: vec![ptrt, f32t],
         ret: f32t,
@@ -871,6 +892,7 @@ fn atomic_cas_lowers_to_cmpxchg_and_extracts_the_old_value() {
     let i32t = Ty::Scalar(Scalar::I32);
     let ptrt = Ty::Ptr(basalt_bir::AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "cas".into(),
         params: vec![ptrt, i32t, i32t],
         ret: i32t,

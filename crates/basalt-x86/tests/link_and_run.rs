@@ -180,6 +180,7 @@ fn vector_add_links_and_runs_via_full_pipeline() {
 /// `vector_add` (a `void` kernel) never does.
 fn hand_built_add_i32() -> Module {
     let f = Function {
+        is_kernel: true,
         name: "add_i32".into(),
         params: vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)],
         ret: Ty::Scalar(Scalar::I32),
@@ -232,6 +233,7 @@ fn hand_built_add_i32_links_and_runs() {
 fn hand_built_mma2x2() -> Module {
     let ptr_global = Ty::Ptr(AddrSpace::Global);
     let f = Function {
+        is_kernel: true,
         name: "mma2x2".into(),
         params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
         ret: Ty::Void,

@@ -291,6 +291,7 @@ mod tests {
 
     fn func(params: Vec<Ty>, blocks: Vec<Block>, insts: Vec<Inst>) -> Function {
         Function {
+            is_kernel: true,
             name: "f".to_string(),
             params,
             ret: Ty::Void,

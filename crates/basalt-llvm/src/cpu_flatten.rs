@@ -71,6 +71,10 @@ pub(crate) fn flatten_to_native_cpu_loop(module: &Module) -> Result<Module, Diag
             .with_arg("cpu-loop flattening: multi-function module"));
     }
     let f = &module.funcs[0];
+    if !f.is_kernel {
+        return Err(Diag::new(ECode::UnsupportedFeature)
+            .with_arg("host/non-kernel function compilation is not yet implemented"));
+    }
     if f.ret != Ty::Void {
         return Err(Diag::new(ECode::UnsupportedType)
             .with_arg("cpu-loop flattening: only a Void-returning kernel function is supported"));
@@ -342,6 +346,7 @@ fn flatten_function(f: &Function) -> Result<Function, Diag> {
 
     Ok(Function {
         name: f.name.clone(),
+        is_kernel: true,
         params,
         ret: Ty::Void,
         blocks,

@@ -223,6 +223,7 @@ fn build_tiled_sgemm(name: &str, in_dtype: Scalar, in_elem_bytes: i64) -> Module
 
     let n_insts = insts.len();
     let f = Function {
+        is_kernel: true,
         name: name.into(),
         params: vec![ptr_global, ptr_global, ptr_global, ptr_global],
         ret: Ty::Void,

@@ -21,6 +21,7 @@ fn wrap(f: Function) -> Module {
 fn simple_fn(name: &str, params: Vec<Ty>, insts: Vec<Inst>, term: Term) -> Function {
     let ids = (0..insts.len() as u32).map(InstId).collect();
     Function {
+        is_kernel: true,
         name: name.into(),
         params,
         ret: Ty::Void,
@@ -68,6 +69,7 @@ fn preamble_declares_kernel_main_and_runtime_args() {
 fn only_actual_goto_targets_get_a_label() {
     let i1t = Ty::Scalar(Scalar::I1);
     let f = Function {
+        is_kernel: true,
         name: "branch".into(),
         params: vec![i1t],
         ret: Ty::Void,
@@ -226,6 +228,7 @@ fn condbr_with_phi_emits_copies_on_both_arms() {
         }, // %0 in bb3
     ];
     let f = Function {
+        is_kernel: true,
         name: "diamond".into(),
         params: vec![i1t, i32t, i32t],
         ret: Ty::Void,
@@ -367,6 +370,13 @@ fn multi_function_module_refuses() {
         target_dtypes: vec![],
     };
     assert_eq!(unsupported_code(&module), ECode::UnsupportedOp);
+}
+
+#[test]
+fn non_kernel_function_refuses() {
+    let mut f = simple_fn("host_only", vec![], vec![], Term::Ret(None));
+    f.is_kernel = false;
+    assert_eq!(unsupported_code(&wrap(f)), ECode::UnsupportedOp);
 }
 
 #[test]

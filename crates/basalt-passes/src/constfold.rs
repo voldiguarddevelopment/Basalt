@@ -607,6 +607,7 @@ mod tests {
 
     fn scalar_fn(name: &str, params: Vec<Ty>, ret: Ty, insts: Vec<Inst>, term: Term) -> Function {
         Function {
+            is_kernel: true,
             name: name.to_string(),
             params,
             ret,

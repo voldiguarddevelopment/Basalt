@@ -1308,6 +1308,11 @@ fn lower_function<'c>(
     gpu_module_block: &Block<'c>,
     f: &Function,
 ) -> Result<(), Diag> {
+    if !f.is_kernel {
+        return Err(unsupported_feature(
+            "host/non-kernel function compilation is not yet implemented",
+        ));
+    }
     if f.ret != Ty::Void {
         return Err(unsupported_op(
             "a non-void-returning top-level function has no meaning for a gpu.func kernel \
