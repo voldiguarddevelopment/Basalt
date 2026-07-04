@@ -26,6 +26,7 @@ basalt-x86 = { path = "../basalt-x86" }
 basalt-ptx = { path = "../basalt-ptx" }
 basalt-amdgpu = { path = "../basalt-amdgpu" }
 basalt-spirv = { path = "../basalt-spirv" }
+basalt-tensix = { path = "../basalt-tensix" }
 basalt-llvm = { path = "../basalt-llvm", optional = true }
 basalt-mlir = { path = "../basalt-mlir", optional = true }
 basalt-clif = { path = "../basalt-clif", optional = true }

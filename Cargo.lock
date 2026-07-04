@@ -96,6 +96,7 @@ dependencies = [
  "basalt-ptx",
  "basalt-sema",
  "basalt-spirv",
+ "basalt-tensix",
  "basalt-x86",
  "object",
 ]
@@ -218,6 +219,14 @@ dependencies = [
 [[package]]
 name = "basalt-tensix"
 version = "0.0.0"
+dependencies = [
+ "basalt-backend",
+ "basalt-bir",
+ "basalt-diag",
+ "basalt-frontend-c",
+ "basalt-passes",
+ "basalt-sema",
+]
 
 [[package]]
 name = "basalt-x86"

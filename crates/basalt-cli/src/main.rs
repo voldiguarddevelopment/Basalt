@@ -23,7 +23,10 @@
 // combination of `--llvm` with a mode is a clean refusal, never a silent fallback to the
 // non-LLVM path. `--spirv` runs the real hand-rolled `basalt-spirv` backend (`Spirv`, always
 // built, no feature gate), following `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention.
-// `--triton` is a modifier following `--llvm`'s own pattern, but on the *frontend* side rather
+// `--tensix` runs the real hand-rolled `basalt-tensix` backend (`Tensix`, always built, no
+// feature gate), generating Metalium C++ for Tenstorrent's Tensix; its output is text like
+// `--nvidia-ptx`'s, so it follows that mode's stdout-or-`-o` convention. `--triton` is a
+// modifier following `--llvm`'s own pattern, but on the *frontend* side rather
 // than the backend side: paired with `--cpu`, `--cpu-regalloc`, or `--nvidia-ptx` it redirects
 // the input from the CUDA-C `run_frontend`/`basalt_sema::check`/`basalt_sema::lower` pipeline
 // to the real Triton one (`basalt_frontend_triton::parse` -> `basalt_sema::check_triton` ->
@@ -51,6 +54,7 @@ use basalt_frontend_c::PpOpts;
 use basalt_llvm::LlvmAmdgcn;
 use basalt_ptx::Ptx;
 use basalt_spirv::Spirv;
+use basalt_tensix::Tensix;
 use basalt_x86::{X86Oracle, X86Regalloc};
 
 /// A mode-selecting flag. Exactly one must be given; a second conflicts with the first.
@@ -698,6 +702,55 @@ fn run_spirv(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--tensix <file>`: same frontend/sema/lower/optimize pipeline as `--cpu`, handed to the real
+/// hand-rolled `basalt-tensix` backend (`Tensix`, always built, no feature gate). Its output is
+/// generated Metalium C++ text, like `--nvidia-ptx`'s PTX, so it follows that mode's stdout-or-
+/// `-o` convention rather than `--spirv`'s binary-artifact/`-o`-mandatory one. No `--triton`
+/// pairing is wired for this mode (see the `--triton` refusal in `run`, below).
+fn run_tensix(
+    input: &Path,
+    output: Option<&Path>,
+    cfg: &Config,
+    table: &LangTable,
+) -> Result<ExitCode, Diag> {
+    let module = if is_bir_input(input) {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        basalt_bir::parse(&src)
+            .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        let fe = run_frontend(&src, input, cfg);
+        let sema_diags = basalt_sema::check(&fe.tu);
+        let (module, lower_diags) = basalt_sema::lower(&fe.tu);
+
+        for p in &fe.problems {
+            eprintln!("{p}");
+        }
+        for d in sema_diags.iter().chain(lower_diags.iter()) {
+            eprintln!("{}", d.render(table));
+        }
+
+        if fe.has_problems() || !sema_diags.is_empty() || !lower_diags.is_empty() {
+            return Ok(ExitCode::FAILURE);
+        }
+        module
+    };
+    let module = basalt_passes::optimize(&module);
+
+    let backend = Tensix;
+    match backend.supports(&module) {
+        Support::Supported => {}
+        Support::Unsupported(code) => return Err(Diag::new(code).with_arg(backend.name())),
+    }
+
+    let artifact = backend.emit(&module, &EmitOpts::default())?;
+    let text = artifact
+        .as_text()
+        .expect("Tensix::emit always produces a Payload::Text artifact");
+    write_output(output, text)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Writes `text` to `output` if given, else stdout — the common tail of every mode that
 /// produces a single text artifact.
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
@@ -748,6 +801,7 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
         }
         Mode::AmdgpuBin => run_amdgpu_bin(input()?, cfg.output.as_deref(), cfg, table),
         Mode::Spirv => run_spirv(input()?, cfg.output.as_deref(), cfg, table),
+        Mode::Tensix => run_tensix(input()?, cfg.output.as_deref(), cfg, table),
         other => Err(Diag::new(ECode::UnsupportedFeature).with_arg(other.flag())),
     }
 }
