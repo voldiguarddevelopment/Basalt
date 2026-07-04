@@ -94,9 +94,49 @@
 // `f16` is refused (`E091`) anywhere it would need real arithmetic (an instruction result, a
 // `cast`/`fcmp`/`store`'s explicit operand type): baseline SSE2 has no scalar half-float
 // arithmetic path (that needs the F16C extension), and this backend does not assume F16C is
-// present. A multi-function module is refused (`E093`): `ElfObjectSpec` binds exactly one
-// named symbol to the whole `.text` payload, which has nothing sound to do with a second
-// function's code.
+// present.
+//
+// # Multi-function modules: one host function, plus the kernel(s) it launches
+//
+// A module of more than one function is refused (`E093`) unless it is shaped exactly like
+// "one host (`is_kernel == false`) function, plus every kernel it actually launches via a
+// real `Op::KernelLaunch`, and nothing else" (`classify_module`) — general multi-function
+// support (two unrelated kernels, a `__device__` helper call, dynamic parallelism) remains
+// out of scope and refuses just as it always has.
+//
+// Both the host function and every kernel it launches are lowered into one shared `.text`
+// blob, each its own named `ElfSymbol` (see `basalt-backend::elf`) at its own offset — no
+// relocation is needed since every offset is known once the whole blob is laid out. A
+// kernel keeps its existing per-thread-loop lowering unchanged; the host function is
+// lowered as an ordinary function with no such loop (it runs once, like any C function).
+// Every intra-function label (`Enc::label`'s own names, never visible in the emitted bytes
+// themselves) is qualified by its owning function's name so two functions sharing one `Enc`
+// never collide; each function's own entry point is additionally labeled with its bare
+// name, matching both the `ElfSymbol` name and the string `Op::KernelLaunch::kernel` names
+// as its `call` target.
+//
+// `Op::KernelLaunch` lowers to a genuine `call rel32` (`Enc::call`) to the launched kernel's
+// own label: each of the launch's `args` reloads into the *launched kernel's own*
+// SysV-classified argument registers (the callee's own declared parameter types drive the
+// classification, exactly matching how that kernel's own entry point already expects to
+// receive them), and the kernel's own trailing `nthreads` register receives the flattened
+// `grid`x`block` product (all six components multiplied together) — this backend's kernels
+// already treat `blockIdx`/`gridDim` as fixed at 0/1 (see the module header above), so the
+// real total number of loop iterations a launch means is that full product, not just
+// `block.x`. `shared`/`stream` carry no meaning under this backend's single-threaded,
+// one-block execution model: a launch is only accepted if both materialize to their
+// documented default (a literal `Op::ConstInt(0)`, exactly what a source launch omitting
+// either one already lowers to); anything else — a nonzero constant, or a genuinely dynamic
+// value — is refused (`E093`) rather than silently ignored. `Op::CudaDeviceSynchronize`
+// lowers to a real `nop`: every launch this backend can even accept already runs to
+// completion synchronously inside its own `call`, so there is genuinely nothing left to
+// wait for, not a stubbed-out placeholder. `Op::CudaMalloc`/`CudaMemcpy`/`CudaFree` remain
+// refused (`E090`) inside a host function: they need a real relocation against an external
+// libc symbol, which is a separate, later piece of work (see `PLAN.md`'s P13-T1c-ii).
+//
+// A kernel launching another kernel, or containing any of these five ops at all, is still
+// refused exactly as before — dynamic parallelism is out of scope, and this backend has no
+// call machinery for a kernel to use one from inside its own per-thread loop.
 //
 // # `mma`
 //
@@ -122,8 +162,8 @@
 use std::collections::HashMap;
 
 use basalt_backend::{
-    write_elf_object, Architecture, Artifact, ArtifactKind, Backend, ElfObjectSpec, EmitOpts,
-    Endianness, Support,
+    write_elf_object, Architecture, Artifact, ArtifactKind, Backend, ElfObjectSpec, ElfSymbol,
+    EmitOpts, Endianness, Support,
 };
 use basalt_bir::{
     AddrSpace, AtomicOp, BinOp, CastOp, FCmpPred, Function, ICmpPred, InstId, MmaLayout, Module,
@@ -155,32 +195,122 @@ impl Backend for X86Oracle {
     }
 
     fn emit(&self, module: &Module, _opts: &EmitOpts) -> Result<Artifact, Diag> {
-        let f = check_module(module)?;
-        let text = emit_function(f)?;
-        let spec = ElfObjectSpec::new(
-            Architecture::X86_64,
-            Endianness::Little,
-            f.name.clone(),
-            text,
-        );
+        let shape = check_module(module)?;
+        let (text, symbols) = match shape {
+            ModuleShape::SingleKernel(f) => {
+                let text = emit_function(f)?;
+                let size = text.len() as u64;
+                (
+                    text,
+                    vec![ElfSymbol {
+                        name: f.name.clone(),
+                        offset: 0,
+                        size,
+                    }],
+                )
+            }
+            ModuleShape::HostAndKernels { host, kernels } => emit_host_and_kernels(host, &kernels)?,
+        };
+        let spec =
+            ElfObjectSpec::new_multi(Architecture::X86_64, Endianness::Little, symbols, text);
         let bytes = write_elf_object(&spec)?;
         Ok(Artifact::bytes(ArtifactKind::Object, bytes))
     }
 }
 
+/// The exact module shapes this backend accepts, returned by `check_module` on success: the
+/// original single-kernel-only shape, or "one host function plus the kernel(s) it actually
+/// launches" (see the module header's own section on this).
+enum ModuleShape<'a> {
+    SingleKernel(&'a Function),
+    HostAndKernels {
+        host: &'a Function,
+        kernels: Vec<&'a Function>,
+    },
+}
+
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
-/// `emit()` so the two can never drift apart. Returns the one function to lower on success.
-fn check_module(module: &Module) -> Result<&Function, Diag> {
-    if module.funcs.len() != 1 {
-        return Err(Diag::new(ECode::UnsupportedFeature)
-            .with_arg("multi-function module: ElfObjectSpec names exactly one symbol"));
+/// `emit()` so the two can never drift apart. Returns the module shape to lower on success.
+fn check_module(module: &Module) -> Result<ModuleShape<'_>, Diag> {
+    if module.funcs.len() == 1 && module.funcs[0].is_kernel {
+        let f = &module.funcs[0];
+        check_function(f, false, &[])?;
+        return Ok(ModuleShape::SingleKernel(f));
     }
-    let f = &module.funcs[0];
-    if !f.is_kernel {
-        return Err(Diag::new(ECode::UnsupportedFeature)
-            .with_arg("host/non-kernel function compilation is not yet implemented"));
+    if module.funcs.len() == 1 {
+        return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+            "host/non-kernel function compilation needs at least one kernel it launches",
+        ));
     }
 
+    let hosts: Vec<&Function> = module.funcs.iter().filter(|f| !f.is_kernel).collect();
+    let host = match hosts.as_slice() {
+        [host] => *host,
+        [] => {
+            return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                "multi-function module: general multi-kernel support is out of scope; needs \
+                 exactly one host function launching kernel(s) it names",
+            ))
+        }
+        _ => {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("multi-function module: more than one host (non-kernel) function"))
+        }
+    };
+
+    let mut launched: Vec<&str> = Vec::new();
+    for inst in &host.insts {
+        if let Op::KernelLaunch { kernel, .. } = &inst.op {
+            launched.push(kernel.as_str());
+        }
+    }
+    if launched.is_empty() {
+        return Err(
+            Diag::new(ECode::UnsupportedFeature).with_arg("host function launches no kernels")
+        );
+    }
+
+    let kernels: Vec<&Function> = module.funcs.iter().filter(|f| f.is_kernel).collect();
+    for k in &kernels {
+        if !launched.contains(&k.name.as_str()) {
+            return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                "multi-function module: kernel present but never launched by the host function \
+                 (general multi-kernel/device-helper-call support is out of scope)",
+            ));
+        }
+    }
+    for name in &launched {
+        if !kernels.iter().any(|k| k.name == *name) {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("kernel launch names a function not present in this module"));
+        }
+    }
+
+    check_function(host, true, &kernels)?;
+    for k in &kernels {
+        check_function(k, false, &[])?;
+    }
+
+    Ok(ModuleShape::HostAndKernels { host, kernels })
+}
+
+/// Whether `v` is the launch's own documented default for `shared`/`stream` (a literal
+/// `Op::ConstInt(0)` — the exact materialization `basalt-sema`'s own lowering produces for a
+/// source launch that names neither, see `Op::KernelLaunch`'s doc comment) — the only shape
+/// this backend accepts for either operand.
+fn launch_operand_is_default(f: &Function, v: ValRef) -> bool {
+    match v {
+        ValRef::Val(id) => matches!(f.insts[id.0 as usize].op, Op::ConstInt(0)),
+        ValRef::Param(_) => false,
+    }
+}
+
+/// The per-function checks shared by every function this backend ever lowers, kernel or
+/// host. `is_host` and `launch_targets` (the kernels visible for a host function's own
+/// `Op::KernelLaunch` calls, empty for a kernel) select the one place kernel and host
+/// bodies are actually allowed to differ: which of the five kernel-launch/CUDA-Runtime-API
+/// ops are real here versus still refused.
+fn check_function(f: &Function, is_host: bool, launch_targets: &[&Function]) -> Result<(), Diag> {
     if matches!(f.ret, Ty::Vec(..)) {
         return Err(Diag::new(ECode::UnsupportedType).with_arg("vector-typed return value"));
     }
@@ -230,22 +360,54 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
                      acc_dtype at least as wide as in_dtype, and neither i1 nor f16",
                 ));
             }
+            Op::KernelLaunch {
+                kernel,
+                shared,
+                stream,
+                args,
+                ..
+            } if is_host => {
+                if !launch_targets.iter().any(|k| &k.name == kernel) {
+                    return Err(Diag::new(ECode::UnsupportedFeature)
+                        .with_arg("kernel launch names a function not present in this module"));
+                }
+                let target = launch_targets
+                    .iter()
+                    .find(|k| &k.name == kernel)
+                    .expect("just checked above");
+                if args.len() != target.params.len() {
+                    return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                        "kernel launch argument count does not match the launched kernel's own \
+                         signature",
+                    ));
+                }
+                if !launch_operand_is_default(f, *shared) || !launch_operand_is_default(f, *stream)
+                {
+                    return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                        "non-default shared-memory/stream operand has no meaning under this \
+                         backend's single-threaded, one-block execution model",
+                    ));
+                }
+            }
+            Op::CudaDeviceSynchronize if is_host => {}
             Op::KernelLaunch { .. }
             | Op::CudaMalloc { .. }
             | Op::CudaMemcpy { .. }
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
-                return Err(Diag::new(ECode::UnsupportedOp).with_arg(
-                    "kernel launch / CUDA Runtime API calls are sema-only today (see \
-                     Op::KernelLaunch's own doc comment): a real oracle lowering needs a call/\
-                     return mechanism this backend does not have yet",
-                ));
+                return Err(Diag::new(ECode::UnsupportedOp).with_arg(if is_host {
+                    "cudaMalloc/cudaMemcpy/cudaFree need a real relocation against an external \
+                     libc symbol this backend does not emit yet"
+                } else {
+                    "kernel launch / CUDA Runtime API calls inside a kernel (dynamic \
+                     parallelism) are out of scope for this backend"
+                }));
             }
             _ => {}
         }
     }
 
-    Ok(f)
+    Ok(())
 }
 
 fn ty_is_f16(ty: Ty) -> bool {
@@ -330,14 +492,20 @@ fn space_tag(space: AddrSpace) -> u8 {
     }
 }
 
-fn block_label(id: u32) -> String {
-    format!("bb{id}")
-}
-
 #[derive(Clone, Copy)]
 enum ArgLoc {
     Int(u8),
     Sse(u8),
+}
+
+/// The one slice of a launched kernel's own signature `lower_kernel_launch` needs to
+/// classify the call's own argument registers exactly like that kernel's own entry point
+/// does. An owned copy (not a borrow of the kernel `Function` itself) so `CodeGen` needs no
+/// extra lifetime parameter beyond the one already tying it to the function it is currently
+/// lowering.
+struct KernelSig {
+    name: String,
+    params: Vec<Ty>,
 }
 
 /// Classifies `params` into the SysV integer/SSE argument sequence and returns the location
@@ -477,15 +645,37 @@ fn build_phi_copies(f: &Function, frame: &Frame) -> PhiCopies {
     map
 }
 
-struct CodeGen<'a> {
+struct CodeGen<'a, 'e> {
     f: &'a Function,
     frame: Frame,
-    enc: Enc,
+    enc: &'e mut Enc,
     label_counter: u32,
     phi_copies: PhiCopies,
+    /// Qualifies every intra-function label this function's own body defines or references
+    /// (see `lbl`) — this function's own name, so two functions sharing one `Enc` (see
+    /// `emit_host_and_kernels`) never collide.
+    label_prefix: String,
+    /// Where `Term::Ret` actually jumps: a kernel's own per-thread loop increment step (the
+    /// kernel keeps running the next thread), or a host function's own epilogue (an
+    /// ordinary function just returns).
+    ret_target: String,
+    /// The kernel(s) a host function's own `Op::KernelLaunch` instructions may call. Always
+    /// empty for a kernel body (`check_module` refuses `Op::KernelLaunch` there).
+    launch_targets: Vec<KernelSig>,
 }
 
-fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
+/// Lowers one function's full body — prologue, params, blocks, epilogue — into `enc`,
+/// starting with a label at `f.name` naming its own entry point (a `call` target for a
+/// host's own launches, and this function's own `ElfSymbol` name in the multi-function
+/// case). A kernel (`is_host = false`) keeps the existing per-thread-loop wrapper unchanged;
+/// a host function (`is_host = true`) is lowered as an ordinary function that runs once, no
+/// loop, no synthesized trailing `nthreads` parameter.
+fn emit_function_body(
+    f: &Function,
+    is_host: bool,
+    launch_targets: Vec<KernelSig>,
+    enc: &mut Enc,
+) -> Result<(), Diag> {
     let (param_locs, nthreads_loc) =
         classify_params(&f.params).expect("check_module already validated the signature");
 
@@ -494,11 +684,15 @@ fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
     let mut cg = CodeGen {
         f,
         frame,
-        enc: Enc::new(),
+        enc,
         label_counter: 0,
         phi_copies,
+        label_prefix: format!("{}$", f.name),
+        ret_target: String::new(),
+        launch_targets,
     };
 
+    cg.enc.label(&f.name);
     cg.enc.push_reg(RBP);
     cg.enc.mov_rbp_rsp();
     cg.enc.sub_rsp_imm(cg.frame.frame_size);
@@ -517,34 +711,52 @@ fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
             }
         }
     }
-    if let ArgLoc::Int(r) = nthreads_loc {
-        cg.enc.mov_rbp_reg(W::B8, cg.frame.nthreads_home, r);
+
+    if is_host {
+        cg.ret_target = cg.lbl("__epilogue");
+    } else {
+        if let ArgLoc::Int(r) = nthreads_loc {
+            cg.enc.mov_rbp_reg(W::B8, cg.frame.nthreads_home, r);
+        }
+
+        cg.enc.mov_reg_imm32(W::B8, RAX, 0);
+        cg.enc.mov_rbp_reg(W::B8, cg.frame.loopctr_home, RAX);
+
+        let loop_check = cg.lbl("__loop_check");
+        let loop_end = cg.lbl("__loop_end");
+        cg.enc.label(&loop_check);
+        cg.enc.mov_reg_rbp(W::B8, RAX, cg.frame.loopctr_home);
+        cg.enc.mov_reg_rbp(W::B8, RCX, cg.frame.nthreads_home);
+        cg.enc.alu_reg_reg(AluOp::Cmp, W::B8, RAX, RCX);
+        cg.enc.jcc(cc::GE, &loop_end);
+
+        cg.ret_target = cg.lbl("__loop_incr");
     }
 
-    cg.enc.mov_reg_imm32(W::B8, RAX, 0);
-    cg.enc.mov_rbp_reg(W::B8, cg.frame.loopctr_home, RAX);
-
-    cg.enc.label("__loop_check");
-    cg.enc.mov_reg_rbp(W::B8, RAX, cg.frame.loopctr_home);
-    cg.enc.mov_reg_rbp(W::B8, RCX, cg.frame.nthreads_home);
-    cg.enc.alu_reg_reg(AluOp::Cmp, W::B8, RAX, RCX);
-    cg.enc.jcc(cc::GE, "__loop_end");
-
     for (bidx, block) in f.blocks.iter().enumerate() {
-        cg.enc.label(&block_label(bidx as u32));
+        let label = cg.block_label(bidx as u32);
+        cg.enc.label(&label);
         for &inst_id in &block.insts {
             cg.lower_inst(inst_id);
         }
         cg.lower_term(bidx as u32, &block.term);
     }
 
-    cg.enc.label("__loop_incr");
-    cg.enc.mov_reg_rbp(W::B8, RAX, cg.frame.loopctr_home);
-    cg.enc.alu_reg_imm32(AluOp::Add, W::B8, RAX, 1);
-    cg.enc.mov_rbp_reg(W::B8, cg.frame.loopctr_home, RAX);
-    cg.enc.jmp("__loop_check");
+    if is_host {
+        let epilogue = cg.lbl("__epilogue");
+        cg.enc.label(&epilogue);
+    } else {
+        let loop_incr = cg.lbl("__loop_incr");
+        let loop_check = cg.lbl("__loop_check");
+        let loop_end = cg.lbl("__loop_end");
+        cg.enc.label(&loop_incr);
+        cg.enc.mov_reg_rbp(W::B8, RAX, cg.frame.loopctr_home);
+        cg.enc.alu_reg_imm32(AluOp::Add, W::B8, RAX, 1);
+        cg.enc.mov_rbp_reg(W::B8, cg.frame.loopctr_home, RAX);
+        cg.enc.jmp(&loop_check);
+        cg.enc.label(&loop_end);
+    }
 
-    cg.enc.label("__loop_end");
     if !matches!(f.ret, Ty::Void) {
         let disp = cg
             .frame
@@ -564,13 +776,88 @@ fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
     cg.enc.pop_reg(RBP);
     cg.enc.ret();
 
-    Ok(cg.enc.finish())
+    Ok(())
 }
 
-impl<'a> CodeGen<'a> {
+/// The `ModuleShape::SingleKernel` path: one function, its own fresh `Enc`, no label
+/// qualification needed (nothing else shares the buffer) — kept as its own entry point so
+/// this shape's emitted bytes never change shape merely because the multi-function path
+/// now exists alongside it.
+fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
+    let mut enc = Enc::new();
+    emit_function_body(f, false, Vec::new(), &mut enc)?;
+    Ok(enc.finish())
+}
+
+/// The `ModuleShape::HostAndKernels` path: the host function followed by every kernel it
+/// launches, all lowered into one shared `Enc` so the host's own `call`s can reach them (see
+/// the module header). Returns the combined `.text` bytes plus one `ElfSymbol` per function,
+/// each sized by the gap to the next function's own entry point (or to the end of the
+/// buffer, for whichever function was laid out last).
+fn emit_host_and_kernels(
+    host: &Function,
+    kernels: &[&Function],
+) -> Result<(Vec<u8>, Vec<ElfSymbol>), Diag> {
+    let launch_targets: Vec<KernelSig> = kernels
+        .iter()
+        .map(|k| KernelSig {
+            name: k.name.clone(),
+            params: k.params.clone(),
+        })
+        .collect();
+
+    let mut enc = Enc::new();
+    emit_function_body(host, true, launch_targets, &mut enc)?;
+    for k in kernels {
+        emit_function_body(k, false, Vec::new(), &mut enc)?;
+    }
+
+    let mut names: Vec<&str> = vec![host.name.as_str()];
+    names.extend(kernels.iter().map(|k| k.name.as_str()));
+    let mut offsets: Vec<(String, u64)> = names
+        .iter()
+        .map(|name| {
+            let off = enc.label_offset(name).unwrap_or_else(|| {
+                panic!("codegen bug: `{name}`'s own entry label was never defined")
+            });
+            ((*name).to_string(), off as u64)
+        })
+        .collect();
+    let total = enc.pos() as u64;
+    let bytes = enc.finish();
+
+    offsets.sort_by_key(|(_, off)| *off);
+    let symbols = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, (name, off))| {
+            let end = offsets.get(i + 1).map_or(total, |(_, o)| *o);
+            ElfSymbol {
+                name: name.clone(),
+                offset: *off,
+                size: end - off,
+            }
+        })
+        .collect();
+    Ok((bytes, symbols))
+}
+
+impl<'a, 'e> CodeGen<'a, 'e> {
+    /// Qualifies an intra-function label name with this function's own `label_prefix`.
+    /// Label spelling has no bearing on the emitted bytes (`Enc::finish` resolves fixups
+    /// purely by numeric offset), so this exists solely to keep two functions sharing one
+    /// `Enc` from ever defining the same label name twice.
+    fn lbl(&self, s: &str) -> String {
+        format!("{}{s}", self.label_prefix)
+    }
+
+    fn block_label(&self, id: u32) -> String {
+        self.lbl(&format!("bb{id}"))
+    }
+
     fn fresh_label(&mut self, prefix: &str) -> String {
         self.label_counter += 1;
-        format!("__{prefix}_{}", self.label_counter)
+        self.lbl(&format!("__{prefix}_{}", self.label_counter))
     }
 
     fn valref_ty(&self, v: ValRef) -> Ty {
@@ -646,6 +933,16 @@ impl<'a> CodeGen<'a> {
         match &inst.op {
             Op::ConstInt(n) => {
                 let n = *n;
+                // `basalt-sema`'s own lowering synthesizes a placeholder `const.i void 0` /
+                // `const.f void 0` as the discarded "value" of a void expression used as a
+                // bare statement (a kernel launch, `__syncthreads()`, ...) — see
+                // `basalt_sema::lower::zero_of`. `Ty::Void` means "no SSA value" by BIR's own
+                // convention (`Store`/`Mma`/`Barrier` are all `Ty::Void` for the same reason),
+                // so nothing ever legitimately reads this instruction's own result; skip it
+                // exactly like `Op::Phi`'s own "nothing to do at the definition site" below.
+                if matches!(ty, Ty::Void) {
+                    return;
+                }
                 if let Ty::Ptr(space) = ty {
                     if local_like(space) {
                         let key = (space_tag(space), n);
@@ -664,6 +961,9 @@ impl<'a> CodeGen<'a> {
             }
             Op::ConstFloat(v) => {
                 let v = *v;
+                if matches!(ty, Ty::Void) {
+                    return;
+                }
                 if is_f64(ty) {
                     self.enc.movabs(RAX, v.to_bits() as i64);
                     self.store_result(id, RAX, W::B8);
@@ -766,11 +1066,23 @@ impl<'a> CodeGen<'a> {
                     id, a, b, c, d, m, n, k, in_dtype, acc_dtype, layout_a, layout_b,
                 );
             }
-            Op::KernelLaunch { .. }
-            | Op::CudaMalloc { .. }
-            | Op::CudaMemcpy { .. }
-            | Op::CudaFree { .. }
-            | Op::CudaDeviceSynchronize => {
+            Op::KernelLaunch {
+                kernel,
+                grid,
+                block,
+                shared,
+                stream,
+                args,
+            } => {
+                let (kernel, grid, block, shared, stream) =
+                    (kernel.clone(), *grid, *block, *shared, *stream);
+                self.lower_kernel_launch(&kernel, grid, block, shared, stream, args);
+            }
+            // Every launch this backend can even accept already runs to completion
+            // synchronously inside its own `call` (see the module header) — genuinely
+            // nothing left to wait for, so this is a real no-op, not a stub.
+            Op::CudaDeviceSynchronize => self.enc.nop(),
+            Op::CudaMalloc { .. } | Op::CudaMemcpy { .. } | Op::CudaFree { .. } => {
                 unreachable!("check_module refuses these before codegen starts")
             }
         }
@@ -1278,6 +1590,64 @@ impl<'a> CodeGen<'a> {
         self.store_result(id, RAX, w);
     }
 
+    /// Lowers a real `Op::KernelLaunch` to a genuine intra-object `call` — reached only for
+    /// a host function's own instructions (`check_module` refuses this op inside a kernel
+    /// body). `shared`/`stream` carry no meaning under this backend's execution model and
+    /// have already been confirmed default by `check_function`, so there is nothing left to
+    /// do with them here.
+    ///
+    /// Each of `args` reloads straight into the *launched kernel's own* SysV-classified
+    /// argument register — `target`'s own declared parameter types drive the
+    /// classification, exactly matching how that kernel's own entry point (`emit_function_
+    /// body`) already expects to receive them. `nthreads` (the kernel's own trailing
+    /// argument) receives the flattened `grid`x`block` product: this backend's kernels treat
+    /// `blockIdx`/`gridDim` as fixed at 0/1 (see the module header), so the real number of
+    /// per-thread loop iterations a launch means is that full six-way product, not just
+    /// `block.x`. The product is computed in `RAX`/`R10` — scratch registers that are never
+    /// themselves a SysV argument-carrying register — so it makes no difference whether it
+    /// runs before or after the param registers below are populated.
+    fn lower_kernel_launch(
+        &mut self,
+        kernel: &str,
+        grid: [ValRef; 3],
+        block: [ValRef; 3],
+        shared: ValRef,
+        stream: ValRef,
+        args: &[ValRef],
+    ) {
+        let _ = (shared, stream);
+
+        let target_idx = self
+            .launch_targets
+            .iter()
+            .position(|k| k.name == kernel)
+            .expect("check_function already validated every launch names a real kernel");
+        let target_params = self.launch_targets[target_idx].params.clone();
+        let (param_locs, nthreads_loc) = classify_params(&target_params)
+            .expect("check_function already validated the launched kernel's own signature");
+        debug_assert_eq!(args.len(), param_locs.len());
+
+        self.reload_gpr(grid[0], RAX, W::B4);
+        for &dim in grid[1..].iter().chain(block.iter()) {
+            self.reload_gpr(dim, R10, W::B4);
+            self.enc.imul_reg_reg(W::B4, RAX, R10);
+        }
+        if let ArgLoc::Int(r) = nthreads_loc {
+            self.enc.mov_reg_reg(W::B8, r, RAX);
+        }
+
+        for (i, loc) in param_locs.iter().enumerate() {
+            let arg = args[i];
+            let ty = target_params[i];
+            match *loc {
+                ArgLoc::Int(r) => self.reload_gpr(arg, r, width_of(ty)),
+                ArgLoc::Sse(r) => self.reload_xmm(arg, r, is_f64(ty)),
+            }
+        }
+
+        self.enc.call(kernel);
+    }
+
     /// `dst := [rbp + base_disp] + (row*leading_dim + col) * elem_bytes`, the address of one
     /// element of an `mma` operand tile — always recomputed from scratch (see the module
     /// header's `# mma` section). `RAX`/`RCX` are scratch; `dst` may be either of them, in
@@ -1525,7 +1895,8 @@ impl<'a> CodeGen<'a> {
         match term {
             Term::Br(target) => {
                 self.emit_phi_copies(from_block, target.0);
-                self.enc.jmp(&block_label(target.0));
+                let label = self.block_label(target.0);
+                self.enc.jmp(&label);
             }
             Term::CondBr(cond, t, f) => {
                 self.reload_gpr(*cond, RAX, W::B1);
@@ -1533,10 +1904,12 @@ impl<'a> CodeGen<'a> {
                 let false_prep = self.fresh_label("condbr_false");
                 self.enc.jcc(cc::E, &false_prep);
                 self.emit_phi_copies(from_block, t.0);
-                self.enc.jmp(&block_label(t.0));
+                let t_label = self.block_label(t.0);
+                self.enc.jmp(&t_label);
                 self.enc.label(&false_prep);
                 self.emit_phi_copies(from_block, f.0);
-                self.enc.jmp(&block_label(f.0));
+                let f_label = self.block_label(f.0);
+                self.enc.jmp(&f_label);
             }
             Term::Switch(scrut, default, cases) => {
                 let ty = self.valref_ty(*scrut);
@@ -1548,11 +1921,13 @@ impl<'a> CodeGen<'a> {
                     let skip = self.fresh_label("switch_skip");
                     self.enc.jcc(cc::NE, &skip);
                     self.emit_phi_copies(from_block, target.0);
-                    self.enc.jmp(&block_label(target.0));
+                    let target_label = self.block_label(target.0);
+                    self.enc.jmp(&target_label);
                     self.enc.label(&skip);
                 }
                 self.emit_phi_copies(from_block, default.0);
-                self.enc.jmp(&block_label(default.0));
+                let default_label = self.block_label(default.0);
+                self.enc.jmp(&default_label);
             }
             Term::Ret(v) => {
                 if let Some(val) = v {
@@ -1575,9 +1950,12 @@ impl<'a> CodeGen<'a> {
                         self.enc.mov_rbp_reg(w, disp, RAX);
                     }
                 }
-                // Every thread must still advance the loop, not actually return, so `ret`
-                // jumps to the loop's own increment step instead of emitting a real `ret`.
-                self.enc.jmp("__loop_incr");
+                // A kernel's own thread must still advance the loop rather than actually
+                // return (`ret_target` is the loop's own increment step there); a host
+                // function's own `ret_target` is its real epilogue, since it runs once like
+                // any ordinary function. Either way, never a bare `ret` here.
+                let target = self.ret_target.clone();
+                self.enc.jmp(&target);
             }
         }
     }
@@ -2095,6 +2473,222 @@ mod tests {
         f.is_kernel = false;
         assert_eq!(
             X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    // ---- host function + real kernel-launch call (P13-T1c-i) ----------------------------
+
+    /// A host function launching `add_i32` (see `func_add_i32`) with a real
+    /// `Op::KernelLaunch`: `grid=(2,1,1)`, `block=(3,1,1)` (so `nthreads` at the call site
+    /// should be the flattened product `6`), args `(10, 20)`, `shared`/`stream` both the
+    /// documented default (`Op::ConstInt(0)`). Instruction indices: 0-2 grid.xyz, 3-5
+    /// block.xyz, 6 shared, 7 stream, 8-9 the two launch args, 10 the launch itself.
+    fn func_host_launches_add_i32() -> Function {
+        let i32t = Ty::Scalar(Scalar::I32);
+        let i64t = Ty::Scalar(Scalar::I64);
+        let ptr_global = Ty::Ptr(AddrSpace::Global);
+        Function {
+            is_kernel: false,
+            name: "host_main".into(),
+            params: vec![],
+            ret: Ty::Void,
+            insts: vec![
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(2),
+                }, // 0: grid.x
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(1),
+                }, // 1: grid.y
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(1),
+                }, // 2: grid.z
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(3),
+                }, // 3: block.x
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(1),
+                }, // 4: block.y
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(1),
+                }, // 5: block.z
+                Inst {
+                    ty: i64t,
+                    op: Op::ConstInt(0),
+                }, // 6: shared (default)
+                Inst {
+                    ty: ptr_global,
+                    op: Op::ConstInt(0),
+                }, // 7: stream (default)
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(10),
+                }, // 8: arg a
+                Inst {
+                    ty: i32t,
+                    op: Op::ConstInt(20),
+                }, // 9: arg b
+                Inst {
+                    ty: Ty::Void,
+                    op: Op::KernelLaunch {
+                        kernel: "add_i32".into(),
+                        grid: [
+                            ValRef::Val(InstId(0)),
+                            ValRef::Val(InstId(1)),
+                            ValRef::Val(InstId(2)),
+                        ],
+                        block: [
+                            ValRef::Val(InstId(3)),
+                            ValRef::Val(InstId(4)),
+                            ValRef::Val(InstId(5)),
+                        ],
+                        shared: ValRef::Val(InstId(6)),
+                        stream: ValRef::Val(InstId(7)),
+                        args: vec![ValRef::Val(InstId(8)), ValRef::Val(InstId(9))],
+                    },
+                }, // 10
+            ],
+            blocks: vec![Block {
+                insts: (0..=10).map(InstId).collect(),
+                term: Term::Ret(None),
+            }],
+        }
+    }
+
+    fn host_and_kernel_module(host: Function, kernels: Vec<Function>) -> Module {
+        let mut funcs = vec![host];
+        funcs.extend(kernels);
+        Module {
+            funcs,
+            launch_bounds: None,
+            shared_mem_bytes: 0,
+            target_dtypes: vec![],
+        }
+    }
+
+    #[test]
+    fn supports_and_emits_host_function_launching_a_kernel() {
+        let module = host_and_kernel_module(func_host_launches_add_i32(), vec![func_add_i32()]);
+        assert_eq!(X86Oracle.supports(&module), Support::Supported);
+
+        let artifact = X86Oracle
+            .emit(&module, &EmitOpts::default())
+            .expect("emit succeeds for a host function launching a real kernel");
+        let bytes = artifact.as_bytes().unwrap();
+        let file = object::read::File::parse(bytes).expect("parses as an object file");
+        let text = file.section_by_name(".text").expect(".text present");
+        let text_len = text.data().unwrap().len() as u64;
+
+        let host_sym = file
+            .symbols()
+            .find(|s| s.name() == Ok("host_main"))
+            .expect("host symbol present");
+        let kernel_sym = file
+            .symbols()
+            .find(|s| s.name() == Ok("add_i32"))
+            .expect("kernel symbol present");
+        assert_ne!(host_sym.address(), kernel_sym.address());
+        assert!(host_sym.size() > 0);
+        assert!(kernel_sym.size() > 0);
+        assert!(host_sym.address() + host_sym.size() <= text_len);
+        assert!(kernel_sym.address() + kernel_sym.size() <= text_len);
+    }
+
+    #[test]
+    fn refuses_kernel_present_but_never_launched_with_e093() {
+        let module = host_and_kernel_module(
+            func_host_launches_add_i32(),
+            vec![func_add_i32(), func_max_i32()],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_launch_naming_a_function_not_in_the_module_with_e093() {
+        let module = host_and_kernel_module(func_host_launches_add_i32(), vec![]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_non_default_shared_operand_with_e093() {
+        let mut host = func_host_launches_add_i32();
+        host.insts[6].op = Op::ConstInt(4096); // shared: non-default, non-zero
+        let module = host_and_kernel_module(host, vec![func_add_i32()]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_non_default_stream_operand_with_e093() {
+        let mut host = func_host_launches_add_i32();
+        host.insts[7].op = Op::ConstInt(7); // stream: non-default, non-null
+        let module = host_and_kernel_module(host, vec![func_add_i32()]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_cuda_malloc_inside_host_function_with_e090() {
+        let mut host = func_host_launches_add_i32();
+        let malloc_id = InstId(host.insts.len() as u32);
+        host.insts.push(Inst {
+            ty: Ty::Ptr(AddrSpace::Global),
+            op: Op::CudaMalloc {
+                size: ValRef::Val(InstId(6)),
+            },
+        });
+        host.blocks[0].insts.push(malloc_id);
+        let module = host_and_kernel_module(host, vec![func_add_i32()]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedOp)
+        );
+    }
+
+    /// `Op::CudaDeviceSynchronize` inside a host function is a real no-op (every launch this
+    /// backend accepts already runs synchronously inside its own `call`), not refused.
+    #[test]
+    fn supports_cuda_device_synchronize_inside_host_function() {
+        let mut host = func_host_launches_add_i32();
+        let sync_id = InstId(host.insts.len() as u32);
+        host.insts.push(Inst {
+            ty: Ty::Void,
+            op: Op::CudaDeviceSynchronize,
+        });
+        host.blocks[0].insts.push(sync_id);
+        let module = host_and_kernel_module(host, vec![func_add_i32()]);
+        assert_eq!(X86Oracle.supports(&module), Support::Supported);
+        X86Oracle
+            .emit(&module, &EmitOpts::default())
+            .expect("emit succeeds with a real cudaDeviceSynchronize no-op");
+    }
+
+    #[test]
+    fn refuses_two_host_functions_with_e093() {
+        let mut second_host = func_host_launches_add_i32();
+        second_host.name = "other_host".into();
+        let module = host_and_kernel_module(
+            func_host_launches_add_i32(),
+            vec![second_host, func_add_i32()],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
             Support::Unsupported(ECode::UnsupportedFeature)
         );
     }

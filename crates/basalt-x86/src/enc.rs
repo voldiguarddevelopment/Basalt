@@ -128,6 +128,20 @@ impl Enc {
         debug_assert!(prev.is_none(), "label defined twice: {name}");
     }
 
+    /// The current length of the byte buffer — the offset the *next* emitted byte will land
+    /// at. Lets a caller record a function's own entry offset directly (e.g. right before
+    /// its `label` call), without waiting for `finish` to resolve anything.
+    pub fn pos(&self) -> usize {
+        self.code.len()
+    }
+
+    /// The already-resolved byte offset of `name`, if it has been defined so far. Used to
+    /// build per-function `ElfSymbol` entries for a multi-function combined buffer without
+    /// waiting for `finish` (which discards its own label map once every fixup is patched).
+    pub fn label_offset(&self, name: &str) -> Option<usize> {
+        self.labels.get(name).copied()
+    }
+
     fn insn(&mut self, prefix: Option<u8>, rex_w: bool, opcode: &[u8], reg: u8, rm: Rm) {
         if let Some(p) = prefix {
             self.code.push(p);
@@ -147,6 +161,20 @@ impl Enc {
 
     pub fn jmp(&mut self, target_label: &str) {
         self.code.push(0xE9);
+        self.rel32_fixup(target_label);
+    }
+
+    /// `call rel32` (opcode `0xE8`), relative to the address of the *next* instruction —
+    /// identical displacement convention to `jmp`/`jcc`, reusing the same fixup mechanism.
+    /// The one precondition this backend's own callers must uphold that `jmp`/`jcc` never
+    /// had to: `target_label` names an entry point that may live in a *different*
+    /// function's own code than the one currently being encoded, so both functions' bytes
+    /// must already share this single `Enc`'s buffer (see `oracle.rs`'s multi-function
+    /// lowering) — `finish`'s fixup resolution has no notion of "function" at all, only byte
+    /// offsets within its own buffer, so this falls out of the existing mechanism with no
+    /// new machinery.
+    pub fn call(&mut self, target_label: &str) {
+        self.code.push(0xE8);
         self.rel32_fixup(target_label);
     }
 
@@ -641,4 +669,65 @@ pub mod cc {
     pub const GE: u8 = 0xD;
     pub const LE: u8 = 0xE;
     pub const G: u8 = 0xF;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A forward `jmp`: `nop; jmp target; nop; target:`. `jmp rel32` is `E9` + a 4-byte
+    /// displacement counted from the address of the *next* instruction, so from the `jmp`
+    /// at offset 1 (5 bytes long, next instruction at offset 6) to `target` at offset 7 the
+    /// displacement is `7 - 6 = 1`.
+    #[test]
+    fn jmp_rel32_encodes_hand_computed_displacement() {
+        let mut enc = Enc::new();
+        enc.nop();
+        enc.jmp("target");
+        enc.nop();
+        enc.label("target");
+        let code = enc.finish();
+
+        assert_eq!(code[0], 0x90);
+        assert_eq!(code[1], 0xE9);
+        assert_eq!(&code[2..6], &1i32.to_le_bytes());
+        assert_eq!(code[6], 0x90);
+        assert_eq!(code.len(), 7);
+    }
+
+    /// A backward `call`: `target: nop; nop; call target`. `call rel32` is `E8` + a 4-byte
+    /// displacement from the address of the instruction after the `call`. `target` is at
+    /// offset 0; the `call` opcode byte sits at offset 2 (5 bytes long, next instruction at
+    /// offset 7), so the displacement is `0 - 7 = -7`.
+    #[test]
+    fn call_rel32_encodes_hand_computed_backward_displacement() {
+        let mut enc = Enc::new();
+        enc.label("target");
+        enc.nop();
+        enc.nop();
+        enc.call("target");
+        let code = enc.finish();
+
+        assert_eq!(code[2], 0xE8);
+        assert_eq!(&code[3..7], &(-7i32).to_le_bytes());
+        assert_eq!(code.len(), 7);
+    }
+
+    /// A forward `call` to a not-yet-defined label, exactly the shape a host function's own
+    /// call to a kernel defined later in the same combined buffer takes: `call target; nop;
+    /// target:`. The `call` opcode is at offset 0 (5 bytes long, next instruction at offset
+    /// 5); `target` is at offset 6, so the displacement is `6 - 5 = 1`.
+    #[test]
+    fn call_rel32_encodes_hand_computed_forward_displacement() {
+        let mut enc = Enc::new();
+        enc.call("target");
+        enc.nop();
+        enc.label("target");
+        let code = enc.finish();
+
+        assert_eq!(code[0], 0xE8);
+        assert_eq!(&code[1..5], &1i32.to_le_bytes());
+        assert_eq!(code[5], 0x90);
+        assert_eq!(code.len(), 6);
+    }
 }

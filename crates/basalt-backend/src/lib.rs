@@ -17,4 +17,4 @@ mod backend;
 mod elf;
 
 pub use backend::{Artifact, ArtifactKind, Backend, EmitOpts, OptLevel, Payload, Support};
-pub use elf::{write_elf_object, Architecture, ElfObjectSpec, Endianness};
+pub use elf::{write_elf_object, Architecture, ElfObjectSpec, ElfSymbol, Endianness};

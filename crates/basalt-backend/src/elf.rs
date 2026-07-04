@@ -18,18 +18,31 @@ pub use object::{Architecture, Endianness};
 
 use basalt_diag::{Diag, ECode};
 
-/// A single global symbol exported at the start of `.text`, sized to cover the whole
-/// section. Sufficient for one kernel/function per object, which is all the hand-rolled
-/// backends need for now; multi-symbol objects can grow this later without
-/// changing the shape of this module's contract.
+/// One named symbol within a combined `.text` blob: `name` bound `offset` bytes into
+/// `.text`, `size` bytes long. `offset`/`size` are always relative to the start of
+/// `.text`, regardless of how many other symbols share the section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElfSymbol {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// One or more named symbols sharing a single combined `.text` blob. The common case (one
+/// kernel/function per object) is `ElfObjectSpec::new`, a symbol at offset 0 sized to cover
+/// the whole section; `ElfObjectSpec::new_multi` is for objects combining several
+/// functions' machine code into one `.text` blob (e.g. `basalt-x86`'s oracle lowering a
+/// host function alongside the kernel(s) it launches) — each symbol names its own entry
+/// point at its own offset, with no relocation needed since every offset is known when the
+/// spec is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElfObjectSpec {
     /// ISA the object targets. Determines how the ELF header's `e_machine` field reads.
     pub architecture: Architecture,
     /// Byte order of the target ISA.
     pub endian: Endianness,
-    /// Name bound to offset 0 of `.text`, `size = text.len()`.
-    pub symbol: String,
+    /// Every named symbol exported from `.text`.
+    pub symbols: Vec<ElfSymbol>,
     /// Machine code for `.text`. May be empty (an object with only data is legal ELF).
     pub text: Vec<u8>,
     /// Required alignment of `.text` within the object, in bytes. Must be a power of two.
@@ -49,10 +62,32 @@ impl ElfObjectSpec {
         symbol: impl Into<String>,
         text: Vec<u8>,
     ) -> ElfObjectSpec {
+        let size = text.len() as u64;
+        ElfObjectSpec::new_multi(
+            architecture,
+            endian,
+            vec![ElfSymbol {
+                name: symbol.into(),
+                offset: 0,
+                size,
+            }],
+            text,
+        )
+    }
+
+    /// A spec with several symbols sharing one `.text` blob, 16-byte aligned. Each
+    /// `ElfSymbol`'s `offset`/`size` names where within `text` that symbol's own machine
+    /// code lives.
+    pub fn new_multi(
+        architecture: Architecture,
+        endian: Endianness,
+        symbols: Vec<ElfSymbol>,
+        text: Vec<u8>,
+    ) -> ElfObjectSpec {
         ElfObjectSpec {
             architecture,
             endian,
-            symbol: symbol.into(),
+            symbols,
             text,
             text_align: 16,
             rodata: None,
@@ -83,17 +118,20 @@ pub fn write_elf_object(spec: &ElfObjectSpec) -> Result<Vec<u8>, Diag> {
     let mut obj = Object::new(BinaryFormat::Elf, spec.architecture, spec.endian);
 
     let text_id = obj.section_id(StandardSection::Text);
-    let symbol_id = obj.add_symbol(Symbol {
-        name: spec.symbol.clone().into_bytes(),
-        value: 0,
-        size: spec.text.len() as u64,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Linkage,
-        weak: false,
-        section: SymbolSection::Undefined,
-        flags: SymbolFlags::None,
-    });
-    obj.add_symbol_data(symbol_id, text_id, &spec.text, spec.text_align);
+    let base = obj.append_section_data(text_id, &spec.text, spec.text_align);
+    for sym in &spec.symbols {
+        let symbol_id = obj.add_symbol(Symbol {
+            name: sym.name.clone().into_bytes(),
+            value: 0,
+            size: sym.size,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        obj.set_symbol_data(symbol_id, text_id, base + sym.offset, sym.size);
+    }
 
     if let Some(rodata) = &spec.rodata {
         let id = obj.section_id(StandardSection::ReadOnlyData);
@@ -154,6 +192,49 @@ mod tests {
         assert_eq!(rodata.data().unwrap(), &[0x01, 0x02, 0x03, 0x04]);
         let data = file.section_by_name(".data").expect(".data present");
         assert_eq!(data.data().unwrap(), &[0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn multi_symbol_object_names_each_function_at_its_own_offset() {
+        // Two "functions" concatenated into one .text blob: 3 bytes of nops+ret, then a
+        // second function's own 5 bytes at offset 3.
+        let text = vec![0x90, 0x90, 0xc3, 0x90, 0x90, 0x90, 0x90, 0xc3];
+        let spec = ElfObjectSpec::new_multi(
+            Architecture::X86_64,
+            Endianness::Little,
+            vec![
+                ElfSymbol {
+                    name: "first".into(),
+                    offset: 0,
+                    size: 3,
+                },
+                ElfSymbol {
+                    name: "second".into(),
+                    offset: 3,
+                    size: 5,
+                },
+            ],
+            text.clone(),
+        );
+        let bytes = write_elf_object(&spec).expect("write succeeds");
+
+        let file = object::read::File::parse(&*bytes).expect("parses as an object file");
+        let section = file.section_by_name(".text").expect(".text present");
+        assert_eq!(section.data().unwrap(), &text[..]);
+
+        let first = file
+            .symbols()
+            .find(|s| s.name() == Ok("first"))
+            .expect("symbol `first` present");
+        assert_eq!(first.address(), 0);
+        assert_eq!(first.size(), 3);
+
+        let second = file
+            .symbols()
+            .find(|s| s.name() == Ok("second"))
+            .expect("symbol `second` present");
+        assert_eq!(second.address(), 3);
+        assert_eq!(second.size(), 5);
     }
 
     #[test]
