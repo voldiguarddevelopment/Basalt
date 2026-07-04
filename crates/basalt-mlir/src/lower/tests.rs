@@ -245,8 +245,21 @@ fn lower_vector_add() -> BirModule {
 /// Returns `None` (skipping the caller's assertions on its output) if `mlir-opt` is not on
 /// `PATH`, mirroring `basalt-llvm::tests::link_and_run`'s own `cc`-not-found handling.
 fn run_mlir_opt(text: &str) -> Option<String> {
+    // `std::process::id()` alone is not enough to keep two tests' scratch files from
+    // colliding: `cargo test` runs every test in this file as separate threads of the *same*
+    // process, so a PID-only name lets one test's `remove_file` race another's still-running
+    // `mlir-opt` (found running this file's own new tests in parallel with the pre-existing
+    // `vector_add` one) — add a real timestamp, mirroring `emit::scratch_path`'s identical
+    // fix for the same race.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_nanos();
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("basalt-mlir-test-{}.mlir", std::process::id()));
+    let path = dir.join(format!(
+        "basalt-mlir-test-{}-{nanos}.mlir",
+        std::process::id()
+    ));
     std::fs::write(&path, text).expect("write scratch .mlir file");
 
     let result = Command::new("mlir-opt").arg(&path).output();
@@ -323,13 +336,13 @@ fn super_test_context() -> melior::Context {
 
 // ---- real pipeline: tests/kernels/tri_vadd.py (masked Triton vector-add), P11-T3 ------------
 //
-// See this module's own "Local/shared/constant/param storage", "Op::Phi", and especially
-// "Known gap" sections above: this is the real, `mlir-opt`-checked proof that P11-T3's actual
-// blocker for `tri_vadd.py` is neither local-slot storage nor `Op::Phi` (both are implemented
-// and exercised by this test's own BIR) but `basalt-sema::triton_lower`'s tile-scratch reuse
-// of the kernel's own last pointer parameter (`c_ptr`) at more than one element type, which
-// this lowering's `memref`-per-parameter model has no representation for. This test asserts
-// the honest current outcome — a stable, precise refusal — rather than a guessed-at success.
+// See this module's own "Local/shared/constant/param storage", "Op::Phi", and "A `Global`
+// parameter accessed at more than one element type" sections above: this is the real,
+// `mlir-opt`-checked proof that P11-T3's actual blocker for `tri_vadd.py` — neither local-slot
+// storage nor `Op::Phi` (both implemented and exercised by this test's own BIR since P11-T3a),
+// but `basalt-sema::triton_lower`'s tile-scratch reuse of the kernel's own last pointer
+// parameter (`c_ptr`) at more than one element type — is now closed by the byte-addressed
+// `memref<?xi8>`/`memref.view` fallback (P11-T3c).
 
 const TRI_VADD_SRC: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -367,20 +380,67 @@ fn compile_triton(src: &str) -> BirModule {
 }
 
 #[test]
-fn tri_vadd_refuses_on_a_stable_e_code_pending_a_byte_addressed_memref_layer() {
+fn tri_vadd_lowers_to_a_well_formed_module_via_the_real_pipeline() {
     let module = compile_triton(TRI_VADD_SRC);
-    let err = lower_to_text(&module).expect_err(
+    let text = lower_to_text(&module).expect(
         "tri_vadd.py's scratch-sharing parameter (c_ptr, read/written at i64/i1/f32 through \
-         basalt-sema's tile-scratch reuse) is not yet representable by this lowering's \
-         one-memref-type-per-parameter model — see this module's own \"Known gap\" section",
+         basalt-sema's tile-scratch reuse) now gets the byte-addressed memref<?xi8>/memref.view \
+         fallback (P11-T3c) — see this module's own \"A Global parameter accessed at more than \
+         one element type\" section",
     );
-    assert_eq!(err.code, ECode::UnsupportedAddressSpace);
+
+    // In-process confirmation: melior's own C-API parser/verifier (not just this crate's own
+    // construction path) accepts the printed text.
+    let context = super_test_context();
+    let reparsed =
+        melior::ir::Module::parse(&context, &text).expect("emitted text re-parses as valid MLIR");
+    assert!(
+        melior::ir::operation::OperationLike::verify(&reparsed.as_operation()),
+        "re-parsed module fails melior's own verifier"
+    );
+
+    assert!(text.contains("gpu.module"));
+    assert!(text.contains("gpu.func"));
+    assert!(text.contains("gpu.block_id"));
+    // `c_ptr` (last pointer parameter, `basalt-sema`'s tile-scratch buffer, real i64/i1/f32
+    // traffic) is the one parameter this kernel visits at more than one element type, so it
+    // alone gets the byte-addressed `memref<?xi8>` model; `a_ptr`/`b_ptr` are each visited at
+    // `f32` only and keep the plain, direct `memref<?xf32>` model unchanged.
+    assert!(text.contains("memref<?xi8>"));
+    assert!(text.contains("memref<?xf32>"));
+    assert!(text.contains("memref.view"));
+    assert!(text.contains("memref.load"));
+    assert!(text.contains("memref.store"));
+    assert!(text.contains("arith.addf"));
+    assert!(text.contains("cf.cond_br"));
+
+    // Out-of-process confirmation: a real `mlir-opt` (LLVM/MLIR 22.1.6 on the one machine this
+    // feature lane builds on) parses and verifies it with no diagnostics.
+    run_mlir_opt(&text);
 }
 
 #[test]
-fn tri_vadd_refusal_is_deterministic() {
+fn tri_vadd_emit_is_deterministic_through_the_real_pipeline() {
     let module = compile_triton(TRI_VADD_SRC);
-    let a = lower_to_text(&module).unwrap_err();
-    let b = lower_to_text(&module).unwrap_err();
-    assert_eq!(a.code, b.code);
+    let a = lower_to_text(&module).unwrap();
+    let b = lower_to_text(&module).unwrap();
+    assert_eq!(a, b);
+}
+
+/// Not this task's own bar (real hardware dispatch is a separate follow-on's job — see this
+/// crate's own P11-T3c task brief), but a quick, real confirmation that the byte-addressed
+/// `memref<?xi8>`/`memref.view` model this test's own module now emits is not a dead end for
+/// `emit::emit_ptx_text`'s real `-convert-gpu-to-nvvm`/`-gpu-module-to-binary` pipeline either:
+/// it turns this module into real NVPTX PTX text with no error, the same success bar
+/// `emit::tests` already holds `vector_add.cu` to.
+#[test]
+fn tri_vadd_also_emits_through_the_real_nvptx_pipeline() {
+    let module = compile_triton(TRI_VADD_SRC);
+    match crate::emit::emit_ptx_text(&module) {
+        Ok(ptx) => assert!(
+            ptx.contains(".visible .entry"),
+            "expected real PTX kernel text, got:\n{ptx}"
+        ),
+        Err(e) => panic!("emit_ptx_text failed on tri_vadd.py's byte-addressed module: {e}"),
+    }
 }
