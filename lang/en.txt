@@ -28,6 +28,7 @@ E304 = lowering does not yet support {0}: {1}
 E305 = tile shapes are not broadcast-compatible: {0} vs {1}
 E306 = tile dimension is not a compile-time-constant expression: {0}
 E307 = construct not supported by tile-shape inference: {0}
+E308 = const violation: {0}
 
 E400 = malformed BIR: {0}
 E401 = BIR round-trip mismatch

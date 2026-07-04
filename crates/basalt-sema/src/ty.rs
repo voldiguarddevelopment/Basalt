@@ -11,7 +11,11 @@ use basalt_frontend_c::ast::ScalarKind;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ty {
     Scalar(ScalarKind),
-    Pointer(Box<Ty>),
+    /// `Pointer(pointee, pointee_const)`: `pointee_const` is `true` for a pointer-to-const
+    /// (`const int *p`) and `false` otherwise, including for a const *pointer* itself
+    /// (`int *const p`) — that top-level const-ness belongs to whatever declared the pointer
+    /// object, not to its type (see `checker::top_level_const` / `ValueSym::Var`'s own `bool`).
+    Pointer(Box<Ty>, bool),
     Array(Box<Ty>),
     Struct(String),
     Union(String),
@@ -61,11 +65,18 @@ impl Ty {
     }
 
     pub(crate) fn is_pointer(&self) -> bool {
-        matches!(self, Ty::Pointer(_))
+        matches!(self, Ty::Pointer(..))
     }
 
     pub(crate) fn is_pointer_like(&self) -> bool {
-        matches!(self, Ty::Pointer(_) | Ty::Array(_))
+        matches!(self, Ty::Pointer(..) | Ty::Array(_))
+    }
+
+    /// Whether this is a pointer whose *pointee* is `const`-qualified (`const int *`, not
+    /// `int *const`) — assigning through such a pointer (`*p = ...`, `p->f = ...`, `p[i] = ...`)
+    /// is a const violation even though `p` itself may be freely reassigned.
+    pub(crate) fn pointee_const(&self) -> bool {
+        matches!(self, Ty::Pointer(_, true))
     }
 
     pub(crate) fn is_integer(&self) -> bool {
@@ -92,7 +103,7 @@ impl Ty {
     /// The pointee (pointer) or element (array) type, for `*`/`[]`/`->`.
     pub(crate) fn deref_target(&self) -> Option<Ty> {
         match self {
-            Ty::Pointer(p) => Some((**p).clone()),
+            Ty::Pointer(p, _) => Some((**p).clone()),
             Ty::Array(e) => Some((**e).clone()),
             _ => None,
         }
@@ -120,11 +131,11 @@ pub(crate) fn assignable(target: &Ty, value: &Ty) -> bool {
         (Ty::Scalar(a), Ty::Enum(_)) => is_integer_kind(*a),
         (Ty::Enum(_), Ty::Scalar(b)) => is_integer_kind(*b),
         (Ty::Enum(_), Ty::Enum(_)) => true,
-        (Ty::Pointer(pa), Ty::Pointer(pb)) => {
+        (Ty::Pointer(pa, _), Ty::Pointer(pb, _)) => {
             pa.is_void_pointee() || pb.is_void_pointee() || pa == pb
         }
-        (Ty::Pointer(pa), Ty::Array(eb)) => pa.is_void_pointee() || **pa == **eb,
-        (Ty::Pointer(_), Ty::Scalar(b)) => is_integer_kind(*b),
+        (Ty::Pointer(pa, _), Ty::Array(eb)) => pa.is_void_pointee() || **pa == **eb,
+        (Ty::Pointer(..), Ty::Scalar(b)) => is_integer_kind(*b),
         (Ty::Struct(a), Ty::Struct(b)) => a == b,
         (Ty::Union(a), Ty::Union(b)) => a == b,
         _ => false,

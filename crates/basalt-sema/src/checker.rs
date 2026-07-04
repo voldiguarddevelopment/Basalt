@@ -134,6 +134,20 @@ pub(crate) fn float_lit_ty(lit: &FloatLit) -> Ty {
     })
 }
 
+/// The top-level `const` on a type as written (`const int`, `const struct Foo`, `T *const`):
+/// the qualifier a declaration's own object carries, as opposed to a pointer's pointee-const
+/// (tracked instead on `Ty::Pointer` itself — see `resolve_type`'s `Type::Pointer` arm). Array
+/// and template-instantiated types have no `Qualifiers` of their own to read.
+pub(crate) fn top_level_const(ty: &Type) -> bool {
+    match ty {
+        Type::Scalar { quals, .. }
+        | Type::Tag { quals, .. }
+        | Type::Named { quals, .. }
+        | Type::Pointer { quals, .. } => quals.is_const,
+        Type::Array { .. } | Type::Instantiated { .. } => false,
+    }
+}
+
 pub(crate) fn compound_binop(op: AssignOp) -> BinOp {
     match op {
         AssignOp::AddAssign => BinOp::Add,
@@ -259,6 +273,14 @@ impl Checker {
         );
     }
 
+    fn err_const(&mut self, span: FSpan, msg: impl Into<String>) {
+        self.diags.push(
+            Diag::new(ECode::ConstViolation)
+                .with_span(conv_span(span))
+                .with_arg(msg.into()),
+        );
+    }
+
     // ---- items ----------------------------------------------------------------------------
 
     fn check_items(&mut self, items: &[Item]) {
@@ -292,7 +314,7 @@ impl Checker {
         let mut fields = Vec::with_capacity(d.fields.len());
         for f in &d.fields {
             let ty = self.resolve_type(&f.ty);
-            fields.push((f.name.clone(), ty));
+            fields.push((f.name.clone(), ty, top_level_const(&f.ty)));
         }
         if let Some(name) = &d.name {
             if self.scopes.declare_struct(name, StructInfo { fields }) {
@@ -305,7 +327,7 @@ impl Checker {
         let mut fields = Vec::with_capacity(d.fields.len());
         for f in &d.fields {
             let ty = self.resolve_type(&f.ty);
-            fields.push((f.name.clone(), ty));
+            fields.push((f.name.clone(), ty, top_level_const(&f.ty)));
         }
         if let Some(name) = &d.name {
             if self.scopes.declare_union(name, StructInfo { fields }) {
@@ -359,7 +381,10 @@ impl Checker {
                 );
             }
         }
-        if self.scopes.declare_value(&v.name, ValueSym::Var(ty)) {
+        if self
+            .scopes
+            .declare_value(&v.name, ValueSym::Var(ty, top_level_const(&v.ty)))
+        {
             self.err_redef(v.span, &v.name);
         }
     }
@@ -450,7 +475,11 @@ impl Checker {
         }
         for (p, ty) in f.params.iter().zip(param_tys.iter()) {
             if let Some(name) = &p.name {
-                if self.scopes.declare_value(name, ValueSym::Var(ty.clone())) {
+                let is_const = top_level_const(&p.ty);
+                if self
+                    .scopes
+                    .declare_value(name, ValueSym::Var(ty.clone(), is_const))
+                {
                     self.err_redef(p.span, name);
                 }
             }
@@ -478,15 +507,16 @@ impl Checker {
             CUDA_DIM3_STRUCT,
             StructInfo {
                 fields: vec![
-                    ("x".to_string(), Ty::Scalar(ScalarKind::UInt)),
-                    ("y".to_string(), Ty::Scalar(ScalarKind::UInt)),
-                    ("z".to_string(), Ty::Scalar(ScalarKind::UInt)),
+                    ("x".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                    ("y".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                    ("z".to_string(), Ty::Scalar(ScalarKind::UInt), false),
                 ],
             },
         );
         let dim3 = Ty::Struct(CUDA_DIM3_STRUCT.to_string());
         for name in CUDA_DIM3_BUILTINS {
-            self.scopes.declare_value(name, ValueSym::Var(dim3.clone()));
+            self.scopes
+                .declare_value(name, ValueSym::Var(dim3.clone(), false));
         }
         self.scopes.declare_value(
             "__syncthreads",
@@ -518,7 +548,7 @@ impl Checker {
                 }),
             );
         }
-        let int_ptr = Ty::Pointer(Box::new(int.clone()));
+        let int_ptr = Ty::Pointer(Box::new(int.clone()), false);
         for name in CUDA_ATOMIC_RMW_BUILTINS {
             self.scopes.declare_value(
                 name,
@@ -709,7 +739,10 @@ impl Checker {
                 self.err_undef(*span, name);
                 Ty::Unknown
             }
-            Type::Pointer { pointee, .. } => Ty::Pointer(Box::new(self.resolve_type(pointee))),
+            Type::Pointer { pointee, .. } => {
+                let pointee_const = top_level_const(pointee);
+                Ty::Pointer(Box::new(self.resolve_type(pointee)), pointee_const)
+            }
             Type::Array { elem, size, .. } => {
                 if let Some(sz) = size {
                     self.type_of(sz);
@@ -786,9 +819,15 @@ impl Checker {
             }
             Add => {
                 if l.is_pointer_like() && r.is_integer() {
-                    Ty::Pointer(Box::new(l.deref_target().unwrap_or(Ty::Unknown)))
+                    Ty::Pointer(
+                        Box::new(l.deref_target().unwrap_or(Ty::Unknown)),
+                        l.pointee_const(),
+                    )
                 } else if r.is_pointer_like() && l.is_integer() {
-                    Ty::Pointer(Box::new(r.deref_target().unwrap_or(Ty::Unknown)))
+                    Ty::Pointer(
+                        Box::new(r.deref_target().unwrap_or(Ty::Unknown)),
+                        r.pointee_const(),
+                    )
                 } else if l.is_arithmetic() && r.is_arithmetic() {
                     promote(l, r)
                 } else if unknown_operand {
@@ -802,7 +841,10 @@ impl Checker {
                 if l.is_pointer_like() && r.is_pointer_like() {
                     Ty::Scalar(ScalarKind::Long)
                 } else if l.is_pointer_like() && r.is_integer() {
-                    Ty::Pointer(Box::new(l.deref_target().unwrap_or(Ty::Unknown)))
+                    Ty::Pointer(
+                        Box::new(l.deref_target().unwrap_or(Ty::Unknown)),
+                        l.pointee_const(),
+                    )
                 } else if l.is_arithmetic() && r.is_arithmetic() {
                     promote(l, r)
                 } else if unknown_operand {
@@ -882,7 +924,7 @@ impl Checker {
                 if t.is_unknown() {
                     Ty::Unknown
                 } else {
-                    Ty::Pointer(Box::new(t))
+                    Ty::Pointer(Box::new(t), self.assigns_to_const(expr))
                 }
             }
         }
@@ -907,6 +949,8 @@ impl Checker {
         let rhs_ty = self.type_of(rhs);
         if !self.is_modifiable_lvalue(lhs, &lhs_ty) {
             self.err_type(lhs.span(), "assignment target is not a modifiable lvalue");
+        } else if self.assigns_to_const(lhs) {
+            self.err_const(lhs.span(), "assignment target is const-qualified");
         }
         match op {
             AssignOp::Assign => {
@@ -1053,20 +1097,127 @@ impl Checker {
         if target.is_unknown() {
             return Ty::Unknown;
         }
-        let fields = match &target {
-            Ty::Struct(n) => self.scopes.lookup_struct(n).map(|s| s.fields.clone()),
-            Ty::Union(n) => self.scopes.lookup_union(n).map(|s| s.fields.clone()),
-            _ => {
-                self.err_type(span, "member access on a non-struct/union type");
-                return Ty::Unknown;
-            }
-        };
-        match fields.and_then(|fs| fs.into_iter().find(|(n, _)| n == name)) {
-            Some((_, ty)) => ty,
+        if !matches!(target, Ty::Struct(_) | Ty::Union(_)) {
+            self.err_type(span, "member access on a non-struct/union type");
+            return Ty::Unknown;
+        }
+        match self.field_entry(&target, name) {
+            Some((ty, _)) => ty,
             None => {
                 self.err_undef(span, name);
                 Ty::Unknown
             }
+        }
+    }
+
+    /// Looks up `name` in a struct/union `Ty`'s field list, returning its type and whether it
+    /// was declared `const`. Pure and side-effect-free (never diagnoses, unlike `check_member`
+    /// which also owns reporting an undefined field) so `assigns_to_const`/`peek_ty` can reuse
+    /// it without any risk of emitting a diagnostic twice.
+    fn field_entry(&self, ty: &Ty, name: &str) -> Option<(Ty, bool)> {
+        let fields = match ty {
+            Ty::Struct(n) => &self.scopes.lookup_struct(n)?.fields,
+            Ty::Union(n) => &self.scopes.lookup_union(n)?.fields,
+            _ => return None,
+        };
+        fields
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, t, c)| (t.clone(), *c))
+    }
+
+    /// Best-effort, side-effect-free re-derivation of an expression's type, used only by
+    /// `assigns_to_const` to inspect the *base* of a member/index/dereference chain. Never
+    /// emits diagnostics (it takes `&self`, so it structurally cannot) — `check_assign` already
+    /// ran full inference (and reported any errors) via `type_of` before `assigns_to_const` is
+    /// consulted, so this only needs to agree with `type_of` on error-free input; anything it
+    /// does not model (calls, casts, arithmetic, ...) degrades to `Ty::Unknown`, which reads as
+    /// "not const" rather than risking a false positive.
+    fn peek_ty(&self, expr: &Expr) -> Ty {
+        match expr {
+            Expr::StrLit { .. } => Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Char)), true),
+            Expr::Ident { name, .. } => match self.scopes.lookup_value(name) {
+                Some(ValueSym::Var(t, _)) => t.clone(),
+                Some(ValueSym::EnumConst(t)) => t.clone(),
+                Some(ValueSym::Func(sig)) => Ty::Function {
+                    ret: Box::new(sig.ret.clone()),
+                    params: sig.params.clone(),
+                    variadic: sig.variadic,
+                },
+                None => Ty::Unknown,
+            },
+            Expr::Member {
+                base, name, arrow, ..
+            } => {
+                let bt = self.peek_ty(base);
+                let target = if *arrow {
+                    bt.deref_target().unwrap_or(Ty::Unknown)
+                } else {
+                    bt
+                };
+                self.field_entry(&target, name)
+                    .map(|(t, _)| t)
+                    .unwrap_or(Ty::Unknown)
+            }
+            Expr::Index { base, .. } => self.peek_ty(base).deref_target().unwrap_or(Ty::Unknown),
+            Expr::Unary {
+                op: UnaryOp::Deref,
+                expr,
+                ..
+            } => self.peek_ty(expr).deref_target().unwrap_or(Ty::Unknown),
+            Expr::Unary {
+                op: UnaryOp::Addr,
+                expr,
+                ..
+            } => Ty::Pointer(Box::new(self.peek_ty(expr)), self.assigns_to_const(expr)),
+            Expr::Comma { exprs, .. } => {
+                exprs.last().map(|e| self.peek_ty(e)).unwrap_or(Ty::Unknown)
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// True if `expr` (which must be lvalue-shaped: `is_lvalue(expr)`) denotes a `const`-
+    /// qualified storage location — a variable/parameter declared `const`, a `const`-qualified
+    /// struct/union field, or a dereference (`*p`, `p[i]`, `p->f`) through a pointer-to-const.
+    /// Distinguishes pointer-to-const (`const int *p`: the pointee is const, `p` itself is
+    /// not) from a const pointer (`int *const p`: `p` itself is const, `*p` is not) — see
+    /// `Ty::Pointer`'s and `ValueSym::Var`'s doc comments for where each half is tracked.
+    fn assigns_to_const(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident { name, .. } => {
+                matches!(self.scopes.lookup_value(name), Some(ValueSym::Var(_, true)))
+            }
+            Expr::Member {
+                base, name, arrow, ..
+            } => {
+                let bt = self.peek_ty(base);
+                let target = if *arrow {
+                    bt.deref_target().unwrap_or(Ty::Unknown)
+                } else {
+                    bt.clone()
+                };
+                let field_const = self
+                    .field_entry(&target, name)
+                    .map(|(_, c)| c)
+                    .unwrap_or(false);
+                field_const
+                    || if *arrow {
+                        bt.pointee_const()
+                    } else {
+                        self.assigns_to_const(base)
+                    }
+            }
+            Expr::Index { base, .. } => match self.peek_ty(base) {
+                Ty::Array(_) => self.assigns_to_const(base),
+                bt => bt.pointee_const(),
+            },
+            Expr::Unary {
+                op: UnaryOp::Deref,
+                expr,
+                ..
+            } => self.peek_ty(expr).pointee_const(),
+            _ => false,
         }
     }
 
@@ -1075,9 +1226,12 @@ impl Checker {
             Expr::IntLit { value, .. } => int_lit_ty(value),
             Expr::FloatLit { value, .. } => float_lit_ty(value),
             Expr::CharLit { .. } => Ty::Scalar(ScalarKind::Char),
-            Expr::StrLit { .. } => Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Char))),
+            // A string literal is `const char *` in C++ (and, pragmatically, in this project's
+            // C-subset too): writing through one is rejected the same way as any other
+            // pointer-to-const, even though nothing else here models literal storage.
+            Expr::StrLit { .. } => Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Char)), true),
             Expr::Ident { name, span } => match self.scopes.lookup_value(name) {
-                Some(ValueSym::Var(t)) => t.clone(),
+                Some(ValueSym::Var(t, _)) => t.clone(),
                 Some(ValueSym::EnumConst(t)) => t.clone(),
                 Some(ValueSym::Func(sig)) => Ty::Function {
                     ret: Box::new(sig.ret.clone()),

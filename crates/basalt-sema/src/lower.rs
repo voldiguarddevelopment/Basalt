@@ -113,7 +113,7 @@ use basalt_frontend_c::ast::{
 use basalt_frontend_c::{FloatLit, FloatSuffix, IntBase, IntLit, Span as FSpan};
 
 use crate::checker::{
-    collect_labels_many, compound_binop, conv_span, float_lit_ty, int_lit_ty,
+    collect_labels_many, compound_binop, conv_span, float_lit_ty, int_lit_ty, top_level_const,
     CUDA_ATOMIC_CAS_BUILTIN, CUDA_DIM3_BUILTINS,
 };
 use crate::scope::{FuncSig, ScopeStack, StructInfo, ValueSym};
@@ -243,7 +243,7 @@ fn to_bir_scalar(k: ScalarKind) -> Option<BScalar> {
 fn to_bir_ty(ty: &Ty) -> BTy {
     match ty {
         Ty::Scalar(k) => to_bir_scalar(*k).map(BTy::Scalar).unwrap_or(BTy::Void),
-        Ty::Pointer(_) | Ty::Array(_) | Ty::Struct(_) | Ty::Union(_) => BTy::Ptr(BSpace::Global),
+        Ty::Pointer(..) | Ty::Array(_) | Ty::Struct(_) | Ty::Union(_) => BTy::Ptr(BSpace::Global),
         Ty::Enum(_) => BTy::Scalar(BScalar::I32),
         Ty::Function { .. } | Ty::Unknown => BTy::Scalar(BScalar::I32),
     }
@@ -549,7 +549,7 @@ impl Lowerer {
                 let mut fields = Vec::with_capacity(d.fields.len());
                 for f in &d.fields {
                     let ty = self.resolve_type(&f.ty);
-                    fields.push((f.name.clone(), ty));
+                    fields.push((f.name.clone(), ty, top_level_const(&f.ty)));
                 }
                 if let Some(name) = &d.name {
                     self.scopes.declare_struct(name, StructInfo { fields });
@@ -559,7 +559,7 @@ impl Lowerer {
                 let mut fields = Vec::with_capacity(d.fields.len());
                 for f in &d.fields {
                     let ty = self.resolve_type(&f.ty);
-                    fields.push((f.name.clone(), ty));
+                    fields.push((f.name.clone(), ty, top_level_const(&f.ty)));
                 }
                 if let Some(name) = &d.name {
                     self.scopes.declare_union(name, StructInfo { fields });
@@ -612,7 +612,7 @@ impl Lowerer {
 
     fn lower_global_var(&mut self, v: &VarDecl) {
         let ty = self.resolve_type(&v.ty);
-        self.scopes.declare_value(&v.name, ValueSym::Var(ty));
+        self.scopes.declare_value(&v.name, ValueSym::Var(ty, false));
         self.unlowered_globals.insert(v.name.clone());
         self.diag_unsupported(
             v.span,
@@ -689,7 +689,10 @@ impl Lowerer {
                 );
                 Ty::Unknown
             }
-            Type::Pointer { pointee, .. } => Ty::Pointer(Box::new(self.resolve_type(pointee))),
+            Type::Pointer { pointee, .. } => Ty::Pointer(
+                Box::new(self.resolve_type(pointee)),
+                top_level_const(pointee),
+            ),
             Type::Array { elem, .. } => Ty::Array(Box::new(self.resolve_type(elem))),
             Type::Instantiated { .. } => Ty::Unknown,
         }
@@ -702,7 +705,7 @@ impl Lowerer {
             Ty::Scalar(k) => to_bir_scalar(*k)
                 .map(|s| u64::from(scalar_byte_size(s)))
                 .unwrap_or(0),
-            Ty::Pointer(_) => 8,
+            Ty::Pointer(..) => 8,
             Ty::Enum(_) => 4,
             // Documented gap: `Ty::Array` carries no element count, so this cannot compute a
             // real total size; treated as a single element (flagged at each `sizeof` call site
@@ -711,7 +714,7 @@ impl Lowerer {
             Ty::Struct(n) => self
                 .scopes
                 .lookup_struct(n)
-                .map(|info| info.fields.iter().map(|(_, t)| self.size_of_ty(t)).sum())
+                .map(|info| info.fields.iter().map(|(_, t, _)| self.size_of_ty(t)).sum())
                 .unwrap_or(0),
             Ty::Union(n) => self
                 .scopes
@@ -719,7 +722,7 @@ impl Lowerer {
                 .map(|info| {
                     info.fields
                         .iter()
-                        .map(|(_, t)| self.size_of_ty(t))
+                        .map(|(_, t, _)| self.size_of_ty(t))
                         .max()
                         .unwrap_or(0)
                 })
@@ -733,7 +736,7 @@ impl Lowerer {
             Ty::Struct(n) => {
                 let info = self.scopes.lookup_struct(n)?;
                 let mut off = 0u64;
-                for (fname, fty) in &info.fields {
+                for (fname, fty, _) in &info.fields {
                     if fname == field {
                         return Some((off, fty.clone()));
                     }
@@ -746,8 +749,8 @@ impl Lowerer {
                 let info = self.scopes.lookup_union(n)?;
                 info.fields
                     .iter()
-                    .find(|(fname, _)| fname == field)
-                    .map(|(_, fty)| (0u64, fty.clone()))
+                    .find(|(fname, _, _)| fname == field)
+                    .map(|(_, fty, _)| (0u64, fty.clone()))
             }
             _ => None,
         }
@@ -1467,7 +1470,7 @@ impl Lowerer {
                     "string literal",
                     "no BIR data-segment representation",
                 );
-                let ty = Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Char)));
+                let ty = Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Char)), true);
                 let v = self.push(BTy::Ptr(BSpace::Global), BOp::ConstInt(0));
                 (v, ty)
             }
@@ -1508,7 +1511,7 @@ impl Lowerer {
                 if lv.ty.is_unknown() {
                     self.placeholder()
                 } else {
-                    (lv.addr, Ty::Pointer(Box::new(lv.ty)))
+                    (lv.addr, Ty::Pointer(Box::new(lv.ty), false))
                 }
             }
             Expr::Unary { op, expr, span } => self.lower_unary(*op, expr, *span),
@@ -1569,7 +1572,7 @@ impl Lowerer {
             if is_aggregate(&slot.ty) {
                 let addr = self.slot_addr(&slot);
                 return match &slot.ty {
-                    Ty::Array(elem) => (addr, Ty::Pointer(elem.clone())),
+                    Ty::Array(elem) => (addr, Ty::Pointer(elem.clone(), false)),
                     _ => {
                         self.diag_unsupported(
                             span,
@@ -1663,7 +1666,7 @@ impl Lowerer {
         }
         if is_aggregate(&lv.ty) {
             return match &lv.ty {
-                Ty::Array(elem) => (lv.addr, Ty::Pointer(elem.clone())),
+                Ty::Array(elem) => (lv.addr, Ty::Pointer(elem.clone(), false)),
                 _ => {
                     self.diag_unsupported(
                         span,
@@ -1689,7 +1692,7 @@ impl Lowerer {
             }
             match lv.ty.clone() {
                 Ty::Array(elem) => (lv.addr, lv.space, *elem),
-                Ty::Pointer(elem) => {
+                Ty::Pointer(elem, _) => {
                     let (v, _) = self.load_addr(&lv);
                     (v, BSpace::Global, *elem)
                 }
@@ -2228,7 +2231,7 @@ impl Lowerer {
         // Arbitrary pointer-*value* arithmetic (as opposed to a known local's own storage,
         // handled through `LValue`) defaults to `Global` — see the module header.
         let addr = self.push(BTy::Ptr(BSpace::Global), BOp::Bin(BBin::Add, pv, byte_off));
-        (addr, Ty::Pointer(Box::new(elem)))
+        (addr, Ty::Pointer(Box::new(elem), false))
     }
 }
 

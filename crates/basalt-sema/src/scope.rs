@@ -13,7 +13,10 @@ use crate::ty::Ty;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StructInfo {
-    pub fields: Vec<(String, Ty)>,
+    /// `(name, type, is_const)` — `is_const` is the field's own top-level `const` (`const int
+    /// x;`), the same flavor of const-ness `ValueSym::Var`'s `bool` carries for a variable;
+    /// a pointer-typed field's pointee-const, if any, already lives in its `Ty::Pointer`.
+    pub fields: Vec<(String, Ty, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +28,10 @@ pub(crate) struct FuncSig {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ValueSym {
-    Var(Ty),
+    /// `Var(type, is_const)` — `is_const` is whether the declared object itself (not its
+    /// pointee, if it is a pointer) was declared `const`: `const int n` or `int *const p`
+    /// (the pointer `p` itself), not `const int *p` (the pointee, tracked on the `Ty` instead).
+    Var(Ty, bool),
     Func(FuncSig),
     EnumConst(Ty),
 }

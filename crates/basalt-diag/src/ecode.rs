@@ -75,6 +75,10 @@ pub enum ECode {
     /// slicing, a reshape producing rank > 2, the `@` matmul operator standing in for
     /// `tl.dot`, ...). Refused outright rather than guessed at.
     TileConstructUnsupported,
+    /// Sema found an assignment (direct or compound) to a `const`-qualified storage location:
+    /// a variable/parameter declared `const`, a `const`-qualified struct/union field, or a
+    /// dereference through a pointer-to-const.
+    ConstViolation,
 
     /// BIR textual parser rejected the input.
     BirParseError,
@@ -117,6 +121,7 @@ impl ECode {
         ECode::TileShapeMismatch,
         ECode::TileDimUnresolved,
         ECode::TileConstructUnsupported,
+        ECode::ConstViolation,
         ECode::BirParseError,
         ECode::BirRoundTripMismatch,
         ECode::IoError,
@@ -149,6 +154,7 @@ impl ECode {
             ECode::TileShapeMismatch => "E305",
             ECode::TileDimUnresolved => "E306",
             ECode::TileConstructUnsupported => "E307",
+            ECode::ConstViolation => "E308",
             ECode::BirParseError => "E400",
             ECode::BirRoundTripMismatch => "E401",
             ECode::IoError => "E500",
