@@ -402,6 +402,42 @@ $stdout_ra"
   fi
 
   echo "  oracle and regalloc agree: $name"
+
+  # MLIR/NVPTX lane, tri_vadd only: basalt-mlir's own gpu/arith/memref/cf-through-mlir-opt
+  # NVPTX path (crates/basalt-mlir/src/emit.rs) is a second, independent way to reach real PTX
+  # for this exact Triton kernel, JIT-loaded and launched on real hardware via basalt-runtime's
+  # CUDA driver loader (crates/basalt-mlir/tests/triton_nvptx_gpu_proof.rs), exactly as
+  # basalt-ptx's own hand-rolled path already is in triton_ptx_gpu_proof.rs — mirrors the
+  # vector_add-only mlir-nvptx lane above, keyed off the Triton kernel instead. This lane needs
+  # `mlir-opt` on PATH plus `--features mlir` buildable plus a working CUDA driver and device;
+  # any of those missing is a clean skip, never a failure of the default run.
+  if [ "$name" = "tri_vadd" ]; then
+    if ! command -v mlir-opt >/dev/null 2>&1; then
+      echo "  skip: mlir-nvptx (no mlir-opt — --features mlir's toolchain is not installed here)"
+    elif ! cargo build --locked --quiet --features mlir -p basalt-mlir 2>"$tmpdir/$name.mlirbuild.log"; then
+      echo "  skip: mlir-nvptx (--features mlir build failed)"
+      sed 's/^/    /' "$tmpdir/$name.mlirbuild.log"
+    else
+      mlir_test_out="$tmpdir/$name.mlir-nvptx.out"
+      if cargo test --locked --quiet --features mlir -p basalt-mlir --test triton_nvptx_gpu_proof \
+        -- --nocapture >"$mlir_test_out" 2>&1; then
+        if grep -q "^PASS: masked triton vector_add via basalt-mlir's NVPTX lane" "$mlir_test_out"; then
+          echo "  mlir-nvptx matches oracle: $name ($(grep '^PASS:' "$mlir_test_out"))"
+        elif grep -q "skipping masked_triton_vector_add_via_mlir_nvptx_runs_on_real_gpu_hardware" "$mlir_test_out"; then
+          skip_reason="$(grep -o 'skipping masked_triton_vector_add_via_mlir_nvptx_runs_on_real_gpu_hardware:.*' "$mlir_test_out" | head -1)"
+          echo "  skip: mlir-nvptx ($skip_reason)"
+        else
+          echo "  FAIL: mlir-nvptx test exited 0 but produced neither a PASS nor a recognized skip line:" >&2
+          sed 's/^/    /' "$mlir_test_out" >&2
+          fail=1
+        fi
+      else
+        echo "  FAIL: mlir-nvptx test (cargo test -p basalt-mlir --test triton_nvptx_gpu_proof) failed:" >&2
+        sed 's/^/    /' "$mlir_test_out" >&2
+        fail=1
+      fi
+    fi
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then
