@@ -19,6 +19,10 @@
 //     anything upstream of it. `cuda_kernel_launch_links_and_runs_via_full_pipeline` is the
 //     real end-to-end proof: a genuine `.cu` host function launching `vector_add.cu`'s own
 //     kernel via real `<<<>>>` syntax, through the whole frontend/sema/lower pipeline.
+//   - `cuda_malloc_memcpy_free_links_and_runs_via_full_pipeline` (P13-T1c-ii) is the real
+//     libc-relocation proof: a genuine `.cu` host function that allocates its own device
+//     buffers via real `cudaMalloc`/`cudaMemcpy`/`cudaFree` calls against libc (this
+//     project's first ever real ELF relocation), through the same whole pipeline.
 //
 // All three scalar-calling-convention proofs read the exact calling convention off
 // `oracle.rs`'s own module header and its `INT_ARG_REGS`/`SSE_ARG_REGS` classification, not off
@@ -528,6 +532,88 @@ fn cuda_kernel_launch_links_and_runs_via_full_pipeline() {
     write_object(bytes, &obj);
 
     compile_link_and_run(&root, "examples/cpu_launch_vadd_host.c", &obj, "vadd_host");
+
+    let _ = std::fs::remove_file(&obj);
+}
+
+/// The real end-to-end proof (P13-T1c-ii): a genuine `.cu` host function
+/// (`tests/kernels/cpu_launch_vadd_malloc.cu`, `launch_vector_add_malloc`) that allocates its
+/// own device buffers via real `cudaMalloc`/`cudaMemcpy`/`cudaFree` calls against libc, rather
+/// than relying on this test's own C driver to pre-allocate them (unlike
+/// `cuda_kernel_launch_links_and_runs_via_full_pipeline` above). Closes the loop this project's
+/// first ever real ELF relocation (`R_X86_64_PLT32` against `malloc`/`memcpy`/`free`,
+/// `basalt_backend::elf::ElfRelocation`) exists to make possible: if the relocation's offset,
+/// addend, or symbol were wrong, `cc`'s own link step would either fail outright or produce a
+/// binary that corrupts memory at `malloc`/`memcpy`/`free`'s real call sites, not just silently
+/// mismatch a value the way a wrong scalar computation would.
+#[test]
+fn cuda_malloc_memcpy_free_links_and_runs_via_full_pipeline() {
+    if !cc_available() {
+        eprintln!(
+            "skipping cuda_malloc_memcpy_free_links_and_runs_via_full_pipeline: `cc` not found"
+        );
+        return;
+    }
+
+    let root = workspace_root();
+    let src_path = root.join("tests/kernels/cpu_launch_vadd_malloc.cu");
+    let src = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", src_path.display()));
+
+    let opts = PpOpts {
+        include_dirs: vec![],
+        defines: vec![],
+        base_dir: src_path.parent().map(Path::to_path_buf),
+    };
+    let (tokens, pp_errors) = basalt_frontend_c::preprocess(&src, &opts);
+    assert!(
+        pp_errors.is_empty(),
+        "preprocessing cpu_launch_vadd_malloc.cu produced problems: {:?}",
+        pp_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    let (tu, parse_errors) = basalt_frontend_c::parse(&tokens);
+    assert!(
+        parse_errors.is_empty(),
+        "parsing cpu_launch_vadd_malloc.cu produced problems: {:?}",
+        parse_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    let sema_diags = basalt_sema::check(&tu);
+    assert!(
+        sema_diags.is_empty(),
+        "type-checking cpu_launch_vadd_malloc.cu produced diagnostics: {:?}",
+        sema_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let (module, lower_diags) = basalt_sema::lower(&tu);
+    assert!(
+        lower_diags.is_empty(),
+        "lowering cpu_launch_vadd_malloc.cu produced diagnostics: {:?}",
+        lower_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    assert_eq!(X86Oracle.supports(&module), Support::Supported);
+    let artifact = X86Oracle
+        .emit(&module, &EmitOpts::default())
+        .expect("oracle emit succeeds for cpu_launch_vadd_malloc.cu + vector_add");
+    let bytes = artifact.as_bytes().expect("oracle emits an object payload");
+
+    let pid = std::process::id();
+    let obj = std::env::temp_dir().join(format!("basalt_vadd_malloc_{pid}.o"));
+    write_object(bytes, &obj);
+
+    compile_link_and_run(
+        &root,
+        "examples/cpu_launch_vadd_malloc.c",
+        &obj,
+        "vadd_malloc",
+    );
 
     let _ = std::fs::remove_file(&obj);
 }

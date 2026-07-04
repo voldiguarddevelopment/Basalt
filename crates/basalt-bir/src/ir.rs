@@ -449,8 +449,10 @@ pub enum Op {
     /// value; `basalt-sema/src/lower.rs`'s lowering immediately follows it with a real `Store`
     /// of that value through `devPtr`'s own address, the same as any other pointer write.
     /// `size` is `size_t`, modeled as `Ty::Scalar(Scalar::I64)` per this project's existing
-    /// `size_t` convention. **Sema-only today** (see `Op::KernelLaunch`'s doc comment): no
-    /// backend allocates real device memory for this yet, refused with `E090` everywhere.
+    /// `size_t` convention. The x86 oracle lowers this to a real call against libc's own
+    /// `malloc` inside a host function (`--cpu`'s "device" memory is just host memory — see
+    /// `basalt-x86::oracle`'s module header, P13-T1c-ii); every other backend
+    /// (`basalt-ptx`/`basalt-spirv`/`basalt-rv`/`basalt-amdgpu`) still refuses it with `E090`.
     CudaMalloc {
         size: ValRef,
     },
@@ -458,21 +460,25 @@ pub enum Op {
     /// `kind` is an ordinary integer operand (`cudaMemcpyKind`'s stable values, `HostToHost=0`
     /// .. `Default=4` — see `basalt-sema/src/checker.rs`'s builtin seeding), not a dedicated
     /// enum field: BIR has no enum type, and a real lowering needs the value at runtime to
-    /// pick a copy path anyway, not just at compile time. **Sema-only today**, refused with
-    /// `E090` everywhere (see `Op::KernelLaunch`'s doc comment).
+    /// pick a copy path anyway, not just at compile time. The x86 oracle lowers this to a real
+    /// call against libc's own `memcpy` inside a host function, ignoring `kind` (there is no
+    /// real host/device distinction to pick a copy path for under a `--cpu` target — see
+    /// `basalt-x86::oracle`'s module header, P13-T1c-ii); every other backend still refuses it
+    /// with `E090`.
     CudaMemcpy {
         dst: ValRef,
         src: ValRef,
         count: ValRef,
         kind: ValRef,
     },
-    /// `cudaFree(void* devPtr)`. **Sema-only today**, refused with `E090` everywhere (see
-    /// `Op::KernelLaunch`'s doc comment).
+    /// `cudaFree(void* devPtr)`. The x86 oracle lowers this to a real call against libc's own
+    /// `free` inside a host function (P13-T1c-ii); every other backend still refuses it with
+    /// `E090`.
     CudaFree {
         ptr: ValRef,
     },
-    /// `cudaDeviceSynchronize(void)`. No operands. **Sema-only today**, refused with `E090`
-    /// everywhere (see `Op::KernelLaunch`'s doc comment).
+    /// `cudaDeviceSynchronize(void)`. No operands. The x86 oracle lowers this to a real `nop`
+    /// inside a host function (P13-T1c-i); every other backend still refuses it with `E090`.
     CudaDeviceSynchronize,
 }
 

@@ -130,13 +130,23 @@
 // value — is refused (`E093`) rather than silently ignored. `Op::CudaDeviceSynchronize`
 // lowers to a real `nop`: every launch this backend can even accept already runs to
 // completion synchronously inside its own `call`, so there is genuinely nothing left to
-// wait for, not a stubbed-out placeholder. `Op::CudaMalloc`/`CudaMemcpy`/`CudaFree` remain
-// refused (`E090`) inside a host function: they need a real relocation against an external
-// libc symbol, which is a separate, later piece of work (see `PLAN.md`'s P13-T1c-ii).
+// wait for, not a stubbed-out placeholder.
 //
-// A kernel launching another kernel, or containing any of these five ops at all, is still
-// refused exactly as before — dynamic parallelism is out of scope, and this backend has no
-// call machinery for a kernel to use one from inside its own per-thread loop.
+// `Op::CudaMalloc`/`CudaMemcpy`/`CudaFree` lower to real calls against libc's own
+// `malloc`/`memcpy`/`free` (`Enc::call_external`, P13-T1c-ii): under a `--cpu` target,
+// "device" memory is just host memory, so this is a genuine, permanent lowering, not a stub.
+// Unlike `Op::KernelLaunch`'s intra-object `call`, the callee's address is never known at
+// emit time — it is only known once the real system linker resolves it against libc — so
+// this is this project's first real ELF relocation (`R_X86_64_PLT32`, see
+// `basalt_backend::elf::ElfRelocation`), threaded from `Enc::externs` through
+// `emit_host_and_kernels` into the emitted object's `.text` relocations. `cudaMemcpy`'s
+// `kind` operand (`cudaMemcpyKind`) is deliberately ignored: there is no real host/device
+// distinction to pick a copy path for under this backend, so an ordinary `memcpy` is always
+// the correct lowering regardless of its value.
+//
+// A kernel containing any of these five ops at all is still refused exactly as before —
+// dynamic parallelism is out of scope, and this backend has no call machinery for a kernel to
+// use one from inside its own per-thread loop.
 //
 // # `mma`
 //
@@ -162,8 +172,8 @@
 use std::collections::HashMap;
 
 use basalt_backend::{
-    write_elf_object, Architecture, Artifact, ArtifactKind, Backend, ElfObjectSpec, ElfSymbol,
-    EmitOpts, Endianness, Support,
+    write_elf_object, Architecture, Artifact, ArtifactKind, Backend, ElfObjectSpec, ElfRelocation,
+    ElfSymbol, EmitOpts, Endianness, Support,
 };
 use basalt_bir::{
     AddrSpace, AtomicOp, BinOp, CastOp, FCmpPred, Function, ICmpPred, InstId, MmaLayout, Module,
@@ -196,7 +206,7 @@ impl Backend for X86Oracle {
 
     fn emit(&self, module: &Module, _opts: &EmitOpts) -> Result<Artifact, Diag> {
         let shape = check_module(module)?;
-        let (text, symbols) = match shape {
+        let (text, symbols, relocations) = match shape {
             ModuleShape::SingleKernel(f) => {
                 let text = emit_function(f)?;
                 let size = text.len() as u64;
@@ -207,12 +217,14 @@ impl Backend for X86Oracle {
                         offset: 0,
                         size,
                     }],
+                    Vec::new(),
                 )
             }
             ModuleShape::HostAndKernels { host, kernels } => emit_host_and_kernels(host, &kernels)?,
         };
         let spec =
-            ElfObjectSpec::new_multi(Architecture::X86_64, Endianness::Little, symbols, text);
+            ElfObjectSpec::new_multi(Architecture::X86_64, Endianness::Little, symbols, text)
+                .with_relocations(relocations);
         let bytes = write_elf_object(&spec)?;
         Ok(Artifact::bytes(ArtifactKind::Object, bytes))
     }
@@ -390,18 +402,19 @@ fn check_function(f: &Function, is_host: bool, launch_targets: &[&Function]) -> 
                 }
             }
             Op::CudaDeviceSynchronize if is_host => {}
+            // `size`/`ptr`/`dst`/`src`/`count` are ordinary operands (any `ValRef` already
+            // validated by the rest of this loop); `kind` is deliberately unchecked (see the
+            // module header on why it carries no meaning under this backend).
+            Op::CudaMalloc { .. } | Op::CudaMemcpy { .. } | Op::CudaFree { .. } if is_host => {}
             Op::KernelLaunch { .. }
             | Op::CudaMalloc { .. }
             | Op::CudaMemcpy { .. }
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
-                return Err(Diag::new(ECode::UnsupportedOp).with_arg(if is_host {
-                    "cudaMalloc/cudaMemcpy/cudaFree need a real relocation against an external \
-                     libc symbol this backend does not emit yet"
-                } else {
+                return Err(Diag::new(ECode::UnsupportedOp).with_arg(
                     "kernel launch / CUDA Runtime API calls inside a kernel (dynamic \
-                     parallelism) are out of scope for this backend"
-                }));
+                     parallelism) are out of scope for this backend",
+                ));
             }
             _ => {}
         }
@@ -789,15 +802,22 @@ fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
     Ok(enc.finish())
 }
 
+/// `.text` bytes, one `ElfSymbol` per function, one `ElfRelocation` per external call — what
+/// `emit_host_and_kernels` hands back to `emit()`.
+type HostAndKernelsText = (Vec<u8>, Vec<ElfSymbol>, Vec<ElfRelocation>);
+
 /// The `ModuleShape::HostAndKernels` path: the host function followed by every kernel it
 /// launches, all lowered into one shared `Enc` so the host's own `call`s can reach them (see
-/// the module header). Returns the combined `.text` bytes plus one `ElfSymbol` per function,
-/// each sized by the gap to the next function's own entry point (or to the end of the
-/// buffer, for whichever function was laid out last).
+/// the module header). Returns the combined `.text` bytes, one `ElfSymbol` per function
+/// (each sized by the gap to the next function's own entry point, or to the end of the
+/// buffer for whichever function was laid out last), and one `ElfRelocation` per
+/// `Enc::call_external` fixup the host recorded (a `cudaMalloc`/`cudaMemcpy`/`cudaFree` call
+/// against libc) — read out of `enc` before `finish` consumes it, exactly like the symbol
+/// offsets above.
 fn emit_host_and_kernels(
     host: &Function,
     kernels: &[&Function],
-) -> Result<(Vec<u8>, Vec<ElfSymbol>), Diag> {
+) -> Result<HostAndKernelsText, Diag> {
     let launch_targets: Vec<KernelSig> = kernels
         .iter()
         .map(|k| KernelSig {
@@ -824,6 +844,20 @@ fn emit_host_and_kernels(
         })
         .collect();
     let total = enc.pos() as u64;
+    // `Enc::call_external`'s own doc comment: `finish` knows nothing about `externs`, so this
+    // must be read out before `finish` consumes `enc`. Every `call rel32` this backend emits
+    // has its addend fixed at `-4` (the disp32 field's own byte width, per the module
+    // header's `# Op::CudaMalloc/CudaMemcpy/CudaFree` section) regardless of which external
+    // symbol it targets.
+    let relocations: Vec<ElfRelocation> = enc
+        .externs()
+        .iter()
+        .map(|(offset, symbol)| ElfRelocation {
+            offset: *offset as u64,
+            symbol: symbol.clone(),
+            addend: -4,
+        })
+        .collect();
     let bytes = enc.finish();
 
     offsets.sort_by_key(|(_, off)| *off);
@@ -839,7 +873,7 @@ fn emit_host_and_kernels(
             }
         })
         .collect();
-    Ok((bytes, symbols))
+    Ok((bytes, symbols, relocations))
 }
 
 impl<'a, 'e> CodeGen<'a, 'e> {
@@ -1082,8 +1116,37 @@ impl<'a, 'e> CodeGen<'a, 'e> {
             // synchronously inside its own `call` (see the module header) — genuinely
             // nothing left to wait for, so this is a real no-op, not a stub.
             Op::CudaDeviceSynchronize => self.enc.nop(),
-            Op::CudaMalloc { .. } | Op::CudaMemcpy { .. } | Op::CudaFree { .. } => {
-                unreachable!("check_module refuses these before codegen starts")
+            // `size` is `size_t` (`Ty::Scalar(Scalar::I64)` per this project's convention),
+            // so it reloads at full 8-byte width straight into the SysV first integer
+            // argument register; `malloc` returns the allocated pointer in `rax`, which is
+            // exactly where this instruction's own result belongs (`basalt-sema`'s own
+            // `Store` of it through `devPtr` is a separate, already-lowered instruction —
+            // see `Op::CudaMalloc`'s own doc comment).
+            Op::CudaMalloc { size } => {
+                let size = *size;
+                self.reload_gpr(size, INT_ARG_REGS[0], W::B8);
+                self.enc.call_external("malloc");
+                self.store_result(id, RAX, W::B8);
+            }
+            // `Ty::Void` — nothing to store.
+            Op::CudaFree { ptr } => {
+                let ptr = *ptr;
+                self.reload_gpr(ptr, INT_ARG_REGS[0], W::B8);
+                self.enc.call_external("free");
+            }
+            // `kind` (`cudaMemcpyKind`) is deliberately unread: under a `--cpu` target
+            // "device" memory is just host memory, so an ordinary `memcpy` is the correct
+            // lowering regardless of which direction the source called for (see the module
+            // header). `Ty::Void` — nothing to store; real `memcpy` returns `dst`, but
+            // nothing in this op's own BIR semantics needs that value read back.
+            Op::CudaMemcpy {
+                dst, src, count, ..
+            } => {
+                let (dst, src, count) = (*dst, *src, *count);
+                self.reload_gpr(dst, INT_ARG_REGS[0], W::B8);
+                self.reload_gpr(src, INT_ARG_REGS[1], W::B8);
+                self.reload_gpr(count, INT_ARG_REGS[2], W::B8);
+                self.enc.call_external("memcpy");
             }
         }
     }
@@ -2644,7 +2707,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_cuda_malloc_inside_host_function_with_e090() {
+    fn supports_and_emits_cuda_malloc_inside_host_function_with_a_real_relocation() {
         let mut host = func_host_launches_add_i32();
         let malloc_id = InstId(host.insts.len() as u32);
         host.insts.push(Inst {
@@ -2655,9 +2718,89 @@ mod tests {
         });
         host.blocks[0].insts.push(malloc_id);
         let module = host_and_kernel_module(host, vec![func_add_i32()]);
+        assert_eq!(X86Oracle.supports(&module), Support::Supported);
+
+        let artifact = X86Oracle
+            .emit(&module, &EmitOpts::default())
+            .expect("emit succeeds for a real cudaMalloc call against libc's own malloc");
+        let bytes = artifact.as_bytes().unwrap();
+        let file = object::read::File::parse(bytes).expect("parses as an object file");
+
+        let malloc_sym = file
+            .symbols()
+            .find(|s| s.name() == Ok("malloc"))
+            .expect("undefined `malloc` symbol present");
+        assert!(
+            malloc_sym.is_undefined(),
+            "malloc must be undefined -- resolved by the real system linker, not this backend"
+        );
+
+        let text = file.section_by_name(".text").expect(".text present");
         assert_eq!(
-            X86Oracle.supports(&module),
-            Support::Unsupported(ECode::UnsupportedOp)
+            text.relocations().count(),
+            1,
+            "expected exactly one real relocation, against malloc"
+        );
+    }
+
+    /// `Op::CudaFree`/`Op::CudaMemcpy` inside a host function are likewise real, each its own
+    /// relocation against a distinct external libc symbol.
+    #[test]
+    fn supports_and_emits_cuda_memcpy_and_free_inside_host_function_with_real_relocations() {
+        let ptr_global = Ty::Ptr(AddrSpace::Global);
+        let i64t = Ty::Scalar(Scalar::I64);
+        let mut host = func_host_launches_add_i32();
+        let dst_id = InstId(host.insts.len() as u32);
+        host.insts.push(Inst {
+            ty: ptr_global,
+            op: Op::ConstInt(0),
+        });
+        let kind_id = InstId(host.insts.len() as u32);
+        host.insts.push(Inst {
+            ty: i64t,
+            op: Op::ConstInt(1),
+        });
+        let memcpy_id = InstId(host.insts.len() as u32);
+        host.insts.push(Inst {
+            ty: Ty::Void,
+            op: Op::CudaMemcpy {
+                dst: ValRef::Val(dst_id),
+                src: ValRef::Val(dst_id),
+                count: ValRef::Val(InstId(6)),
+                kind: ValRef::Val(kind_id),
+            },
+        });
+        let free_id = InstId(host.insts.len() as u32);
+        host.insts.push(Inst {
+            ty: Ty::Void,
+            op: Op::CudaFree {
+                ptr: ValRef::Val(dst_id),
+            },
+        });
+        host.blocks[0]
+            .insts
+            .extend([dst_id, kind_id, memcpy_id, free_id]);
+        let module = host_and_kernel_module(host, vec![func_add_i32()]);
+        assert_eq!(X86Oracle.supports(&module), Support::Supported);
+
+        let artifact = X86Oracle
+            .emit(&module, &EmitOpts::default())
+            .expect("emit succeeds for real cudaMemcpy/cudaFree calls against libc");
+        let bytes = artifact.as_bytes().unwrap();
+        let file = object::read::File::parse(bytes).expect("parses as an object file");
+
+        for name in ["memcpy", "free"] {
+            let sym = file
+                .symbols()
+                .find(|s| s.name() == Ok(name))
+                .unwrap_or_else(|| panic!("undefined `{name}` symbol present"));
+            assert!(sym.is_undefined(), "`{name}` must be undefined");
+        }
+        let text = file.section_by_name(".text").expect(".text present");
+        assert_eq!(
+            text.relocations().count(),
+            2,
+            "expected one relocation each for memcpy and free"
         );
     }
 

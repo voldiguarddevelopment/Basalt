@@ -11,10 +11,12 @@
 // is deterministic: same spec in, byte-identical object out.
 
 use object::write::{
-    Object, StandardSection, Symbol, SymbolFlags, SymbolKind, SymbolScope, SymbolSection,
+    Object, Relocation, StandardSection, Symbol, SymbolFlags, SymbolId, SymbolKind, SymbolScope,
+    SymbolSection,
 };
 use object::BinaryFormat;
 pub use object::{Architecture, Endianness};
+use object::{RelocationEncoding, RelocationFlags, RelocationKind};
 
 use basalt_diag::{Diag, ECode};
 
@@ -26,6 +28,23 @@ pub struct ElfSymbol {
     pub name: String,
     pub offset: u64,
     pub size: u64,
+}
+
+/// One `R_X86_64_PLT32` relocation against an external symbol never defined in this object
+/// (e.g. libc's own `malloc`) — the real system linker (`cc`) resolves `symbol`'s address at
+/// link time, not this crate. `offset` is the byte offset of the disp32 field itself
+/// (relative to the start of `.text`), matching a `call rel32`'s own displacement-field
+/// convention. `addend` is `-4` for a `call rel32`: the ELF/PLT32 relocation calculation is
+/// `S + A - P`, and `P` (the place) is defined as the address of the relocation field itself,
+/// four bytes *before* the next instruction a `call rel32`'s displacement is actually counted
+/// from — see `basalt-x86`'s own `Enc::call_external` doc comment for the full derivation.
+/// x86-64 ELF is RELA-format, so `addend` lives entirely in this struct/the emitted relocation
+/// entry, never patched into `text`'s own bytes (which stay literal zeroes at `offset`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElfRelocation {
+    pub offset: u64,
+    pub symbol: String,
+    pub addend: i64,
 }
 
 /// One or more named symbols sharing a single combined `.text` blob. The common case (one
@@ -43,6 +62,10 @@ pub struct ElfObjectSpec {
     pub endian: Endianness,
     /// Every named symbol exported from `.text`.
     pub symbols: Vec<ElfSymbol>,
+    /// Every relocation against an external symbol referenced from `.text` (e.g. a
+    /// `call rel32` to libc's own `malloc`). Empty for every object that needs no real
+    /// linker-resolved symbol, which is still the common case.
+    pub relocations: Vec<ElfRelocation>,
     /// Machine code for `.text`. May be empty (an object with only data is legal ELF).
     pub text: Vec<u8>,
     /// Required alignment of `.text` within the object, in bytes. Must be a power of two.
@@ -88,6 +111,7 @@ impl ElfObjectSpec {
             architecture,
             endian,
             symbols,
+            relocations: Vec::new(),
             text,
             text_align: 16,
             rodata: None,
@@ -104,6 +128,12 @@ impl ElfObjectSpec {
     #[must_use]
     pub fn with_data(mut self, data: Vec<u8>) -> ElfObjectSpec {
         self.data = Some(data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_relocations(mut self, relocations: Vec<ElfRelocation>) -> ElfObjectSpec {
+        self.relocations = relocations;
         self
     }
 }
@@ -131,6 +161,44 @@ pub fn write_elf_object(spec: &ElfObjectSpec) -> Result<Vec<u8>, Diag> {
             flags: SymbolFlags::None,
         });
         obj.set_symbol_data(symbol_id, text_id, base + sym.offset, sym.size);
+    }
+
+    // Every relocation's target is an external symbol resolved by the real system linker,
+    // never defined in this object — added once per distinct name (two relocations against
+    // the same external symbol, e.g. two `cudaMalloc` call sites both calling `malloc`, must
+    // not register it twice) as a real undefined symbol, then wired to a relocation entry at
+    // its own place in `.text`.
+    let mut extern_symbols: std::collections::HashMap<&str, SymbolId> =
+        std::collections::HashMap::new();
+    for reloc in &spec.relocations {
+        let symbol_id = *extern_symbols
+            .entry(reloc.symbol.as_str())
+            .or_insert_with(|| {
+                obj.add_symbol(Symbol {
+                    name: reloc.symbol.clone().into_bytes(),
+                    value: 0,
+                    size: 0,
+                    kind: SymbolKind::Text,
+                    scope: SymbolScope::Dynamic,
+                    weak: false,
+                    section: SymbolSection::Undefined,
+                    flags: SymbolFlags::None,
+                })
+            });
+        obj.add_relocation(
+            text_id,
+            Relocation {
+                offset: base + reloc.offset,
+                symbol: symbol_id,
+                addend: reloc.addend,
+                flags: RelocationFlags::Generic {
+                    kind: RelocationKind::PltRelative,
+                    encoding: RelocationEncoding::Generic,
+                    size: 32,
+                },
+            },
+        )
+        .map_err(|e| Diag::new(ECode::IoError).with_arg(e.to_string()))?;
     }
 
     if let Some(rodata) = &spec.rodata {
@@ -235,6 +303,43 @@ mod tests {
             .expect("symbol `second` present");
         assert_eq!(second.address(), 3);
         assert_eq!(second.size(), 5);
+    }
+
+    #[test]
+    fn relocation_against_an_external_symbol_is_a_real_plt32_entry() {
+        // `nop; call rel32 <placeholder>; ret` — the disp32 field (offset 2) is left as
+        // literal zero bytes, exactly like `basalt-x86`'s own `Enc::call_external` emits;
+        // the relocation entry itself carries the real addressing information.
+        let text = vec![0x90, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        let spec = ElfObjectSpec::new(Architecture::X86_64, Endianness::Little, "caller", text)
+            .with_relocations(vec![ElfRelocation {
+                offset: 2,
+                symbol: "malloc".into(),
+                addend: -4,
+            }]);
+        let bytes = write_elf_object(&spec).expect("write succeeds");
+
+        let file = object::read::File::parse(&*bytes).expect("parses as an object file");
+        let malloc_sym = file
+            .symbols()
+            .find(|s| s.name() == Ok("malloc"))
+            .expect("undefined `malloc` symbol present");
+        assert!(malloc_sym.is_undefined(), "malloc must be undefined");
+
+        let section = file.section_by_name(".text").expect(".text present");
+        let (reloc_offset, reloc) = section
+            .relocations()
+            .next()
+            .expect("a real relocation entry is present");
+        assert_eq!(reloc_offset, 2);
+        assert_eq!(reloc.addend(), -4);
+        match reloc.target() {
+            object::read::RelocationTarget::Symbol(idx) => {
+                let sym = file.symbol_by_index(idx).expect("symbol resolves");
+                assert_eq!(sym.name(), Ok("malloc"));
+            }
+            other => panic!("expected a symbol-targeted relocation, got {other:?}"),
+        }
     }
 
     #[test]

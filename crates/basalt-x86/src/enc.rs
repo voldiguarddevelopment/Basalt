@@ -112,6 +112,7 @@ pub struct Enc {
     code: Vec<u8>,
     labels: std::collections::HashMap<String, usize>,
     fixups: Vec<(usize, String)>,
+    externs: Vec<(usize, String)>,
 }
 
 impl Enc {
@@ -120,6 +121,7 @@ impl Enc {
             code: Vec::new(),
             labels: std::collections::HashMap::new(),
             fixups: Vec::new(),
+            externs: Vec::new(),
         }
     }
 
@@ -140,6 +142,14 @@ impl Enc {
     /// waiting for `finish` (which discards its own label map once every fixup is patched).
     pub fn label_offset(&self, name: &str) -> Option<usize> {
         self.labels.get(name).copied()
+    }
+
+    /// Every `call_external` fixup recorded so far: `(byte offset of the disp32 field,
+    /// external symbol name)`. Same "read a side channel before `finish` consumes `self`"
+    /// convention as `label_offset`/`pos` above, since `finish` has no notion of externs at
+    /// all — only `fixups` against locally-defined `labels`.
+    pub fn externs(&self) -> &[(usize, String)] {
+        &self.externs
     }
 
     fn insn(&mut self, prefix: Option<u8>, rex_w: bool, opcode: &[u8], reg: u8, rm: Rm) {
@@ -176,6 +186,23 @@ impl Enc {
     pub fn call(&mut self, target_label: &str) {
         self.code.push(0xE8);
         self.rel32_fixup(target_label);
+    }
+
+    /// `call rel32` to an external symbol this buffer never defines a label for (e.g. libc's
+    /// own `malloc`) — its address is only known once the real system linker resolves it
+    /// against libc, not at emit time. Emits the identical bytes `call` does (opcode `0xE8`
+    /// plus a 4-byte placeholder), but records the fixup on a *separate* list from
+    /// `fixups`: `finish`'s fixup resolution panics on any name absent from `labels`, and an
+    /// external symbol is never going to be defined via `Enc::label`. The recorded
+    /// `(offset, symbol)` pairs are read back via `externs` before calling `finish` (which
+    /// consumes `self` and would otherwise discard them), then turned into real ELF
+    /// relocations by the caller (see `oracle.rs`'s `emit_host_and_kernels` and
+    /// `basalt_backend::elf::ElfRelocation`).
+    pub fn call_external(&mut self, symbol: &str) {
+        self.code.push(0xE8);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0, 0, 0, 0]);
+        self.externs.push((pos, symbol.to_string()));
     }
 
     /// `cc` is the condition-code nibble as used by both Jcc (`0F 80+cc`) and SETcc
@@ -556,6 +583,7 @@ impl Enc {
             mut code,
             labels,
             fixups,
+            externs: _,
         } = self;
         for (pos, name) in &fixups {
             let target = *labels
@@ -728,6 +756,25 @@ mod tests {
         assert_eq!(code[0], 0xE8);
         assert_eq!(&code[1..5], &1i32.to_le_bytes());
         assert_eq!(code[5], 0x90);
+        assert_eq!(code.len(), 6);
+    }
+
+    /// `call_external` emits the same `E8` + 4-zero-byte shape `call` does — the disp32
+    /// field is left as literal zeroes rather than patched, since x86-64 ELF is RELA-format
+    /// (the addend lives entirely in the relocation entry, never in the instruction stream,
+    /// per this task's own `as`/`readelf` round trip) — and records the fixup on `externs`,
+    /// never on `fixups`, so `finish` neither touches nor panics on it.
+    #[test]
+    fn call_external_emits_zeroed_disp32_and_records_the_fixup_separately() {
+        let mut enc = Enc::new();
+        enc.nop();
+        enc.call_external("malloc");
+        assert_eq!(enc.externs(), &[(2usize, "malloc".to_string())]);
+
+        let code = enc.finish();
+        assert_eq!(code[0], 0x90);
+        assert_eq!(code[1], 0xE8);
+        assert_eq!(&code[2..6], &[0, 0, 0, 0]);
         assert_eq!(code.len(), 6);
     }
 }
