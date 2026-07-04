@@ -53,16 +53,18 @@
 // routines pass a dedicated zeroed scratch register as the pair's high half rather than
 // carrying a real second word.
 //
-// # Validation tier: algorithm-validated and encoding-verified, NOT execution-tested
+// # Validation tier: algorithm-validated, encoding-verified, and now sim-validated
 //
 // Per this project's honest-tiering convention (see `CLAUDE.md`'s hardware-access section):
 // this file is *algorithm-validated* (every routine's logic traces back to `softfloat_ref.rs`,
 // itself checked against 3000+ independently-computed ground-truth vectors) and *encoding-
 // verified* (built only from `enc.rs`'s primitives, each cross-checked against a real
-// assembler). It is explicitly **not execution-tested** — no RV32 simulator exists yet in this
-// tree (a later task's job) — so the single biggest residual risk in this file is a
-// translation-fidelity bug: an instruction sequence that does not faithfully reproduce what
-// `softfloat_ref.rs` computes, despite every individual instruction being correctly encoded.
+// assembler). `tests/diff/rv32_sim` (P12-T2) sim-validates `rtz_add32`/`rtz_mul32` for real,
+// under `qemu-system-riscv32`, via `stress.cu`'s own float-heavy proof kernel — so this file's
+// biggest residual risk (a translation-fidelity bug: an instruction sequence that does not
+// faithfully reproduce what `softfloat_ref.rs` computes, despite every individual instruction
+// being correctly encoded) is no longer purely theoretical, only untested for `rtz_div32` and
+// the int<->float conversion routines, which that proof kernel does not happen to exercise.
 // That is exactly what a future execution-test pass should check first.
 
 use crate::enc::{
