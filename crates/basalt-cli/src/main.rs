@@ -25,7 +25,10 @@
 // built, no feature gate), following `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention.
 // `--tensix` runs the real hand-rolled `basalt-tensix` backend (`Tensix`, always built, no
 // feature gate), generating Metalium C++ for Tenstorrent's Tensix; its output is text like
-// `--nvidia-ptx`'s, so it follows that mode's stdout-or-`-o` convention. `--rv-elf` runs the
+// `--nvidia-ptx`'s, so it follows that mode's stdout-or-`-o` convention. `--tensix --tdf`
+// is a modifier on the same mode (see `run_tensix`): instead of the single-core emitter, it
+// runs `basalt_tensix::dump_tdf`'s real multi-core fission pass and prints the resulting
+// region/channel/NoC-arc layout. `--rv-elf` runs the
 // real hand-rolled `basalt-rv` backend (`Rv32`, always built, no feature gate), following
 // `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention instead. `--triton` is a
 // modifier following `--llvm`'s own pattern, but on the *frontend* side rather
@@ -112,14 +115,16 @@ impl Mode {
     }
 }
 
-/// Parsed CLI state. `-I`/`-D` feed `run_frontend`'s `PpOpts`; `tdf`/`snap` are collected but
-/// still unused until the corresponding tooling lands. `llvm` is the `--llvm` modifier: paired
+/// Parsed CLI state. `-I`/`-D` feed `run_frontend`'s `PpOpts`; `snap` is collected but still
+/// unused until the corresponding tooling lands. `llvm` is the `--llvm` modifier: paired
 /// with `Mode::AmdgpuBin` it selects the LLVM-backed AMDGCN object-emission path (see `run`);
 /// paired with anything else, `run` refuses cleanly rather than silently ignoring it. `triton`
 /// is the `--triton` modifier: paired with `Mode::Cpu`, `Mode::CpuRegalloc`, or
 /// `Mode::NvidiaPtx` it selects the real Triton frontend/sema pipeline instead of the CUDA-C
 /// one (see `run_triton_frontend`); paired with anything else, `run` refuses the same way
-/// `llvm` does.
+/// `llvm` does. `tdf` is the `--tdf` modifier: paired with `Mode::Tensix` it selects
+/// `run_tensix`'s TDF-dump path instead of the single-core Metalium emitter (see `run_tensix`);
+/// paired with anything else, `run` refuses the same way `llvm`/`triton` do.
 #[derive(Debug, Default)]
 struct Config {
     mode: Option<Mode>,
@@ -710,6 +715,15 @@ fn run_spirv(
 /// generated Metalium C++ text, like `--nvidia-ptx`'s PTX, so it follows that mode's stdout-or-
 /// `-o` convention rather than `--spirv`'s binary-artifact/`-o`-mandatory one. No `--triton`
 /// pairing is wired for this mode (see the `--triton` refusal in `run`, below).
+///
+/// `--tensix --tdf <file>` is a modifier on this same mode, following `--llvm`/`--triton`'s own
+/// pattern of a flag that changes what an existing mode does rather than adding a new one:
+/// instead of the single-core `Tensix` backend, the same optimized module is handed to
+/// `basalt_tensix::dump_tdf`, which runs the TDF (Tile-DataFlow) fission pass and prints the
+/// resulting regions/channels/NoC-arc layout (plus the two kernel bodies the pass produced) as
+/// text — same stdout-or-`-o` convention, since this is text output too. A module the fission
+/// pass cannot fission is refused the same way an unsupported module refuses under plain
+/// `--tensix`.
 fn run_tensix(
     input: &Path,
     output: Option<&Path>,
@@ -739,6 +753,12 @@ fn run_tensix(
         module
     };
     let module = basalt_passes::optimize(&module);
+
+    if cfg.tdf {
+        let text = basalt_tensix::dump_tdf(&module)?;
+        write_output(output, &text)?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let backend = Tensix;
     match backend.supports(&module) {
@@ -821,8 +841,8 @@ fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
 /// `--nvidia-ptx`/`--amdgpu-bin`/`--spirv`/`--tensix`/`--rv-elf` run the real pipeline; every
 /// other mode has no implementation yet (backends land in later phases) — refuse cleanly
 /// rather than emit anything. `--triton`
-/// (only meaningful with `--cpu`/`--nvidia-ptx`) is handled above this match, before the mode
-/// dispatch even begins.
+/// (only meaningful with `--cpu`/`--nvidia-ptx`) and `--tdf` (only meaningful with `--tensix`)
+/// are handled above this match, before the mode dispatch even begins.
 fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
     let mode = cfg
         .mode
@@ -842,6 +862,11 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
     // discipline above.
     if cfg.triton && mode != Mode::Cpu && mode != Mode::CpuRegalloc && mode != Mode::NvidiaPtx {
         return Err(Diag::new(ECode::UnsupportedFeature).with_arg("--triton"));
+    }
+    // `--tdf` only has a wired path for `Mode::Tensix`; paired with any other mode it must
+    // refuse outright, matching `--llvm`/`--triton`'s own refusal discipline above.
+    if cfg.tdf && mode != Mode::Tensix {
+        return Err(Diag::new(ECode::UnsupportedFeature).with_arg("--tdf"));
     }
     match mode {
         Mode::Ir => run_ir(input()?, cfg.output.as_deref(), cfg, table),

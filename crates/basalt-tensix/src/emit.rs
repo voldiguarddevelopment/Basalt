@@ -91,7 +91,7 @@ use basalt_passes::construct_ssa;
 
 // ---- type mapping ---------------------------------------------------------------------------
 
-fn f16_refusal(what: &'static str) -> Diag {
+pub(crate) fn f16_refusal(what: &'static str) -> Diag {
     Diag::new(ECode::UnsupportedType).with_arg(format!(
         "f16: not a safe stand-in for Tensix's native bfloat16 format ({what})"
     ))
@@ -100,7 +100,7 @@ fn f16_refusal(what: &'static str) -> Diag {
 /// The C++ type a BIR scalar is represented as. Every non-pointer SSA value keeps the sign
 /// convention its declared width implies — see the module header on why `zext`/`fptoui` still
 /// need an explicit unsigned detour despite this.
-fn cpp_scalar_ty(s: Scalar) -> Result<&'static str, Diag> {
+pub(crate) fn cpp_scalar_ty(s: Scalar) -> Result<&'static str, Diag> {
     match s {
         Scalar::I1 => Ok("bool"),
         Scalar::I8 => Ok("int8_t"),
@@ -113,7 +113,7 @@ fn cpp_scalar_ty(s: Scalar) -> Result<&'static str, Diag> {
     }
 }
 
-fn cpp_unsigned_scalar_ty(s: Scalar) -> &'static str {
+pub(crate) fn cpp_unsigned_scalar_ty(s: Scalar) -> &'static str {
     match s {
         Scalar::I1 => "bool",
         Scalar::I8 => "uint8_t",
@@ -126,7 +126,7 @@ fn cpp_unsigned_scalar_ty(s: Scalar) -> &'static str {
     }
 }
 
-fn cpp_ty(ty: Ty) -> Result<String, Diag> {
+pub(crate) fn cpp_ty(ty: Ty) -> Result<String, Diag> {
     match ty {
         Ty::Scalar(s) => cpp_scalar_ty(s).map(|s| s.to_string()),
         Ty::Ptr(AddrSpace::Global) => Ok("uint8_t*".to_string()),
@@ -156,7 +156,7 @@ fn zero_literal(ty: Ty) -> Result<&'static str, Diag> {
     }
 }
 
-fn scalar_of(ty: Ty) -> Scalar {
+pub(crate) fn scalar_of(ty: Ty) -> Scalar {
     match ty {
         Ty::Scalar(s) => s,
         _ => unreachable!("scalar_of called on a non-scalar type"),
@@ -172,7 +172,7 @@ fn valref_ty(f: &Function, v: ValRef) -> Ty {
     }
 }
 
-fn val_text(v: ValRef) -> String {
+pub(crate) fn val_text(v: ValRef) -> String {
     match v {
         ValRef::Param(i) => format!("p{i}"),
         ValRef::Val(id) => format!("v{}", id.0),
@@ -244,10 +244,10 @@ fn cannot_trace_ptr() -> Diag {
 // ---- per-parameter classification ------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-struct PtrAccess {
-    scalar: Option<Scalar>,
-    has_load: bool,
-    has_store: bool,
+pub(crate) struct PtrAccess {
+    pub(crate) scalar: Option<Scalar>,
+    pub(crate) has_load: bool,
+    pub(crate) has_store: bool,
 }
 
 impl PtrAccess {
@@ -260,7 +260,7 @@ impl PtrAccess {
     }
 }
 
-enum ParamKind {
+pub(crate) enum ParamKind {
     Scalar(Scalar),
     Ptr(PtrAccess),
 }
@@ -303,7 +303,7 @@ fn record_access(
 /// pointer parameter must be `ptr.global`, actually dereferenced somewhere, and dereferenced at
 /// one consistent scalar type throughout (see the module header). Shared verbatim by
 /// `supports()` and `emit()`.
-fn analyze_params(f: &Function) -> Result<Vec<ParamKind>, Diag> {
+pub(crate) fn analyze_params(f: &Function) -> Result<Vec<ParamKind>, Diag> {
     let mut kinds: Vec<ParamKind> = Vec::with_capacity(f.params.len());
     for &ty in &f.params {
         kinds.push(match ty {
@@ -441,7 +441,7 @@ fn check_inst(inst: &Inst) -> Result<(), Diag> {
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
 /// `emit()`. A Metalium kernel file has exactly one `kernel_main()`; a module with more than one
 /// function has nowhere to put the second one, so it refuses here too.
-fn check_module(module: &Module) -> Result<(), Diag> {
+pub(crate) fn check_module(module: &Module) -> Result<(), Diag> {
     if module.funcs.len() != 1 {
         return Err(Diag::new(ECode::UnsupportedOp).with_arg(
             "this backend's single-core bring-up supports exactly one function per module \
@@ -468,9 +468,9 @@ fn check_module(module: &Module) -> Result<(), Diag> {
 /// `(from_block, to_block) -> [(phi's own InstId, incoming value)]`, exactly `basalt-ptx`'s own
 /// `PhiCopies` shape: every predecessor writes a phi's variable directly before jumping, so the
 /// definition site itself (`Op::Phi`) emits nothing.
-type PhiCopies = HashMap<(u32, u32), Vec<(InstId, ValRef)>>;
+pub(crate) type PhiCopies = HashMap<(u32, u32), Vec<(InstId, ValRef)>>;
 
-fn build_phi_copies(f: &Function) -> PhiCopies {
+pub(crate) fn build_phi_copies(f: &Function) -> PhiCopies {
     let mut map: PhiCopies = HashMap::new();
     for (bidx, block) in f.blocks.iter().enumerate() {
         for &inst_id in &block.insts {
@@ -493,7 +493,7 @@ fn build_phi_copies(f: &Function) -> PhiCopies {
 /// by fallthrough, so a label is only worth emitting for a block some other block actually jumps
 /// to (`-Werror` in `tt_metal`'s own real kernel build would otherwise turn that warning into a
 /// hard compile failure).
-fn goto_targets(f: &Function) -> std::collections::HashSet<u32> {
+pub(crate) fn goto_targets(f: &Function) -> std::collections::HashSet<u32> {
     let mut targets = std::collections::HashSet::new();
     for block in &f.blocks {
         match &block.term {
@@ -518,15 +518,15 @@ fn goto_targets(f: &Function) -> std::collections::HashSet<u32> {
 
 // ---- code generation ---------------------------------------------------------------------
 
-struct CodeGen<'a> {
-    f: &'a Function,
-    params: &'a [ParamKind],
-    phi_copies: PhiCopies,
-    out: String,
+pub(crate) struct CodeGen<'a> {
+    pub(crate) f: &'a Function,
+    pub(crate) params: &'a [ParamKind],
+    pub(crate) phi_copies: PhiCopies,
+    pub(crate) out: String,
 }
 
 impl<'a> CodeGen<'a> {
-    fn line(&mut self, text: &str) {
+    pub(crate) fn line(&mut self, text: &str) {
         self.out.push_str("    ");
         self.out.push_str(text);
         self.out.push('\n');
@@ -612,7 +612,7 @@ impl<'a> CodeGen<'a> {
         Ok(())
     }
 
-    fn emit_ssa_decls(&mut self) -> Result<(), Diag> {
+    pub(crate) fn emit_ssa_decls(&mut self) -> Result<(), Diag> {
         for (id, inst) in self.f.insts.iter().enumerate() {
             if !inst.has_result() {
                 continue;
@@ -752,7 +752,7 @@ impl<'a> CodeGen<'a> {
         })
     }
 
-    fn lower_inst(&mut self, id: InstId) -> Result<(), Diag> {
+    pub(crate) fn lower_inst(&mut self, id: InstId) -> Result<(), Diag> {
         let inst = &self.f.insts[id.0 as usize];
         let ty = inst.ty;
         match &inst.op {
@@ -854,7 +854,7 @@ impl<'a> CodeGen<'a> {
 
     // ---- terminators --------------------------------------------------------------------
 
-    fn lower_term(&mut self, from_block: u32, term: &Term) {
+    pub(crate) fn lower_term(&mut self, from_block: u32, term: &Term) {
         match term {
             Term::Br(target) => {
                 for copy in self.phi_copy_lines(from_block, target.0) {
