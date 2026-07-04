@@ -155,6 +155,47 @@ $stdout_ra"
 
   echo "  oracle and regalloc agree: $name"
 
+  # RV32-sim lane, every kernel: basalt-rv's own bare-metal RV32IM object (crates/basalt-rv,
+  # `--rv-elf`) linked against this kernel's own existing host driver — cross-compiled for
+  # rv32im/ilp32 instead of the host, via tests/diff/rv32_sim/run_kernel.sh — and booted under
+  # qemu-system-riscv32's "-M virt" board. That script's own header has the real detail,
+  # including why the guest's numeric exit code can't be used as a pass/fail signal here (a
+  # documented 32-bit-semihosting limitation, not a bug in this harness) — the comparison
+  # below is against the oracle's own live stdout instead. Needs riscv64-elf-gcc (an
+  # rv32im/ilp32-capable bare-metal/newlib cross-compiler) and qemu-system-riscv32 on PATH;
+  # either missing is a clean skip, never a failure of the default run.
+  rv_obj="$tmpdir/$name-rv.o"
+  if ! "$basalt" --rv-elf "$kernel_path" -o "$rv_obj" 2>"$tmpdir/$name.rv.stderr"; then
+    echo "  FAIL: basalt --rv-elf $kernel did not exit 0:" >&2
+    sed 's/^/    /' "$tmpdir/$name.rv.stderr" >&2
+    fail=1
+  else
+    set +e
+    rv_out="$(bash "$root/tests/diff/rv32_sim/run_kernel.sh" "$rv_obj" "$driver_path" 2>"$tmpdir/$name.rv-sim.log")"
+    rv_code=$?
+    set -e
+
+    if [ "$rv_code" -eq 77 ]; then
+      echo "  skip: rv32-sim ($(tail -1 "$tmpdir/$name.rv-sim.log"))"
+    elif [ "$rv_code" -ne 0 ]; then
+      echo "  FAIL: rv32-sim harness did not exit 0:" >&2
+      sed 's/^/    /' "$tmpdir/$name.rv-sim.log" >&2
+      fail=1
+    else
+      expected_stdout="$(tail -n +2 <<<"$actual")"
+      if [ "$rv_out" = "$expected_stdout" ]; then
+        echo "  rv32-sim matches oracle: $name"
+      else
+        echo "  FAIL: $name diverges between the oracle and rv32-sim" >&2
+        echo "    oracle stdout (live):" >&2
+        sed 's/^/      /' <<<"$expected_stdout" >&2
+        echo "    rv32-sim stdout:" >&2
+        sed 's/^/      /' <<<"$rv_out" >&2
+        fail=1
+      fi
+    fi
+  fi
+
   # MLIR/NVPTX lane, vector_add only: `basalt-mlir`'s own gpu/arith/memref/cf-through-mlir-opt
   # NVPTX path (crates/basalt-mlir/src/emit.rs) is a second, independent way to reach real PTX
   # for this exact kernel, JIT-loaded and launched on real hardware via basalt-runtime's CUDA
