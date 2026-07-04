@@ -158,6 +158,16 @@ fn classify_rule(op: &Op) -> Rule {
         Op::Phi(incoming) => Rule::FromOperands(incoming.iter().map(|(_, v)| *v).collect()),
         // No result (`Ty::Void`): never looked up, but every `Op` needs a rule.
         Op::Store { .. } | Op::Barrier | Op::Mma { .. } => Rule::Fixed(Divergence::Uniform),
+        // Host-side, sema-only ops (see `Op::KernelLaunch`'s own doc comment in `ir.rs`): a
+        // kernel launch and the CUDA Runtime API calls are host-code constructs, never
+        // executed per-thread inside a warp/block, so `Uniform` is the only sensible
+        // classification here — `CudaMalloc`'s allocated pointer is the same one value handed
+        // back to the (single) host thread that called it, not something that varies by lane.
+        Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => Rule::Fixed(Divergence::Uniform),
     }
 }
 

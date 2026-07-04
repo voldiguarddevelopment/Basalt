@@ -24,6 +24,11 @@ pub(crate) struct FuncSig {
     pub ret: Ty,
     pub params: Vec<Ty>,
     pub variadic: bool,
+    /// Whether this name is a real `__global__` kernel entry point — the only kind of
+    /// function `Expr::KernelLaunch` may legally name. `false` for every ordinary/`__host__`/
+    /// `__device__` function and every builtin seeded into scope (dim3/atomic/shuffle/vote,
+    /// the CUDA Runtime API calls, ...), none of which are launchable.
+    pub is_kernel: bool,
 }
 
 #[derive(Debug, Clone)]

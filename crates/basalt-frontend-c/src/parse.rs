@@ -938,6 +938,16 @@ impl<'a> Parser<'a> {
         self.parse_additive()
     }
 
+    /// Parses one `<<<...>>>` launch-config argument (`grid`/`block`/`shared`/`stream`) at the
+    /// same additive-expression level `parse_template_arg_expr` uses, for the identical reason:
+    /// relational/shift tokens (`<`/`<<`/`>`/`>>`) are needed here to recognize the config
+    /// list's own closing `>>>`, so an argument that genuinely needs one must be parenthesized
+    /// (`vadd<<<(n << 1), block>>>(...)`) — the same "wrap it in parens" convention template
+    /// arguments already use in this parser.
+    fn parse_launch_config_expr(&mut self) -> Expr {
+        self.parse_additive()
+    }
+
     fn parse_scalar(&mut self, start: crate::token::Loc) -> Type {
         let mut c = ScalarCounts::default();
         loop {
@@ -2083,6 +2093,55 @@ impl<'a> Parser<'a> {
                         span: Span::new(start, self.prev_span_end().end),
                     };
                 }
+                // `<<<` is not its own token (the lexer produces ordinary `Shl`/`Lt`, so
+                // `<<<` is `Shl` immediately followed by `Lt`) — recognized here, and only
+                // here, because there is no other valid C++ expression shape where `<<`
+                // directly follows a bare postfix expression in call position: ordinary
+                // `a << b` is parsed by `parse_shift`, one precedence level further out, and
+                // never reaches this loop with `Shl` as the current token in the first place
+                // (postfix binds tighter than shift, so by the time a real `<<` shift operator
+                // is current, `e` has already fully reduced through here). The `Lt` lookahead
+                // is what tells a genuine launch (`<<<`) apart from plain `a << b` (`Shl`
+                // followed by whatever begins `b`, essentially never `Lt`) without any
+                // speculative parse/backtrack.
+                TokenKind::Punct(Punct::Shl)
+                    if matches!(
+                        self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Punct(Punct::Lt))
+                    ) =>
+                {
+                    self.bump(); // `<<`
+                    self.bump(); // `<`
+                    let grid = self.parse_launch_config_expr();
+                    self.expect_punct(Punct::Comma, "','");
+                    let block = self.parse_launch_config_expr();
+                    let mut shared = None;
+                    let mut stream = None;
+                    if self.eat_punct(Punct::Comma) {
+                        shared = Some(Box::new(self.parse_launch_config_expr()));
+                        if self.eat_punct(Punct::Comma) {
+                            stream = Some(Box::new(self.parse_launch_config_expr()));
+                        }
+                    }
+                    // `>>>` is likewise `Shr` (`>>`) immediately followed by `Gt` (`>`).
+                    if self.expect_punct(Punct::Shr, "'>>>'").is_some() {
+                        self.expect_punct(Punct::Gt, "'>>>'");
+                    }
+                    let args = if self.expect_punct(Punct::LParen, "'('").is_some() {
+                        self.parse_arg_list()
+                    } else {
+                        Vec::new()
+                    };
+                    e = Expr::KernelLaunch {
+                        kernel: Box::new(e),
+                        grid: Box::new(grid),
+                        block: Box::new(block),
+                        shared,
+                        stream,
+                        args,
+                        span: Span::new(start, self.prev_span_end().end),
+                    };
+                }
                 TokenKind::Punct(Punct::LBracket) => {
                     self.bump();
                     let index = self.parse_expr();
@@ -3140,6 +3199,104 @@ mod tests {
             parse_expr_src("p->x"),
             Expr::Member { arrow: true, .. }
         ));
+    }
+
+    #[test]
+    fn expr_kernel_launch_two_argument_config() {
+        let e = parse_expr_src("vadd<<<256, 256>>>(a, b, c)");
+        let Expr::KernelLaunch {
+            kernel,
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+            ..
+        } = &e
+        else {
+            panic!("{e:?}");
+        };
+        assert!(matches!(&**kernel, Expr::Ident { name, .. } if name == "vadd"));
+        assert!(matches!(&**grid, Expr::IntLit { .. }));
+        assert!(matches!(&**block, Expr::IntLit { .. }));
+        assert!(shared.is_none());
+        assert!(stream.is_none());
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn expr_kernel_launch_three_argument_config() {
+        let e = parse_expr_src("vadd<<<grid, block, smem>>>()");
+        let Expr::KernelLaunch {
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+            ..
+        } = &e
+        else {
+            panic!("{e:?}");
+        };
+        assert!(matches!(&**grid, Expr::Ident { name, .. } if name == "grid"));
+        assert!(matches!(&**block, Expr::Ident { name, .. } if name == "block"));
+        assert!(matches!(shared.as_deref(), Some(Expr::Ident { name, .. }) if name == "smem"));
+        assert!(stream.is_none());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn expr_kernel_launch_four_argument_config() {
+        let e = parse_expr_src("vadd<<<grid, block, smem, stream>>>(x)");
+        let Expr::KernelLaunch { shared, stream, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert!(matches!(shared.as_deref(), Some(Expr::Ident { name, .. }) if name == "smem"));
+        assert!(matches!(stream.as_deref(), Some(Expr::Ident { name, .. }) if name == "stream"));
+    }
+
+    /// A launch-config argument needing a shift/relational operator of its own must be
+    /// parenthesized, the same "wrap it in parens" convention `parse_template_arg_expr` already
+    /// established for template arguments — proving the `<<<`/`>>>` recognition in
+    /// `parse_postfix` correctly leaves a parenthesized sub-expression's own `<<` alone.
+    #[test]
+    fn expr_kernel_launch_config_arg_with_shift_needs_parens() {
+        let e = parse_expr_src("vadd<<<(n << 1), m>>>()");
+        let Expr::KernelLaunch { grid, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert!(matches!(&**grid, Expr::Binary { op: BinOp::Shl, .. }));
+    }
+
+    /// Ordinary left-shift, unrelated to any call, must keep parsing exactly as it always has:
+    /// `<<<` recognition only triggers immediately after a postfix (call-position) expression,
+    /// and even then only when a literal `Lt` token immediately follows the `Shl`.
+    #[test]
+    fn expr_plain_shift_and_compare_are_not_misparsed_as_a_launch() {
+        let e = parse_expr_src("a << b");
+        assert!(matches!(e, Expr::Binary { op: BinOp::Shl, .. }));
+
+        let e = parse_expr_src("a << b < c");
+        let Expr::Binary {
+            op: BinOp::Lt, lhs, ..
+        } = &e
+        else {
+            panic!("{e:?}");
+        };
+        assert!(matches!(&**lhs, Expr::Binary { op: BinOp::Shl, .. }));
+    }
+
+    /// A plain call whose callee expression happens to itself be built from `<<`/`<` (rather
+    /// than the callee being immediately followed by one) must still parse as an ordinary
+    /// `Call`, not a launch — `<<<` is only recognized directly in postfix position.
+    #[test]
+    fn expr_shift_result_used_as_ordinary_call_still_parses() {
+        let e = parse_expr_src("f(a << b)");
+        let Expr::Call { args, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0], Expr::Binary { op: BinOp::Shl, .. }));
     }
 
     // ---- statements ------------------------------------------------------------------------

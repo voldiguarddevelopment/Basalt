@@ -271,6 +271,16 @@ fn check_inst(inst: &Inst) -> Result<(), Diag> {
                 Diag::new(ECode::UnsupportedOp).with_arg("mma has no lowering in this backend yet")
             );
         }
+        Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => {
+            return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                 Op::KernelLaunch's own doc comment); this backend has no lowering for them yet",
+            ));
+        }
         _ => {}
     }
     Ok(())
@@ -844,7 +854,12 @@ fn lower_inst(
         | Op::Ballot(..)
         | Op::VoteAny(..)
         | Op::VoteAll(..)
-        | Op::Mma { .. } => {
+        | Op::Mma { .. }
+        | Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => {
             unreachable!("check_module refuses this op before codegen starts")
         }
     }

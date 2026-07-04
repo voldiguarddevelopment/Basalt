@@ -107,6 +107,28 @@ pub(crate) const CUDA_ATOMIC_RMW_BUILTINS: [&str; 8] = [
 /// third operand and maps to BIR's own separate `atomic.cas` op.
 pub(crate) const CUDA_ATOMIC_CAS_BUILTIN: &str = "atomicCAS";
 
+/// The four CUDA Runtime API host-side calls this pass recognizes (P13-T1b). Unlike
+/// `CUDA_DIM3_BUILTINS`/the warp-collective builtins above, these are ordinary host-callable
+/// functions, not gated to a device/kernel body — real CUDA-C calls them from plain `__host__`
+/// code preparing device buffers — so `seed_cuda_runtime_api` seeds them once into the
+/// translation unit's top-level scope rather than per function body.
+pub(crate) const CUDA_MALLOC_BUILTIN: &str = "cudaMalloc";
+pub(crate) const CUDA_MEMCPY_BUILTIN: &str = "cudaMemcpy";
+pub(crate) const CUDA_FREE_BUILTIN: &str = "cudaFree";
+pub(crate) const CUDA_DEVICE_SYNCHRONIZE_BUILTIN: &str = "cudaDeviceSynchronize";
+
+/// `cudaMemcpyKind`'s five stable real values. Seeded as plain `int`-typed named constants
+/// (`ValueSym::EnumConst`, the same shape this pass already gives an anonymous `enum`'s
+/// variants — see `check_enum_decl`), so a real program may pass either the named constant or
+/// a bare integer literal to `cudaMemcpy`'s `kind` parameter and have both type-check.
+pub(crate) const CUDA_MEMCPY_KIND_CONSTANTS: [(&str, i64); 5] = [
+    ("cudaMemcpyHostToHost", 0),
+    ("cudaMemcpyHostToDevice", 1),
+    ("cudaMemcpyDeviceToHost", 2),
+    ("cudaMemcpyDeviceToDevice", 3),
+    ("cudaMemcpyDefault", 4),
+];
+
 pub(crate) fn conv_span(s: FSpan) -> DSpan {
     DSpan::new(
         DLoc::new(s.start.line, s.start.col),
@@ -234,6 +256,7 @@ pub fn check(tu: &TranslationUnit) -> Vec<Diag> {
         switch_depth: 0,
     };
     ck.scopes.push();
+    ck.seed_cuda_runtime_api();
     ck.check_items(&tu.items);
     ck.scopes.pop();
     ck.diags
@@ -424,6 +447,7 @@ impl Checker {
             ret: ret.clone(),
             params: param_tys.clone(),
             variadic: f.variadic,
+            is_kernel: f.cuda_quals.is_global,
         };
         if self.scopes.declare_value(&f.name, ValueSym::Func(sig)) {
             self.err_redef(f.span, &f.name);
@@ -503,16 +527,10 @@ impl Checker {
     /// them ride the checker's existing member-access and call-arity machinery instead of
     /// needing special cases there.
     fn seed_cuda_builtins(&mut self) {
-        self.scopes.declare_struct(
-            CUDA_DIM3_STRUCT,
-            StructInfo {
-                fields: vec![
-                    ("x".to_string(), Ty::Scalar(ScalarKind::UInt), false),
-                    ("y".to_string(), Ty::Scalar(ScalarKind::UInt), false),
-                    ("z".to_string(), Ty::Scalar(ScalarKind::UInt), false),
-                ],
-            },
-        );
+        // `CUDA_DIM3_STRUCT` itself is declared globally by `seed_cuda_runtime_api` (real CUDA
+        // code declares plain `dim3` locals in ordinary host code building a launch config, not
+        // only inside a device/kernel body) — only the four builtin *values* below are gated to
+        // a device/kernel body.
         let dim3 = Ty::Struct(CUDA_DIM3_STRUCT.to_string());
         for name in CUDA_DIM3_BUILTINS {
             self.scopes
@@ -524,6 +542,7 @@ impl Checker {
                 ret: Ty::Scalar(ScalarKind::Void),
                 params: Vec::new(),
                 variadic: false,
+                is_kernel: false,
             }),
         );
 
@@ -535,6 +554,7 @@ impl Checker {
                     ret: int.clone(),
                     params: vec![int.clone(), int.clone()],
                     variadic: false,
+                    is_kernel: false,
                 }),
             );
         }
@@ -545,6 +565,7 @@ impl Checker {
                     ret: int.clone(),
                     params: vec![int.clone()],
                     variadic: false,
+                    is_kernel: false,
                 }),
             );
         }
@@ -556,6 +577,7 @@ impl Checker {
                     ret: int.clone(),
                     params: vec![int_ptr.clone(), int.clone()],
                     variadic: false,
+                    is_kernel: false,
                 }),
             );
         }
@@ -565,8 +587,86 @@ impl Checker {
                 ret: int.clone(),
                 params: vec![int_ptr, int.clone(), int],
                 variadic: false,
+                is_kernel: false,
             }),
         );
+    }
+
+    /// Seeds the four CUDA Runtime API host-side calls
+    /// (`cudaMalloc`/`cudaMemcpy`/`cudaFree`/`cudaDeviceSynchronize`) plus `cudaMemcpyKind`'s
+    /// five named integer constants into the translation unit's top-level scope — called once
+    /// from `check`, unlike `seed_cuda_builtins`'s per-function-body device/kernel-only
+    /// builtins, since these are ordinary functions any host code may call. Each one's real
+    /// return type, `cudaError_t`, is modeled as a plain `int`: the same simplification this
+    /// pass already applies to the shuffle/vote/atomic builtins' own return values above, since
+    /// nothing here needs to distinguish a real error code structurally, and a call site that
+    /// discards the return value (the overwhelming majority of real CUDA-C) works either way.
+    ///
+    /// `cudaMalloc`'s first parameter is genuinely `void**` (a pointer to the caller's own
+    /// pointer variable, which the real function writes the freshly-allocated address through)
+    /// — not `void*` — matching the real signature exactly rather than simplifying it away.
+    fn seed_cuda_runtime_api(&mut self) {
+        // `dim3` itself (`CUDA_DIM3_STRUCT`'s synthetic backing name): declared globally, not
+        // per-device-body like `seed_cuda_builtins`'s four builtin *values* below, since real
+        // CUDA-C declares `dim3` locals in ordinary host code assembling a launch config
+        // (`dim3 grid(...); kernel<<<grid, block>>>(...);`), not only inside a kernel body.
+        self.scopes.declare_struct(
+            CUDA_DIM3_STRUCT,
+            StructInfo {
+                fields: vec![
+                    ("x".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                    ("y".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                    ("z".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                ],
+            },
+        );
+
+        let void_ptr = Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Void)), false);
+        let void_ptr_ptr = Ty::Pointer(Box::new(void_ptr.clone()), false);
+        let size_t = Ty::Scalar(ScalarKind::ULong);
+        let int = Ty::Scalar(ScalarKind::Int);
+
+        self.scopes.declare_value(
+            CUDA_MALLOC_BUILTIN,
+            ValueSym::Func(FuncSig {
+                ret: int.clone(),
+                params: vec![void_ptr_ptr, size_t.clone()],
+                variadic: false,
+                is_kernel: false,
+            }),
+        );
+        self.scopes.declare_value(
+            CUDA_MEMCPY_BUILTIN,
+            ValueSym::Func(FuncSig {
+                ret: int.clone(),
+                params: vec![void_ptr.clone(), void_ptr.clone(), size_t, int.clone()],
+                variadic: false,
+                is_kernel: false,
+            }),
+        );
+        self.scopes.declare_value(
+            CUDA_FREE_BUILTIN,
+            ValueSym::Func(FuncSig {
+                ret: int.clone(),
+                params: vec![void_ptr],
+                variadic: false,
+                is_kernel: false,
+            }),
+        );
+        self.scopes.declare_value(
+            CUDA_DEVICE_SYNCHRONIZE_BUILTIN,
+            ValueSym::Func(FuncSig {
+                ret: int.clone(),
+                params: Vec::new(),
+                variadic: false,
+                is_kernel: false,
+            }),
+        );
+
+        for &(name, _) in &CUDA_MEMCPY_KIND_CONSTANTS {
+            self.scopes
+                .declare_value(name, ValueSym::EnumConst(int.clone()));
+        }
     }
 
     // ---- statements -------------------------------------------------------------------------
@@ -1056,6 +1156,123 @@ impl Checker {
         }
     }
 
+    /// Type-checks `kernel<<<grid, block[, shared[, stream]]>>>(args...)`. `grid`/`block` each
+    /// accept a bare integer or a `dim3`-typed value (`check_launch_config_dim`); `shared`
+    /// (dynamic shared-memory bytes), if present, must be an integer; `stream` is merely
+    /// type-checked for its own sub-expressions' sake, with no type constraint of its own (see
+    /// the module header and `basalt_bir::Op::KernelLaunch`'s own doc comment on why real
+    /// stream semantics are out of this task's scope). The named kernel must resolve to a real,
+    /// known `__global__` function, and `args` must match its parameters exactly like an
+    /// ordinary call (`check_call`'s arity/type logic, duplicated here rather than shared,
+    /// since a launch's callee is never allowed to be an arbitrary function-valued expression
+    /// the way `check_call`'s non-`Ident` fallback tolerates). A launch's own "value" is `void`,
+    /// same as BIR's `Op::KernelLaunch`: nothing in CUDA C++'s grammar gives a launch an
+    /// ordinary-expression result.
+    #[allow(clippy::too_many_arguments)]
+    fn check_kernel_launch(
+        &mut self,
+        kernel: &Expr,
+        grid: &Expr,
+        block: &Expr,
+        shared: Option<&Expr>,
+        stream: Option<&Expr>,
+        args: &[Expr],
+        span: FSpan,
+    ) -> Ty {
+        self.check_launch_config_dim(grid);
+        self.check_launch_config_dim(block);
+        if let Some(s) = shared {
+            let st = self.type_of(s);
+            if !st.is_unknown() && !st.is_integer() {
+                self.err_type(
+                    s.span(),
+                    "dynamic shared-memory byte count must have an integer type",
+                );
+            }
+        }
+        if let Some(s) = stream {
+            self.type_of(s);
+        }
+
+        let Expr::Ident {
+            name,
+            span: ident_span,
+        } = kernel
+        else {
+            self.type_of(kernel);
+            for arg in args {
+                self.type_of(arg);
+            }
+            self.err_type(
+                kernel.span(),
+                "kernel launch target must be a named function",
+            );
+            return Ty::Scalar(ScalarKind::Void);
+        };
+
+        match self.scopes.lookup_value(name).cloned() {
+            Some(ValueSym::Func(sig)) if sig.is_kernel => {
+                if args.len() != sig.params.len() {
+                    self.err_type(
+                        span,
+                        format!(
+                            "kernel launch of '{name}' expects {} argument(s), got {}",
+                            sig.params.len(),
+                            args.len()
+                        ),
+                    );
+                }
+                for (i, arg) in args.iter().enumerate() {
+                    let at = self.type_of(arg);
+                    if let Some(pt) = sig.params.get(i) {
+                        if !at.is_unknown() && !pt.is_unknown() && !assignable(pt, &at) {
+                            self.err_type(
+                                arg.span(),
+                                format!(
+                                    "argument {} to kernel launch of '{name}' has an incompatible type",
+                                    i + 1
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                self.err_type(*ident_span, format!("'{name}' is not a __global__ kernel"));
+                for arg in args {
+                    self.type_of(arg);
+                }
+            }
+            None => {
+                self.err_undef(*ident_span, name);
+                for arg in args {
+                    self.type_of(arg);
+                }
+            }
+        }
+        Ty::Scalar(ScalarKind::Void)
+    }
+
+    /// A launch-config dimension (`grid`/`block`) accepts a bare integer (`dim3`'s own
+    /// single-argument implicit constructor, `kernel<<<256, 256>>>(...)`) or a value already of
+    /// the synthetic `dim3` struct type (`CUDA_DIM3_STRUCT`) — a real `dim3` local, or one of
+    /// `threadIdx`/`blockIdx`/`blockDim`/`gridDim` themselves, though launching a kernel with a
+    /// launch config derived from another kernel's own thread/block indices is unusual, this
+    /// pass does not judge that, only the type.
+    fn check_launch_config_dim(&mut self, e: &Expr) {
+        let t = self.type_of(e);
+        if t.is_unknown() {
+            return;
+        }
+        let dim3 = Ty::Struct(CUDA_DIM3_STRUCT.to_string());
+        if !t.is_integer() && t != dim3 {
+            self.err_type(
+                e.span(),
+                "launch grid/block dimension must be an integer or a dim3 value",
+            );
+        }
+    }
+
     fn check_index(&mut self, base: &Expr, index: &Expr, span: FSpan) -> Ty {
         let bt = self.type_of(base);
         let it = self.type_of(index);
@@ -1279,6 +1496,23 @@ impl Checker {
                 Ty::Scalar(ScalarKind::ULong)
             }
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
+            Expr::KernelLaunch {
+                kernel,
+                grid,
+                block,
+                shared,
+                stream,
+                args,
+                span,
+            } => self.check_kernel_launch(
+                kernel,
+                grid,
+                block,
+                shared.as_deref(),
+                stream.as_deref(),
+                args,
+                *span,
+            ),
             Expr::Index { base, index, span } => self.check_index(base, index, *span),
             Expr::Member {
                 base,

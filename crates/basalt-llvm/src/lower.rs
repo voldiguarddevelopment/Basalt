@@ -1207,6 +1207,18 @@ fn lower_inst<'ctx>(
             )?;
             None
         }
+        // Sema-only today (see `Op::KernelLaunch`'s own doc comment in `basalt-bir/src/ir.rs`):
+        // a kernel launch and the CUDA Runtime API calls have no LLVM IR lowering yet — both
+        // need a real host-side dispatch story this lane does not have.
+        Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => {
+            return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                "kernel launch / CUDA Runtime API calls have no LLVM IR lowering in this lane yet",
+            ));
+        }
     };
     Ok(val)
 }

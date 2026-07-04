@@ -197,6 +197,56 @@ fn print_op(out: &mut String, inst: &Inst) {
                 val(*d)
             );
         }
+        Op::KernelLaunch {
+            kernel,
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+        } => {
+            let _ = write!(
+                out,
+                "kernel.launch @{kernel} grid {}, {}, {} block {}, {}, {} shared {} stream {} [",
+                val(grid[0]),
+                val(grid[1]),
+                val(grid[2]),
+                val(block[0]),
+                val(block[1]),
+                val(block[2]),
+                val(*shared),
+                val(*stream),
+            );
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&val(*a));
+            }
+            out.push(']');
+        }
+        Op::CudaMalloc { size } => {
+            let _ = write!(out, "cuda.malloc {ty} {}", val(*size));
+        }
+        Op::CudaMemcpy {
+            dst,
+            src,
+            count,
+            kind,
+        } => {
+            let _ = write!(
+                out,
+                "cuda.memcpy {}, {}, {}, {}",
+                val(*dst),
+                val(*src),
+                val(*count),
+                val(*kind)
+            );
+        }
+        Op::CudaFree { ptr } => {
+            let _ = write!(out, "cuda.free {}", val(*ptr));
+        }
+        Op::CudaDeviceSynchronize => out.push_str("cuda.device_sync"),
         other => {
             // Zero-operand GPU index intrinsics (tid.x, bid.y, ...).
             let mnemonic = other

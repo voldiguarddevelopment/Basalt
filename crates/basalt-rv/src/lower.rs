@@ -272,6 +272,17 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
                     "f64 atomics are a documented scope cut in this backend (see lower.rs's own header)",
                 ));
             }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                    "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                     Op::KernelLaunch's own doc comment); this backend has no host-side dispatch \
+                     story for them yet",
+                ));
+            }
             _ => {}
         }
     }
@@ -786,6 +797,13 @@ impl<'a> CodeGen<'a> {
                 self.lower_atomic_cas(id, ptr, cmp, newv, ty);
             }
             Op::Mma { .. } => unreachable!("check_module refuses mma before codegen starts"),
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                unreachable!("check_module refuses these before codegen starts")
+            }
         }
     }
 
@@ -1856,6 +1874,30 @@ mod tests {
                     ValRef::Param(0),
                     ValRef::Param(0),
                 ),
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
+            }],
+        };
+        assert_eq!(
+            Rv32.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedOp)
+        );
+    }
+
+    /// P13-T1b's kernel-launch/CUDA-Runtime-API ops are sema-only today (see
+    /// `basalt_bir::Op::KernelLaunch`'s own doc comment) — every backend refuses them cleanly.
+    #[test]
+    fn refuses_kernel_launch_and_cuda_runtime_api_ops_with_e090() {
+        let f = Function {
+            is_kernel: true,
+            name: "launch_stub".into(),
+            params: vec![],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::CudaDeviceSynchronize,
             }],
             blocks: vec![Block {
                 insts: vec![InstId(0)],

@@ -114,7 +114,8 @@ use basalt_frontend_c::{FloatLit, FloatSuffix, IntBase, IntLit, Span as FSpan};
 
 use crate::checker::{
     collect_labels_many, compound_binop, conv_span, float_lit_ty, int_lit_ty, top_level_const,
-    CUDA_ATOMIC_CAS_BUILTIN, CUDA_DIM3_BUILTINS,
+    CUDA_ATOMIC_CAS_BUILTIN, CUDA_DEVICE_SYNCHRONIZE_BUILTIN, CUDA_DIM3_BUILTINS, CUDA_DIM3_STRUCT,
+    CUDA_FREE_BUILTIN, CUDA_MALLOC_BUILTIN, CUDA_MEMCPY_BUILTIN, CUDA_MEMCPY_KIND_CONSTANTS,
 };
 use crate::scope::{FuncSig, ScopeStack, StructInfo, ValueSym};
 use crate::ty::{assignable, is_signed_kind, promote, Ty};
@@ -146,6 +147,7 @@ pub fn lower(tu: &TranslationUnit) -> (Module, Vec<Diag>) {
         fn_ret: Ty::Scalar(ScalarKind::Void),
     };
     lw.scopes.push();
+    lw.seed_cuda_runtime_api();
     lw.lower_items(&tu.items);
     lw.scopes.pop();
     let module = Module {
@@ -537,6 +539,30 @@ fn float_lit_value(lit: &FloatLit) -> f64 {
 // ---- Lowerer: item-level registration -----------------------------------------------------
 
 impl Lowerer {
+    /// Mirrors `checker::Checker::seed_cuda_runtime_api`'s scope-visible side (this pass has no
+    /// need to register the four CUDA Runtime API calls themselves — `lower_call` recognizes
+    /// them directly by name, exactly like `__syncthreads`): declares `dim3`
+    /// (`CUDA_DIM3_STRUCT`) globally so `field_offset` can resolve a real dim3-typed launch-
+    /// config value's `x`/`y`/`z` fields, and pre-populates `enum_values` with
+    /// `cudaMemcpyKind`'s five named constants the same way `lower_enum_decl` would for a real
+    /// `enum` — so a `cudaMemcpy` call naming one of them by name lowers to the same real
+    /// integer constant `checker::Checker::seed_cuda_runtime_api` typed it as.
+    fn seed_cuda_runtime_api(&mut self) {
+        self.scopes.declare_struct(
+            CUDA_DIM3_STRUCT,
+            StructInfo {
+                fields: vec![
+                    ("x".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                    ("y".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                    ("z".to_string(), Ty::Scalar(ScalarKind::UInt), false),
+                ],
+            },
+        );
+        for &(name, value) in &CUDA_MEMCPY_KIND_CONSTANTS {
+            self.enum_values.insert(name.to_string(), value);
+        }
+    }
+
     fn lower_items(&mut self, items: &[Item]) {
         for item in items {
             self.lower_item(item);
@@ -628,6 +654,7 @@ impl Lowerer {
             ret: ret.clone(),
             params: param_tys.clone(),
             variadic: f.variadic,
+            is_kernel: f.cuda_quals.is_global,
         };
         self.scopes.declare_value(&f.name, ValueSym::Func(sig));
         if let Some(body) = &f.body {
@@ -1553,6 +1580,23 @@ impl Lowerer {
                 (v, Ty::Scalar(ScalarKind::ULong))
             }
             Expr::Call { callee, args, span } => self.lower_call(callee, args, *span),
+            Expr::KernelLaunch {
+                kernel,
+                grid,
+                block,
+                shared,
+                stream,
+                args,
+                span,
+            } => self.lower_kernel_launch(
+                kernel,
+                grid,
+                block,
+                shared.as_deref(),
+                stream.as_deref(),
+                args,
+                *span,
+            ),
             Expr::Comma { exprs, .. } => {
                 let mut last = self.placeholder();
                 for ex in exprs {
@@ -2436,6 +2480,18 @@ impl Lowerer {
             if name == CUDA_ATOMIC_CAS_BUILTIN {
                 return self.lower_atomic_cas_call(args, span);
             }
+            if name == CUDA_MALLOC_BUILTIN {
+                return self.lower_cuda_malloc_call(args, span);
+            }
+            if name == CUDA_MEMCPY_BUILTIN {
+                return self.lower_cuda_memcpy_call(args);
+            }
+            if name == CUDA_FREE_BUILTIN {
+                return self.lower_cuda_free_call(args);
+            }
+            if name == CUDA_DEVICE_SYNCHRONIZE_BUILTIN {
+                return self.lower_cuda_device_synchronize_call(args);
+            }
         }
         let ret_ty = if let Expr::Ident { name, .. } = callee {
             match self.scopes.lookup_value(name).cloned() {
@@ -2556,6 +2612,242 @@ impl Lowerer {
             self.push(i32t, BOp::AtomicCas(*addr, cmp, new, BSpace::Global)),
             ity,
         )
+    }
+
+    /// Lowers a checked `kernel<<<grid, block[, shared[, stream]]>>>(args...)` to
+    /// `Op::KernelLaunch`. Deliberately not routed through `lower_call` at all — a launch is
+    /// never a generic call (see the module header and `basalt_bir::Op::KernelLaunch`'s own
+    /// doc comment) — so this is its own top-level entry point from `lower_expr`, the same way
+    /// `Expr::KernelLaunch` is its own top-level `Expr` variant rather than a shape of `Call`.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_kernel_launch(
+        &mut self,
+        kernel: &Expr,
+        grid: &Expr,
+        block: &Expr,
+        shared: Option<&Expr>,
+        stream: Option<&Expr>,
+        args: &[Expr],
+        span: FSpan,
+    ) -> (ValRef, Ty) {
+        let void_ty = Ty::Scalar(ScalarKind::Void);
+        let Expr::Ident { name, .. } = kernel else {
+            self.lower_expr(kernel);
+            for a in args {
+                self.lower_expr(a);
+            }
+            self.diag_unsupported(
+                span,
+                "kernel launch",
+                "launch target is not a named function",
+            );
+            return (self.zero_of(&void_ty), void_ty);
+        };
+
+        let grid_vals = self.lower_launch_config_dim(grid);
+        let block_vals = self.lower_launch_config_dim(block);
+        let shared_val = match shared {
+            Some(e) => {
+                let (v, t) = self.lower_expr(e);
+                self.coerce_to(v, &t, &Ty::Scalar(ScalarKind::ULong))
+            }
+            None => self.push(BTy::Scalar(BScalar::I64), BOp::ConstInt(0)),
+        };
+        let stream_val = match stream {
+            Some(e) => self.lower_expr(e).0,
+            // No stream named: a null-stream sentinel — see `Op::KernelLaunch`'s own doc
+            // comment on why this op has no `Option` operands.
+            None => self.push(BTy::Ptr(BSpace::Global), BOp::ConstInt(0)),
+        };
+        let arg_vals: Vec<ValRef> = args.iter().map(|a| self.lower_expr(a).0).collect();
+
+        self.push_void(BOp::KernelLaunch {
+            kernel: name.clone(),
+            grid: grid_vals,
+            block: block_vals,
+            shared: shared_val,
+            stream: stream_val,
+            args: arg_vals,
+        });
+        (self.zero_of(&void_ty), void_ty)
+    }
+
+    /// Lowers one launch-config dimension (`grid`/`block`) to its flattened `(x, y, z)` triple:
+    /// `dim3`'s own single-argument implicit constructor for a bare integer (`(v, 1, 1)`, real
+    /// CUDA's `kernel<<<256, 256>>>(...)` shape), or three real field loads for an actual
+    /// `dim3`-typed value — `peek_launch_dim_is_dim3` tells the two shapes apart without
+    /// lowering `e` twice (`checker::Checker::check_launch_config_dim` already validated `e` is
+    /// one or the other before lowering ever runs).
+    fn lower_launch_config_dim(&mut self, e: &Expr) -> [ValRef; 3] {
+        let i32t = BTy::Scalar(BScalar::I32);
+        if self.peek_launch_dim_is_dim3(e) {
+            let lv = self.lower_lvalue(e);
+            if lv.ty.is_unknown() {
+                let z = self.push(i32t, BOp::ConstInt(0));
+                return [z, z, z];
+            }
+            let x = self.load_dim3_field(&lv, "x");
+            let y = self.load_dim3_field(&lv, "y");
+            let z = self.load_dim3_field(&lv, "z");
+            [x, y, z]
+        } else {
+            let (v, t) = self.lower_expr(e);
+            let x = if t.is_unknown() {
+                self.push(i32t, BOp::ConstInt(0))
+            } else {
+                self.coerce_to(v, &t, &Ty::Scalar(ScalarKind::UInt))
+            };
+            let one = self.push(i32t, BOp::ConstInt(1));
+            [x, one, one]
+        }
+    }
+
+    /// Best-effort static check of whether `e` is `dim3`-typed, without lowering it — enough to
+    /// tell a launch-config dimension's two legal shapes apart before deciding whether it needs
+    /// three field loads or a single value. Deliberately narrow, matching what
+    /// `checker::Checker::check_launch_config_dim` actually accepts: only a local variable or
+    /// one of the four `dim3`-typed builtins (`checker::CUDA_DIM3_BUILTINS`) can name a `dim3`
+    /// value in source today (there is no `dim3(...)` constructor-call syntax modeled by this
+    /// pass); anything else is assumed to be the integer shape.
+    fn peek_launch_dim_is_dim3(&self, e: &Expr) -> bool {
+        let Expr::Ident { name, .. } = e else {
+            return false;
+        };
+        if let Some(slot) = self.find_local(name) {
+            return slot.ty == Ty::Struct(CUDA_DIM3_STRUCT.to_string());
+        }
+        CUDA_DIM3_BUILTINS.contains(&name.as_str())
+    }
+
+    /// Loads one `x`/`y`/`z` field out of a `dim3`-typed `LValue`, the same base-address-plus-
+    /// byte-offset technique `lower_member_lvalue` uses for ordinary struct member access.
+    fn load_dim3_field(&mut self, base: &LValue, field: &str) -> ValRef {
+        match self.field_offset(&base.ty, field) {
+            Some((off, fty)) => {
+                let off_val = self.push(BTy::Scalar(BScalar::I64), BOp::ConstInt(off as i64));
+                let addr = self.push(
+                    BTy::Ptr(base.space),
+                    BOp::Bin(BBin::Add, base.addr, off_val),
+                );
+                let field_lv = LValue {
+                    addr,
+                    ty: fty,
+                    space: base.space,
+                };
+                self.load_addr(&field_lv).0
+            }
+            None => self.push(BTy::Scalar(BScalar::I32), BOp::ConstInt(0)),
+        }
+    }
+
+    /// `cudaMalloc(devPtr, size)` -> `Op::CudaMalloc` plus a real `Store` of the allocated
+    /// pointer through `devPtr`'s own address (see `lower_cuda_malloc_devptr` and
+    /// `Op::CudaMalloc`'s own doc comment on why the store, not this instruction's own SSA
+    /// value, is the real output). `size` (`size_t`) is coerced to `i64`. The call's own
+    /// expression value is a synthesized `cudaSuccess` (`0`) placeholder — this pass has no
+    /// runtime failure to report honestly (see the module header), matching every other
+    /// builtin here that stands in for a value with no BIR execution semantics attached yet.
+    fn lower_cuda_malloc_call(&mut self, args: &[Expr], span: FSpan) -> (ValRef, Ty) {
+        let ity = Ty::Scalar(ScalarKind::Int);
+        if args.len() != 2 {
+            for a in args {
+                self.lower_expr(a);
+            }
+            self.diag_unsupported(span, "cudaMalloc", "expects exactly 2 arguments");
+            return self.placeholder();
+        }
+        let (size_v, size_t) = self.lower_expr(&args[1]);
+        let devptr_lv = self.lower_cuda_malloc_devptr(&args[0], span);
+        if size_t.is_unknown() || devptr_lv.ty.is_unknown() {
+            return self.placeholder();
+        }
+        let size = self.coerce_to(size_v, &size_t, &Ty::Scalar(ScalarKind::ULong));
+        let ptr_ty = BTy::Ptr(BSpace::Global);
+        let allocated = self.push(ptr_ty, BOp::CudaMalloc { size });
+        self.store_addr(&devptr_lv, allocated);
+        (self.zero_of(&ity), ity)
+    }
+
+    /// Resolves `cudaMalloc`'s first argument (`devPtr`, real signature `void**`) to the real
+    /// `LValue` the allocated pointer must be stored through. The common real shape is
+    /// `(void**)&d_a` — a cast wrapping `&lvalue` — unwrapped here so the store keeps the
+    /// lvalue's own real address space (`Local`/`Shared`/...) rather than losing it through an
+    /// ordinary value-lowering of the whole expression: this project's sema `Ty::Pointer`
+    /// carries no address-space annotation of its own (see the module header), so once that
+    /// information is gone it cannot be recovered downstream. Anything else (an already-
+    /// `void**`-typed plain value, e.g. a parameter) still lowers correctly, defaulting to
+    /// `AddrSpace::Global` — the same default every other pointer *value* gets in this pass.
+    fn lower_cuda_malloc_devptr(&mut self, e: &Expr, span: FSpan) -> LValue {
+        let mut inner = e;
+        while let Expr::Cast { expr, .. } = inner {
+            inner = expr;
+        }
+        if let Expr::Unary {
+            op: UnaryOp::Addr,
+            expr,
+            ..
+        } = inner
+        {
+            return self.lower_lvalue(expr);
+        }
+        let (v, ty) = self.lower_expr(e);
+        if !ty.is_pointer_like() {
+            if !ty.is_unknown() {
+                self.diag_unsupported(span, "cudaMalloc", "first argument is not a pointer");
+            }
+            return self.lvalue_unknown();
+        }
+        LValue {
+            addr: v,
+            ty: Ty::Pointer(Box::new(Ty::Scalar(ScalarKind::Void)), false),
+            space: BSpace::Global,
+        }
+    }
+
+    /// `cudaMemcpy(dst, src, count, kind)` -> `Op::CudaMemcpy`. No real byte-copy semantics are
+    /// modeled here (see the module header): the op simply carries the four operands
+    /// faithfully, exactly like `cudaFree`/`cudaDeviceSynchronize` below — a real host-side
+    /// copy is separate, later work. `kind` accepts either a bare integer literal or one of
+    /// `checker::CUDA_MEMCPY_KIND_CONSTANTS`'s named constants; both already lower through the
+    /// ordinary `Expr::Ident` enum-constant path `seed_cuda_runtime_api` wires up.
+    fn lower_cuda_memcpy_call(&mut self, args: &[Expr]) -> (ValRef, Ty) {
+        let vals = self.lower_call_args(args);
+        if vals.len() != 4 || vals.iter().any(|(_, t)| t.is_unknown()) {
+            return self.placeholder();
+        }
+        let count = self.coerce_to(vals[2].0, &vals[2].1, &Ty::Scalar(ScalarKind::ULong));
+        let kind = self.coerce_to(vals[3].0, &vals[3].1, &Ty::Scalar(ScalarKind::Int));
+        self.push_void(BOp::CudaMemcpy {
+            dst: vals[0].0,
+            src: vals[1].0,
+            count,
+            kind,
+        });
+        let ity = Ty::Scalar(ScalarKind::Int);
+        (self.zero_of(&ity), ity)
+    }
+
+    /// `cudaFree(devPtr)` -> `Op::CudaFree`.
+    fn lower_cuda_free_call(&mut self, args: &[Expr]) -> (ValRef, Ty) {
+        let vals = self.lower_call_args(args);
+        if vals.len() != 1 || vals[0].1.is_unknown() {
+            return self.placeholder();
+        }
+        self.push_void(BOp::CudaFree { ptr: vals[0].0 });
+        let ity = Ty::Scalar(ScalarKind::Int);
+        (self.zero_of(&ity), ity)
+    }
+
+    /// `cudaDeviceSynchronize(void)` -> `Op::CudaDeviceSynchronize`. Any arguments (there
+    /// should be none) are still lowered first for their side effects, matching
+    /// `lower_syncthreads_call`'s own convention for a zero-arity builtin.
+    fn lower_cuda_device_synchronize_call(&mut self, args: &[Expr]) -> (ValRef, Ty) {
+        for a in args {
+            self.lower_expr(a);
+        }
+        self.push_void(BOp::CudaDeviceSynchronize);
+        let ity = Ty::Scalar(ScalarKind::Int);
+        (self.zero_of(&ity), ity)
     }
 }
 
@@ -2935,5 +3227,228 @@ mod tests {
             "{diags:?}"
         );
         assert_eq!(m.funcs.len(), 1);
+    }
+
+    // ---- P13-T1b: kernel launch + CUDA Runtime API -----------------------------------------
+
+    #[test]
+    fn kernel_launch_with_bare_integer_config_lowers_to_kernel_launch_op() {
+        let tu = checked(
+            r#"
+            __global__ void vadd(float *a, float *b, float *c) {
+                c[threadIdx.x] = a[threadIdx.x] + b[threadIdx.x];
+            }
+            void launch(float *a, float *b, float *c) {
+                vadd<<<1, 256>>>(a, b, c);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let launcher = m.funcs.iter().find(|f| f.name == "launch").unwrap();
+        let launch_inst = launcher
+            .insts
+            .iter()
+            .find_map(|inst| match &inst.op {
+                basalt_bir::Op::KernelLaunch {
+                    kernel,
+                    grid,
+                    block,
+                    args,
+                    ..
+                } => Some((kernel.clone(), *grid, *block, args.clone())),
+                _ => None,
+            })
+            .expect("expected a KernelLaunch instruction");
+        let (kernel, grid, block, args) = launch_inst;
+        assert_eq!(kernel, "vadd");
+        assert_eq!(args.len(), 3);
+
+        // A bare-integer launch config (`<<<1, 256>>>`) flattens to `(v, 1, 1)` per dim3's own
+        // single-argument implicit constructor — check every non-leading component really is
+        // the constant `1`, and the leading component is the real grid/block value (not itself
+        // hardcoded to 1).
+        let const_int_value = |v: basalt_bir::ValRef| -> Option<i64> {
+            let basalt_bir::ValRef::Val(id) = v else {
+                return None;
+            };
+            match launcher.insts[id.0 as usize].op {
+                basalt_bir::Op::ConstInt(n) => Some(n),
+                _ => None,
+            }
+        };
+        assert_eq!(const_int_value(grid[1]), Some(1));
+        assert_eq!(const_int_value(grid[2]), Some(1));
+        assert_eq!(const_int_value(block[1]), Some(1));
+        assert_eq!(const_int_value(block[2]), Some(1));
+
+        assert_roundtrip(&m);
+    }
+
+    /// A launch-config dimension that really is `dim3`-typed (rather than a bare integer)
+    /// lowers to three real field loads, not the `(v, 1, 1)` flattening. `__basalt_cuda_dim3`
+    /// is the synthetic struct name `checker`/`lower` register `dim3` builtin values under
+    /// (see `checker::CUDA_DIM3_STRUCT`) — real CUDA-C has no way to spell a `dim3` local today
+    /// (see this file's own module header's `Op::KernelLaunch` note), so this test exercises
+    /// the mechanism directly against that internal name, the same way the sema layer would see
+    /// it if a real `dim3`-typed value reached a launch.
+    #[test]
+    fn kernel_launch_with_dim3_typed_config_loads_real_fields() {
+        let tu = checked(
+            r#"
+            __global__ void vadd(float *a) {
+                a[threadIdx.x] = 0.0f;
+            }
+            void launch(float *a, __basalt_cuda_dim3 g, __basalt_cuda_dim3 b) {
+                vadd<<<g, b>>>(a);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        // Three loads per dim3 config argument (x/y/z), six total, rather than any `const.i`
+        // standing in for a flattened `1`.
+        assert!(
+            text.matches("load i32 ptr.param").count() >= 6,
+            "expected at least 6 field loads, got:\n{text}"
+        );
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn kernel_launch_with_shared_and_stream_lowers_those_operands() {
+        let tu = checked(
+            r#"
+            __global__ void vadd(float *a) {
+                a[threadIdx.x] = 0.0f;
+            }
+            void launch(float *a, int shared_bytes, void *stream) {
+                vadd<<<1, 256, shared_bytes, stream>>>(a);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("kernel.launch"), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    /// Omitting `shared`/`stream` still produces concrete operands (a `0`-byte default and a
+    /// null-stream sentinel) — `Op::KernelLaunch` has no `Option` fields (see its own doc
+    /// comment), so these must always be real, materialized values.
+    #[test]
+    fn kernel_launch_without_shared_or_stream_still_materializes_both_operands() {
+        let tu = checked(
+            r#"
+            __global__ void vadd(float *a) {
+                a[threadIdx.x] = 0.0f;
+            }
+            void launch(float *a) {
+                vadd<<<1, 256>>>(a);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let launcher = m.funcs.iter().find(|f| f.name == "launch").unwrap();
+        let found = launcher.insts.iter().any(|inst| {
+            matches!(
+                &inst.op,
+                basalt_bir::Op::KernelLaunch {
+                    shared: basalt_bir::ValRef::Val(_),
+                    stream: basalt_bir::ValRef::Val(_),
+                    ..
+                }
+            )
+        });
+        assert!(found, "expected concrete shared/stream operands");
+        assert_roundtrip(&m);
+    }
+
+    /// `cudaMalloc`'s real pointer-to-pointer semantics: the allocated pointer is not just
+    /// this instruction's own unused SSA result — it must be written through `devPtr`'s own
+    /// address with a genuine `Op::Store`.
+    #[test]
+    fn cuda_malloc_stores_the_allocated_pointer_through_devptr() {
+        let tu = checked(
+            r#"
+            void setup(int n) {
+                float *d_a;
+                cudaMalloc((void**)&d_a, n * sizeof(float));
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &m.funcs[0];
+        let malloc_id = f
+            .insts
+            .iter()
+            .position(|inst| matches!(inst.op, basalt_bir::Op::CudaMalloc { .. }))
+            .expect("expected a CudaMalloc instruction");
+        let stores_result = f.insts.iter().any(|inst| match &inst.op {
+            basalt_bir::Op::Store { val, .. } => {
+                *val == basalt_bir::ValRef::Val(basalt_bir::InstId(malloc_id as u32))
+            }
+            _ => false,
+        });
+        assert!(
+            stores_result,
+            "expected a Store writing CudaMalloc's own result through devPtr"
+        );
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn cuda_memcpy_named_kind_constant_lowers_to_its_real_integer_value() {
+        let tu = checked(
+            r#"
+            void setup(float *h_a, float *d_a, int n) {
+                cudaMemcpy(d_a, h_a, n * sizeof(float), cudaMemcpyHostToDevice);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &m.funcs[0];
+        let kind = f
+            .insts
+            .iter()
+            .find_map(|inst| match &inst.op {
+                basalt_bir::Op::CudaMemcpy { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("expected a CudaMemcpy instruction");
+        let basalt_bir::ValRef::Val(id) = kind else {
+            panic!("kind operand should be a real instruction value");
+        };
+        assert_eq!(f.insts[id.0 as usize].op, basalt_bir::Op::ConstInt(1));
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn cuda_free_and_device_synchronize_lower_to_their_own_ops() {
+        let tu = checked(
+            r#"
+            void teardown(float *d_a) {
+                cudaDeviceSynchronize();
+                cudaFree(d_a);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &m.funcs[0];
+        assert!(f
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, basalt_bir::Op::CudaDeviceSynchronize)));
+        assert!(f
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, basalt_bir::Op::CudaFree { .. })));
+        assert_roundtrip(&m);
     }
 }

@@ -314,6 +314,18 @@ fn mma_refuses() {
     assert_eq!(unsupported_code(&wrap(f)), ECode::UnsupportedOp);
 }
 
+/// P13-T1b's kernel-launch/CUDA-Runtime-API ops are sema-only today (see
+/// `basalt_bir::Op::KernelLaunch`'s own doc comment) — every backend refuses them cleanly.
+#[test]
+fn kernel_launch_and_cuda_runtime_api_ops_refuse() {
+    let insts = vec![Inst {
+        ty: Ty::Void,
+        op: Op::CudaDeviceSynchronize,
+    }];
+    let f = simple_fn("launch_stub", vec![], insts, Term::Ret(None));
+    assert_eq!(unsupported_code(&wrap(f)), ECode::UnsupportedOp);
+}
+
 #[test]
 fn warp_collective_ops_refuse() {
     let i32t = Ty::Scalar(Scalar::I32);

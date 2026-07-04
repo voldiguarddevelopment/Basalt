@@ -408,6 +408,72 @@ pub enum Op {
         layout_a: MmaLayout,
         layout_b: MmaLayout,
     },
+    /// `kernel_name<<<grid, block[, shared[, stream]]>>>(args...)`. `kernel` names the
+    /// launched `Function` by its own `name` field, spelled `@name` in textual BIR exactly
+    /// like a function's own declaration line (see `print.rs`/`parse.rs`) — a genuine
+    /// function *reference*, not a declaration, and the first thing in BIR that names a
+    /// function from anywhere other than its own `func @name (...)` line. It is a plain
+    /// `String`, not an arena index: nothing about parsing or printing this op needs to
+    /// resolve the name against `Module::funcs` (that is a semantic question for whatever
+    /// validates the module, not a syntactic one for this crate), so a launch may name a
+    /// function printed earlier or later in the same module with no special handling either
+    /// way — see `parse.rs`'s round-trip test for a launch referencing a function defined
+    /// after it.
+    ///
+    /// `grid`/`block` are each a flattened `(x, y, z)` triple: BIR has no aggregate value
+    /// type to hold a `dim3` directly (`basalt-sema/src/lower.rs`'s own module header has the
+    /// full "no aggregate BIR type" story), so `basalt-sema` decomposes both the struct form
+    /// and `dim3`'s single-argument implicit-constructor form (`kernel<<<256, 256>>>(...)`,
+    /// equivalent to `dim3(256, 1, 1)`) into three scalar operands before this op is ever
+    /// built. `shared` (dynamic shared-memory byte count) and `stream` are always concrete
+    /// operands, never `Option`: a source launch that omits either lowers to a materialized
+    /// default (`0` bytes; a null-stream sentinel) rather than leaving an optional field for
+    /// this op's textual grammar to disambiguate.
+    ///
+    /// Side-effecting like `Store`/`Mma`, not value-producing (`Ty::Void`) — a real kernel
+    /// launch has no ordinary-expression value in CUDA C++'s own grammar. **Sema-only today**:
+    /// no hand-rolled backend lowers this op yet, including the x86 oracle (a real oracle
+    /// lowering needs a genuine call/return mechanism this project has not built — see
+    /// `PLAN.md`'s P13-T1c). Every backend refuses it with `E090` until that lands.
+    KernelLaunch {
+        kernel: String,
+        grid: [ValRef; 3],
+        block: [ValRef; 3],
+        shared: ValRef,
+        stream: ValRef,
+        args: Vec<ValRef>,
+    },
+    /// `cudaMalloc(void** devPtr, size_t size)`. The interesting output is not this
+    /// instruction's own SSA value — real `cudaMalloc` writes the freshly-allocated pointer
+    /// *through* `devPtr` — so this op only produces that pointer as an ordinary `Ty::Ptr`
+    /// value; `basalt-sema/src/lower.rs`'s lowering immediately follows it with a real `Store`
+    /// of that value through `devPtr`'s own address, the same as any other pointer write.
+    /// `size` is `size_t`, modeled as `Ty::Scalar(Scalar::I64)` per this project's existing
+    /// `size_t` convention. **Sema-only today** (see `Op::KernelLaunch`'s doc comment): no
+    /// backend allocates real device memory for this yet, refused with `E090` everywhere.
+    CudaMalloc {
+        size: ValRef,
+    },
+    /// `cudaMemcpy(void* dst, const void* src, size_t count, enum cudaMemcpyKind kind)`.
+    /// `kind` is an ordinary integer operand (`cudaMemcpyKind`'s stable values, `HostToHost=0`
+    /// .. `Default=4` — see `basalt-sema/src/checker.rs`'s builtin seeding), not a dedicated
+    /// enum field: BIR has no enum type, and a real lowering needs the value at runtime to
+    /// pick a copy path anyway, not just at compile time. **Sema-only today**, refused with
+    /// `E090` everywhere (see `Op::KernelLaunch`'s doc comment).
+    CudaMemcpy {
+        dst: ValRef,
+        src: ValRef,
+        count: ValRef,
+        kind: ValRef,
+    },
+    /// `cudaFree(void* devPtr)`. **Sema-only today**, refused with `E090` everywhere (see
+    /// `Op::KernelLaunch`'s doc comment).
+    CudaFree {
+        ptr: ValRef,
+    },
+    /// `cudaDeviceSynchronize(void)`. No operands. **Sema-only today**, refused with `E090`
+    /// everywhere (see `Op::KernelLaunch`'s doc comment).
+    CudaDeviceSynchronize,
 }
 
 /// One arena-resident instruction: its result type (`Ty::Void` if it produces no value)

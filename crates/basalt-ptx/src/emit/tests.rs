@@ -684,6 +684,30 @@ fn mma_is_refused_not_guessed() {
     assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
 }
 
+/// P13-T1b's kernel-launch/CUDA-Runtime-API ops are sema-only today (see
+/// `basalt_bir::Op::KernelLaunch`'s own doc comment) — every backend refuses them cleanly.
+#[test]
+fn kernel_launch_and_cuda_runtime_api_ops_are_refused_not_guessed() {
+    let f = simple_fn(
+        "launch_stub",
+        vec![],
+        vec![Inst {
+            ty: Ty::Void,
+            op: Op::CudaDeviceSynchronize,
+        }],
+        Term::Ret(None),
+    );
+    let module = wrap(f);
+    assert_eq!(
+        Ptx.supports(&module),
+        Support::Unsupported(basalt_diag::ECode::UnsupportedOp)
+    );
+    let err = Ptx
+        .emit(&module, &EmitOpts::default())
+        .expect_err("emit must refuse what supports() refuses, not guess");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
+}
+
 #[test]
 fn non_kernel_function_is_refused_not_silently_emitted_as_a_kernel() {
     // The live gap this test guards: every function in a module is emitted as its own

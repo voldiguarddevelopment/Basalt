@@ -662,6 +662,84 @@ impl<'a> Parser<'a> {
                 let new = self.val()?;
                 Ok((ty, Op::AtomicCas(ptr, cmp, new, space)))
             }
+            "kernel.launch" => {
+                let name_word = self.word()?;
+                let kernel = name_word
+                    .strip_prefix('@')
+                    .ok_or_else(|| ParseError {
+                        line: self.line(),
+                        msg: format!("expected `@name`, found `{name_word}`"),
+                    })?
+                    .to_string();
+                self.expect_kw("grid")?;
+                let g0 = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let g1 = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let g2 = self.val()?;
+                self.expect_kw("block")?;
+                let b0 = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let b1 = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let b2 = self.val()?;
+                self.expect_kw("shared")?;
+                let shared = self.val()?;
+                self.expect_kw("stream")?;
+                let stream = self.val()?;
+                self.expect_tok(Tok::LBracket)?;
+                let mut args = Vec::new();
+                if !self.check(&Tok::RBracket) {
+                    loop {
+                        args.push(self.val()?);
+                        if self.check(&Tok::Comma) {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect_tok(Tok::RBracket)?;
+                Ok((
+                    Ty::Void,
+                    Op::KernelLaunch {
+                        kernel,
+                        grid: [g0, g1, g2],
+                        block: [b0, b1, b2],
+                        shared,
+                        stream,
+                        args,
+                    },
+                ))
+            }
+            "cuda.malloc" => {
+                let ty = self.ty()?;
+                let size = self.val()?;
+                Ok((ty, Op::CudaMalloc { size }))
+            }
+            "cuda.memcpy" => {
+                let dst = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let src = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let count = self.val()?;
+                self.expect_tok(Tok::Comma)?;
+                let kind = self.val()?;
+                Ok((
+                    Ty::Void,
+                    Op::CudaMemcpy {
+                        dst,
+                        src,
+                        count,
+                        kind,
+                    },
+                ))
+            }
+            "cuda.free" => {
+                let ptr = self.val()?;
+                Ok((Ty::Void, Op::CudaFree { ptr }))
+            }
+            "cuda.device_sync" => Ok((Ty::Void, Op::CudaDeviceSynchronize)),
             "mma" => {
                 let in_dtype = self.scalar_ty()?;
                 let acc_dtype = self.scalar_ty()?;

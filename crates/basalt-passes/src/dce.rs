@@ -105,6 +105,31 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         Op::Atomic(_, ptr, v, _) => vec![*ptr, *v],
         Op::AtomicCas(ptr, cmp, new, _) => vec![*ptr, *cmp, *new],
         Op::Mma { a, b, c, d, .. } => vec![*a, *b, *c, *d],
+        Op::KernelLaunch {
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(8 + args.len());
+            v.extend_from_slice(grid);
+            v.extend_from_slice(block);
+            v.push(*shared);
+            v.push(*stream);
+            v.extend(args.iter().copied());
+            v
+        }
+        Op::CudaMalloc { size } => vec![*size],
+        Op::CudaMemcpy {
+            dst,
+            src,
+            count,
+            kind,
+        } => vec![*dst, *src, *count, *kind],
+        Op::CudaFree { ptr } => vec![*ptr],
+        Op::CudaDeviceSynchronize => Vec::new(),
     }
 }
 
@@ -206,6 +231,35 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
             layout_a: *layout_a,
             layout_b: *layout_b,
         },
+        Op::KernelLaunch {
+            kernel,
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+        } => Op::KernelLaunch {
+            kernel: kernel.clone(),
+            grid: [f(grid[0]), f(grid[1]), f(grid[2])],
+            block: [f(block[0]), f(block[1]), f(block[2])],
+            shared: f(*shared),
+            stream: f(*stream),
+            args: args.iter().map(|&v| f(v)).collect(),
+        },
+        Op::CudaMalloc { size } => Op::CudaMalloc { size: f(*size) },
+        Op::CudaMemcpy {
+            dst,
+            src,
+            count,
+            kind,
+        } => Op::CudaMemcpy {
+            dst: f(*dst),
+            src: f(*src),
+            count: f(*count),
+            kind: f(*kind),
+        },
+        Op::CudaFree { ptr } => Op::CudaFree { ptr: f(*ptr) },
+        Op::CudaDeviceSynchronize => Op::CudaDeviceSynchronize,
     }
 }
 
@@ -214,9 +268,16 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
 /// that effect (a `volatile` `load`'s read must never be assumed droppable).
 fn is_root(op: &Op) -> bool {
     match op {
-        Op::Store { .. } | Op::Barrier | Op::Atomic(..) | Op::AtomicCas(..) | Op::Mma { .. } => {
-            true
-        }
+        Op::Store { .. }
+        | Op::Barrier
+        | Op::Atomic(..)
+        | Op::AtomicCas(..)
+        | Op::Mma { .. }
+        | Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => true,
         Op::Load { volatile, .. } => *volatile,
         _ => false,
     }

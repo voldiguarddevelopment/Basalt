@@ -89,6 +89,19 @@ pub(crate) fn flatten_to_native_cpu_loop(module: &Module) -> Result<Module, Diag
                  one-thread-at-a-time execution",
             ));
         }
+        if matches!(
+            inst.op,
+            Op::KernelLaunch { .. }
+                | Op::CudaMalloc { .. }
+                | Op::CudaMemcpy { .. }
+                | Op::CudaFree { .. }
+                | Op::CudaDeviceSynchronize
+        ) {
+            return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                "cpu-loop flattening: kernel launch / CUDA Runtime API calls are sema-only \
+                 today (see Op::KernelLaunch's own doc comment)",
+            ));
+        }
     }
 
     Ok(Module {
@@ -229,6 +242,14 @@ fn remap_op(op: &Op, inst_offset: u32, block_offset: u32) -> Op {
             layout_a: *layout_a,
             layout_b: *layout_b,
         },
+        Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => unreachable!(
+            "flatten_to_native_cpu_loop refuses kernel launch / CUDA Runtime API calls before \
+             this point"
+        ),
     }
 }
 

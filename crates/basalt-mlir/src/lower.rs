@@ -1112,6 +1112,16 @@ fn lower_inst<'c, 'a>(
                  this task's vector_add-scoped minimum bar",
             ))
         }
+        Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => {
+            return Err(unsupported_op(
+                "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                 Op::KernelLaunch's own doc comment); this lane has no lowering for them yet",
+            ))
+        }
     }))
 }
 
@@ -1277,6 +1287,16 @@ fn check_unsupported_ops(f: &Function) -> Result<(), Diag> {
                 return Err(unsupported_op(
                     "Op::Mma -> linalg.matmul is a real, deferred follow-up; not attempted by \
                      this task's vector_add-scoped minimum bar",
+                ))
+            }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                return Err(unsupported_op(
+                    "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                     Op::KernelLaunch's own doc comment); this lane has no lowering for them yet",
                 ))
             }
             _ => {}

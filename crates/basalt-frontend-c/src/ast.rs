@@ -169,6 +169,23 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// `kernel<<<grid, block[, shared[, stream]]>>>(args...)` — CUDA's kernel-launch syntax.
+    /// Deliberately a peer of `Call`, not one of its variants: a launch is not an ordinary
+    /// function call at the C++ grammar level (no return value used the normal way; real nvcc
+    /// treats it as a distinct statement-like expression), and keeping it a distinct construct
+    /// end to end (parser -> checker -> BIR op) matches every other CUDA builtin in this
+    /// project, none of which are routed through `Call`'s own generic call machinery either.
+    /// `shared`/`stream` are `None` when the source omits them (`<<<grid, block>>>` is valid
+    /// CUDA; only the 2-argument launch-config form is required).
+    KernelLaunch {
+        kernel: Box<Expr>,
+        grid: Box<Expr>,
+        block: Box<Expr>,
+        shared: Option<Box<Expr>>,
+        stream: Option<Box<Expr>>,
+        args: Vec<Expr>,
+        span: Span,
+    },
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
@@ -209,6 +226,7 @@ impl Expr {
             | Expr::SizeofExpr { span, .. }
             | Expr::SizeofType { span, .. }
             | Expr::Call { span, .. }
+            | Expr::KernelLaunch { span, .. }
             | Expr::Index { span, .. }
             | Expr::Member { span, .. }
             | Expr::Error { span } => *span,

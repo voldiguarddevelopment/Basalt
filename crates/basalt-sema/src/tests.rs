@@ -532,3 +532,137 @@ fn plain_variable_parameter_and_pointer_assignment_has_no_diagnostics() {
     let diags = check(&tu);
     assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
 }
+
+// ---- P13-T1b: kernel launch + CUDA Runtime API -----------------------------------------------
+
+/// `cudaMalloc`/`cudaMemcpy`/`cudaFree`/`cudaDeviceSynchronize` are ordinary host-callable
+/// functions, not gated to a device/kernel body the way `threadIdx`/`__syncthreads` are (see
+/// `builtins_are_not_available_in_an_ordinary_host_function` above) — real CUDA-C calls them
+/// from plain host code.
+#[test]
+fn cuda_runtime_api_calls_from_host_code_have_no_diagnostics() {
+    let tu = parse_ok(
+        r#"
+        void setup(float *h_a, int n) {
+            float *d_a;
+            cudaMalloc((void**)&d_a, n * sizeof(float));
+            cudaMemcpy(d_a, h_a, n * sizeof(float), cudaMemcpyHostToDevice);
+            cudaDeviceSynchronize();
+            cudaFree(d_a);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+/// A bare integer literal is just as valid as the named constant for `cudaMemcpy`'s `kind`
+/// parameter (both are plain `int`-typed).
+#[test]
+fn cuda_memcpy_accepts_a_bare_integer_kind() {
+    let tu = parse_ok(
+        r#"
+        void copy_back(float *h_a, float *d_a, int n) {
+            cudaMemcpy(h_a, d_a, n * sizeof(float), 2);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn valid_kernel_launch_has_no_diagnostics() {
+    let tu = parse_ok(
+        r#"
+        __global__ void vadd(float *a, float *b, float *c) {
+            c[threadIdx.x] = a[threadIdx.x] + b[threadIdx.x];
+        }
+        void launch(float *a, float *b, float *c) {
+            vadd<<<1, 256>>>(a, b, c);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+#[test]
+fn kernel_launch_with_shared_and_stream_has_no_diagnostics() {
+    let tu = parse_ok(
+        r#"
+        __global__ void vadd(float *a) {
+            a[threadIdx.x] = 0.0f;
+        }
+        void launch(float *a, int shared_bytes, void *stream) {
+            vadd<<<1, 256, shared_bytes, stream>>>(a);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+}
+
+/// Launching an ordinary (non-`__global__`) function is rejected: only a real kernel is a
+/// legal launch target.
+#[test]
+fn launching_a_non_kernel_function_reports_e300() {
+    let tu = parse_ok(
+        r#"
+        void helper(int *a) {
+            a[0] = 1;
+        }
+        void launch(int *a) {
+            helper<<<1, 1>>>(a);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::TypeError));
+}
+
+#[test]
+fn launching_an_undefined_kernel_reports_e301() {
+    let tu = parse_ok(
+        r#"
+        void launch() {
+            nope<<<1, 1>>>();
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::UndefinedSymbol));
+}
+
+#[test]
+fn kernel_launch_wrong_argument_count_reports_e300() {
+    let tu = parse_ok(
+        r#"
+        __global__ void vadd(float *a, float *b) {
+            a[0] = b[0];
+        }
+        void launch(float *a) {
+            vadd<<<1, 1>>>(a);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::TypeError));
+}
+
+#[test]
+fn kernel_launch_wrong_argument_type_reports_e300() {
+    let tu = parse_ok(
+        r#"
+        struct Point { int x; int y; };
+        __global__ void vadd(float *a) {
+            a[0] = 0.0f;
+        }
+        void launch(struct Point p) {
+            vadd<<<1, 1>>>(p);
+        }
+        "#,
+    );
+    let diags = check(&tu);
+    assert!(codes(&diags).contains(&ECode::TypeError));
+}

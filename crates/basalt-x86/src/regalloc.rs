@@ -183,6 +183,17 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
                 return Err(Diag::new(ECode::UnsupportedOp)
                     .with_arg("mma has no lowering in the regalloc-based x86-64 backend yet"));
             }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                    "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                     Op::KernelLaunch's own doc comment): a real call/return mechanism does not \
+                     exist in this backend yet",
+                ));
+            }
             _ => {}
         }
     }
@@ -766,6 +777,13 @@ impl<'a> CodeGen<'a> {
             }
             Op::Mma { .. } => {
                 unreachable!("check_module refuses mma before codegen starts")
+            }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                unreachable!("check_module refuses these before codegen starts")
             }
         }
     }
@@ -1520,6 +1538,31 @@ mod tests {
                     ValRef::Param(0),
                     ValRef::Param(0),
                 ),
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
+            }],
+        };
+        assert_eq!(
+            X86Regalloc.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedOp)
+        );
+    }
+
+    /// P13-T1b's kernel-launch/CUDA-Runtime-API ops are sema-only today (see
+    /// `basalt_bir::Op::KernelLaunch`'s own doc comment): a real call/return mechanism does
+    /// not exist in this backend yet. Every backend refuses them cleanly.
+    #[test]
+    fn refuses_kernel_launch_and_cuda_runtime_api_ops_with_e090() {
+        let f = Function {
+            is_kernel: true,
+            name: "launch_stub".into(),
+            params: vec![],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::CudaDeviceSynchronize,
             }],
             blocks: vec![Block {
                 insts: vec![InstId(0)],

@@ -433,6 +433,17 @@ fn check_inst(inst: &Inst) -> Result<(), Diag> {
             return Err(Diag::new(ECode::UnsupportedOp)
                 .with_arg("mma has no tile/matrix-engine lowering in this backend yet"));
         }
+        Op::KernelLaunch { .. }
+        | Op::CudaMalloc { .. }
+        | Op::CudaMemcpy { .. }
+        | Op::CudaFree { .. }
+        | Op::CudaDeviceSynchronize => {
+            return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                 Op::KernelLaunch's own doc comment); this backend has no host-side dispatch \
+                 story for them yet",
+            ));
+        }
         _ => {}
     }
     Ok(())
@@ -849,7 +860,12 @@ impl<'a> CodeGen<'a> {
             | Op::VoteAll(..)
             | Op::Atomic(..)
             | Op::AtomicCas(..)
-            | Op::Mma { .. } => {
+            | Op::Mma { .. }
+            | Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses these before codegen starts")
             }
         }

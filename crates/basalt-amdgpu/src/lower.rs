@@ -563,6 +563,31 @@ fn op_operands(op: &Op) -> Vec<ValRef> {
         Op::Atomic(_, p, v, _) => vec![*p, *v],
         Op::AtomicCas(p, c, n, _) => vec![*p, *c, *n],
         Op::Mma { a, b, c, d, .. } => vec![*a, *b, *c, *d],
+        Op::KernelLaunch {
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(8 + args.len());
+            v.extend_from_slice(grid);
+            v.extend_from_slice(block);
+            v.push(*shared);
+            v.push(*stream);
+            v.extend(args.iter().copied());
+            v
+        }
+        Op::CudaMalloc { size } => vec![*size],
+        Op::CudaMemcpy {
+            dst,
+            src,
+            count,
+            kind,
+        } => vec![*dst, *src, *count, *kind],
+        Op::CudaFree { ptr } => vec![*ptr],
+        Op::CudaDeviceSynchronize => vec![],
     }
 }
 
@@ -1246,6 +1271,14 @@ fn check_function(f: &Function) -> Result<(), Diag> {
                     }
                 }
             }
+            // Sema-only today (see `Op::KernelLaunch`'s own doc comment in
+            // `basalt-bir/src/ir.rs`): no real host-side dispatch story exists for this
+            // backend yet.
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => return Err(e_feature()),
         }
     }
     for block in &f.blocks {
@@ -1643,7 +1676,12 @@ impl<'a> CodeGen<'a> {
             | Op::Ballot(_)
             | Op::VoteAny(_)
             | Op::VoteAll(_)
-            | Op::AtomicCas(..) => {
+            | Op::AtomicCas(..)
+            | Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses this construct before codegen starts")
             }
         }
@@ -3066,6 +3104,33 @@ mod tests {
             blocks: vec![Block {
                 insts: vec![InstId(0)],
                 term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+            }],
+        };
+        assert_eq!(
+            Amdgcn.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    /// P13-T1b's kernel-launch/CUDA-Runtime-API ops are sema-only today (see
+    /// `basalt_bir::Op::KernelLaunch`'s own doc comment) — every backend refuses them cleanly.
+    /// `UnsupportedFeature` matches this backend's own existing convention for "op not
+    /// implemented here" (see `refuses_atomic_cas_with_e093`/`refuses_shuffle_and_vote_with_e093`
+    /// above), not the generic `UnsupportedOp`.
+    #[test]
+    fn refuses_kernel_launch_and_cuda_runtime_api_ops_with_e093() {
+        let f = Function {
+            is_kernel: true,
+            name: "launch_stub".into(),
+            params: vec![],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::CudaDeviceSynchronize,
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
             }],
         };
         assert_eq!(

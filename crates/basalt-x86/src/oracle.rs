@@ -230,6 +230,17 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
                      acc_dtype at least as wide as in_dtype, and neither i1 nor f16",
                 ));
             }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                    "kernel launch / CUDA Runtime API calls are sema-only today (see \
+                     Op::KernelLaunch's own doc comment): a real oracle lowering needs a call/\
+                     return mechanism this backend does not have yet",
+                ));
+            }
             _ => {}
         }
     }
@@ -754,6 +765,13 @@ impl<'a> CodeGen<'a> {
                 self.lower_mma(
                     id, a, b, c, d, m, n, k, in_dtype, acc_dtype, layout_a, layout_b,
                 );
+            }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                unreachable!("check_module refuses these before codegen starts")
             }
         }
     }
@@ -1950,6 +1968,32 @@ mod tests {
                     ValRef::Param(0),
                     ValRef::Param(0),
                 ),
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(None),
+            }],
+        };
+        assert_eq!(
+            X86Oracle.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedOp)
+        );
+    }
+
+    /// P13-T1b's kernel-launch/CUDA-Runtime-API ops are sema-only today (see
+    /// `basalt_bir::Op::KernelLaunch`'s own doc comment): a real oracle lowering needs a
+    /// genuine call/return mechanism this backend does not have yet. Every backend refuses
+    /// them cleanly.
+    #[test]
+    fn refuses_kernel_launch_and_cuda_runtime_api_ops_with_e090() {
+        let f = Function {
+            is_kernel: true,
+            name: "launch_stub".into(),
+            params: vec![],
+            ret: Ty::Void,
+            insts: vec![Inst {
+                ty: Ty::Void,
+                op: Op::CudaDeviceSynchronize,
             }],
             blocks: vec![Block {
                 insts: vec![InstId(0)],

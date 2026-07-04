@@ -492,6 +492,35 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
             layout_a: *layout_a,
             layout_b: *layout_b,
         },
+        Op::KernelLaunch {
+            kernel,
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+        } => Op::KernelLaunch {
+            kernel: kernel.clone(),
+            grid: [f(grid[0]), f(grid[1]), f(grid[2])],
+            block: [f(block[0]), f(block[1]), f(block[2])],
+            shared: f(*shared),
+            stream: f(*stream),
+            args: args.iter().map(|&v| f(v)).collect(),
+        },
+        Op::CudaMalloc { size } => Op::CudaMalloc { size: f(*size) },
+        Op::CudaMemcpy {
+            dst,
+            src,
+            count,
+            kind,
+        } => Op::CudaMemcpy {
+            dst: f(*dst),
+            src: f(*src),
+            count: f(*count),
+            kind: f(*kind),
+        },
+        Op::CudaFree { ptr } => Op::CudaFree { ptr: f(*ptr) },
+        Op::CudaDeviceSynchronize => Op::CudaDeviceSynchronize,
     }
 }
 

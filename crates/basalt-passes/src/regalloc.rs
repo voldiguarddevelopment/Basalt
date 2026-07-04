@@ -169,6 +169,31 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         Op::Atomic(_, ptr, v, _) => vec![*ptr, *v],
         Op::AtomicCas(ptr, cmp, new, _) => vec![*ptr, *cmp, *new],
         Op::Mma { a, b, c, d, .. } => vec![*a, *b, *c, *d],
+        Op::KernelLaunch {
+            grid,
+            block,
+            shared,
+            stream,
+            args,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(8 + args.len());
+            v.extend_from_slice(grid);
+            v.extend_from_slice(block);
+            v.push(*shared);
+            v.push(*stream);
+            v.extend(args.iter().copied());
+            v
+        }
+        Op::CudaMalloc { size } => vec![*size],
+        Op::CudaMemcpy {
+            dst,
+            src,
+            count,
+            kind,
+        } => vec![*dst, *src, *count, *kind],
+        Op::CudaFree { ptr } => vec![*ptr],
+        Op::CudaDeviceSynchronize => Vec::new(),
     }
 }
 

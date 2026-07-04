@@ -450,6 +450,79 @@ fn roundtrip_mma() {
     assert_roundtrip(&module_of(vec![f]));
 }
 
+/// A kernel launch whose target function (`child`) is printed *after* the launching function
+/// (`launcher`) in the module — `Op::KernelLaunch::kernel` is a plain function-name `String`,
+/// not an arena index resolved during parsing, so nothing about parsing this module depends on
+/// which function comes first textually. This is the forward-reference case the BIR-level
+/// grammar must handle (see `Op::KernelLaunch`'s own doc comment in `ir.rs`).
+#[test]
+fn roundtrip_kernel_launch_forward_reference() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let ptr_global = Ty::Ptr(AddrSpace::Global);
+
+    let mut b = FnB::new();
+    let grid_x = b.push(i32t, Op::ConstInt(256));
+    let one = b.push(i32t, Op::ConstInt(1));
+    let block_x = b.push(i32t, Op::ConstInt(128));
+    let shared = b.push(i32t, Op::ConstInt(4096));
+    let stream = b.push(ptr_global, Op::ConstInt(42));
+    let a0 = b.push(i32t, Op::ConstInt(1));
+    let a1 = b.push(i32t, Op::ConstInt(2));
+    b.push_void(Op::KernelLaunch {
+        kernel: "child".to_string(),
+        grid: [grid_x, one, one],
+        block: [block_x, one, one],
+        shared,
+        stream,
+        args: vec![a0, a1],
+    });
+    b.end_block(Term::Ret(None));
+    let mut launcher = b.finish("launcher", vec![], Ty::Void);
+    launcher.is_kernel = false;
+
+    // `child` is a real `__global__` kernel, printed second — after the launch that names it.
+    let mut bk = FnB::new();
+    bk.end_block(Term::Ret(None));
+    let child = bk.finish("child", vec![i32t, i32t], Ty::Void);
+
+    assert_roundtrip(&module_of(vec![launcher, child]));
+}
+
+#[test]
+fn roundtrip_cuda_runtime_calls() {
+    let i64t = Ty::Scalar(Scalar::I64);
+    let ptr_global = Ty::Ptr(AddrSpace::Global);
+    let ptr_local = Ty::Ptr(AddrSpace::Local);
+    let addr_of_dptr = ValRef::Param(0);
+    let host_src = ValRef::Param(1);
+
+    let mut b = FnB::new();
+    let size = b.push(i64t, Op::ConstInt(1024));
+    let dptr = b.push(ptr_global, Op::CudaMalloc { size });
+    b.push_void(Op::Store {
+        ptr: addr_of_dptr,
+        val: dptr,
+        ty: ptr_global,
+        space: AddrSpace::Local,
+        align: 8,
+        volatile: false,
+    });
+    let kind = b.push(i64t, Op::ConstInt(1));
+    b.push_void(Op::CudaMemcpy {
+        dst: dptr,
+        src: host_src,
+        count: size,
+        kind,
+    });
+    b.push_void(Op::CudaFree { ptr: dptr });
+    b.push_void(Op::CudaDeviceSynchronize);
+    b.end_block(Term::Ret(None));
+
+    let mut f = b.finish("host_fn", vec![ptr_local, ptr_local], Ty::Void);
+    f.is_kernel = false;
+    assert_roundtrip(&module_of(vec![f]));
+}
+
 #[test]
 fn roundtrip_vector_types_and_bitcast() {
     let v2i32 = Ty::Vec(Scalar::I32, 2);

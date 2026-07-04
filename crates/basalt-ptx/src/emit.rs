@@ -474,6 +474,27 @@ fn check_no_mma(inst: &Inst) -> Result<(), Diag> {
     Ok(())
 }
 
+/// Kernel-launch and CUDA Runtime API ops (`Op::KernelLaunch`/`Op::CudaMalloc`/
+/// `Op::CudaMemcpy`/`Op::CudaFree`/`Op::CudaDeviceSynchronize`) are sema-only today — see
+/// `Op::KernelLaunch`'s own doc comment in `basalt-bir/src/ir.rs`. A real host-side dispatch
+/// story for this backend is separate, later work; refuse cleanly rather than falling through
+/// to the scalar per-op emitters below, which have no case for any of them.
+fn check_no_host_ops(inst: &Inst) -> Result<(), Diag> {
+    if matches!(
+        &inst.op,
+        Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize
+    ) {
+        return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+            "kernel launch / CUDA Runtime API calls have no lowering in this backend yet",
+        ));
+    }
+    Ok(())
+}
+
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
 /// `emit()`. Run once, on the module as originally handed in — `construct_ssa` never introduces
 /// an op/type shape this pass didn't already see, so re-checking after it would be redundant.
@@ -504,6 +525,7 @@ fn check_module(module: &Module) -> Result<(), Diag> {
             check_atomic_width(inst)?;
             check_no_pred_shuffle(inst)?;
             check_no_mma(inst)?;
+            check_no_host_ops(inst)?;
         }
     }
     Ok(())
@@ -863,6 +885,13 @@ impl<'a> CodeGen<'a> {
             }
             Op::Mma { .. } => {
                 unreachable!("check_module refuses mma before codegen starts")
+            }
+            Op::KernelLaunch { .. }
+            | Op::CudaMalloc { .. }
+            | Op::CudaMemcpy { .. }
+            | Op::CudaFree { .. }
+            | Op::CudaDeviceSynchronize => {
+                unreachable!("check_module refuses kernel launch / CUDA Runtime API ops before codegen starts")
             }
         }
     }
