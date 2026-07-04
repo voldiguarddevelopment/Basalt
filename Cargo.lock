@@ -94,6 +94,7 @@ dependencies = [
  "basalt-mlir",
  "basalt-passes",
  "basalt-ptx",
+ "basalt-rv",
  "basalt-sema",
  "basalt-spirv",
  "basalt-tensix",
@@ -192,6 +193,12 @@ dependencies = [
 [[package]]
 name = "basalt-rv"
 version = "0.0.0"
+dependencies = [
+ "basalt-backend",
+ "basalt-bir",
+ "basalt-diag",
+ "object",
+]
 
 [[package]]
 name = "basalt-sema"

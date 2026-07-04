@@ -25,7 +25,9 @@
 // built, no feature gate), following `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention.
 // `--tensix` runs the real hand-rolled `basalt-tensix` backend (`Tensix`, always built, no
 // feature gate), generating Metalium C++ for Tenstorrent's Tensix; its output is text like
-// `--nvidia-ptx`'s, so it follows that mode's stdout-or-`-o` convention. `--triton` is a
+// `--nvidia-ptx`'s, so it follows that mode's stdout-or-`-o` convention. `--rv-elf` runs the
+// real hand-rolled `basalt-rv` backend (`Rv32`, always built, no feature gate), following
+// `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention instead. `--triton` is a
 // modifier following `--llvm`'s own pattern, but on the *frontend* side rather
 // than the backend side: paired with `--cpu`, `--cpu-regalloc`, or `--nvidia-ptx` it redirects
 // the input from the CUDA-C `run_frontend`/`basalt_sema::check`/`basalt_sema::lower` pipeline
@@ -53,6 +55,7 @@ use basalt_frontend_c::PpOpts;
 #[cfg(feature = "llvm")]
 use basalt_llvm::LlvmAmdgcn;
 use basalt_ptx::Ptx;
+use basalt_rv::Rv32;
 use basalt_spirv::Spirv;
 use basalt_tensix::Tensix;
 use basalt_x86::{X86Oracle, X86Regalloc};
@@ -751,6 +754,57 @@ fn run_tensix(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--rv-elf <file>`: same frontend/sema/lower/optimize pipeline as `--cpu`, handed to the
+/// real hand-rolled `basalt-rv` backend (`Rv32`, always built, no feature gate — RV32IM has no
+/// LLVM-free build concern here, this is a from-scratch encoder just like `--amdgpu-bin`/
+/// `--spirv`). Follows `--amdgpu-bin`'s binary-artifact/`-o`-mandatory convention: an ELF
+/// object is either right or not written at all.
+fn run_rv_elf(
+    input: &Path,
+    output: Option<&Path>,
+    cfg: &Config,
+    table: &LangTable,
+) -> Result<ExitCode, Diag> {
+    let output = output.ok_or_else(|| Diag::new(ECode::CliMissingArgument).with_arg("-o"))?;
+
+    let module = if is_bir_input(input) {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        basalt_bir::parse(&src)
+            .map_err(|e| Diag::new(ECode::BirParseError).with_arg(e.to_string()))?
+    } else {
+        let src = fs::read_to_string(input).map_err(|e| io_diag(input, e))?;
+        let fe = run_frontend(&src, input, cfg);
+        let sema_diags = basalt_sema::check(&fe.tu);
+        let (module, lower_diags) = basalt_sema::lower(&fe.tu);
+
+        for p in &fe.problems {
+            eprintln!("{p}");
+        }
+        for d in sema_diags.iter().chain(lower_diags.iter()) {
+            eprintln!("{}", d.render(table));
+        }
+
+        if fe.has_problems() || !sema_diags.is_empty() || !lower_diags.is_empty() {
+            return Ok(ExitCode::FAILURE);
+        }
+        module
+    };
+    let module = basalt_passes::optimize(&module);
+
+    let backend = Rv32;
+    match backend.supports(&module) {
+        Support::Supported => {}
+        Support::Unsupported(code) => return Err(Diag::new(code).with_arg(backend.name())),
+    }
+
+    let artifact = backend.emit(&module, &EmitOpts::default())?;
+    let bytes = artifact
+        .as_bytes()
+        .expect("Rv32::emit always produces a Payload::Bytes artifact");
+    fs::write(output, bytes).map_err(|e| io_diag(output, e))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Writes `text` to `output` if given, else stdout — the common tail of every mode that
 /// produces a single text artifact.
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
@@ -764,8 +818,9 @@ fn write_output(output: Option<&Path>, text: &str) -> Result<(), Diag> {
 }
 
 /// Dispatches on the selected mode. `--ast`/`--sema`/`--ir`/`--cpu`/`--cpu-regalloc`/
-/// `--nvidia-ptx`/`--amdgpu-bin`/`--spirv` run the real pipeline; every other mode has no implementation
-/// yet (backends land in later phases) — refuse cleanly rather than emit anything. `--triton`
+/// `--nvidia-ptx`/`--amdgpu-bin`/`--spirv`/`--tensix`/`--rv-elf` run the real pipeline; every
+/// other mode has no implementation yet (backends land in later phases) — refuse cleanly
+/// rather than emit anything. `--triton`
 /// (only meaningful with `--cpu`/`--nvidia-ptx`) is handled above this match, before the mode
 /// dispatch even begins.
 fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
@@ -802,6 +857,7 @@ fn run(cfg: &Config, table: &LangTable) -> Result<ExitCode, Diag> {
         Mode::AmdgpuBin => run_amdgpu_bin(input()?, cfg.output.as_deref(), cfg, table),
         Mode::Spirv => run_spirv(input()?, cfg.output.as_deref(), cfg, table),
         Mode::Tensix => run_tensix(input()?, cfg.output.as_deref(), cfg, table),
+        Mode::RvElf => run_rv_elf(input()?, cfg.output.as_deref(), cfg, table),
         other => Err(Diag::new(ECode::UnsupportedFeature).with_arg(other.flag())),
     }
 }
