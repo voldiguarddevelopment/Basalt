@@ -30,6 +30,11 @@
 //     this object's own callable entry point (the `ModuleShape::KernelWithHelpers` shape has no
 //     separate host function), so the C shim calls it directly, the same calling convention as
 //     `vector_add_links_and_runs_via_full_pipeline`'s plain kernel.
+//   - `device_helper_chain_links_and_runs_via_full_pipeline` (P13-T-calls-ii) goes one further:
+//     a genuine `.cu` file (`tests/kernels/device_helper_chain.cu`) where the kernel calls a
+//     `__device__` helper that calls another `__device__` helper that calls a third — a real
+//     three-level device-to-device call chain, confirming each link gets its own correct,
+//     independent stack frame rather than assuming it from the single-hop proof above.
 //
 // All three scalar-calling-convention proofs read the exact calling convention off
 // `oracle.rs`'s own module header and its `INT_ARG_REGS`/`SSE_ARG_REGS` classification, not off
@@ -699,6 +704,86 @@ fn device_helper_call_links_and_runs_via_full_pipeline() {
         "examples/cpu_launch_device_helper_square.c",
         &obj,
         "device_helper_square",
+    );
+
+    let _ = std::fs::remove_file(&obj);
+}
+
+/// The real end-to-end proof (P13-T-calls-ii): a genuine `.cu` file
+/// (`tests/kernels/device_helper_chain.cu`) where a `__global__` kernel calls a `__device__`
+/// helper that itself calls another `__device__` helper that itself calls a third — a real
+/// three-level device-to-device call chain, not just the one kernel-to-helper hop
+/// `device_helper_call_links_and_runs_via_full_pipeline` above already covers. Each link's own
+/// stack frame, argument register, and return-value handoff has to be independently correct for
+/// the final value to come out right, since each of `negate_then_scale`/`scale_then_inc`/`inc`
+/// is lowered as its own real function with its own real prologue/epilogue
+/// (`emit_function_body`'s `is_host = true` shape) sharing one `Enc` — a corrupted or aliased
+/// frame between nested calls would show up here as a wrong-answer failure, not a crash.
+#[test]
+fn device_helper_chain_links_and_runs_via_full_pipeline() {
+    if !cc_available() {
+        eprintln!("skipping device_helper_chain_links_and_runs_via_full_pipeline: `cc` not found");
+        return;
+    }
+
+    let root = workspace_root();
+    let src_path = root.join("tests/kernels/device_helper_chain.cu");
+    let src = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", src_path.display()));
+
+    let opts = PpOpts {
+        include_dirs: vec![],
+        defines: vec![],
+        base_dir: src_path.parent().map(Path::to_path_buf),
+    };
+    let (tokens, pp_errors) = basalt_frontend_c::preprocess(&src, &opts);
+    assert!(
+        pp_errors.is_empty(),
+        "preprocessing device_helper_chain.cu produced problems: {:?}",
+        pp_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    let (tu, parse_errors) = basalt_frontend_c::parse(&tokens);
+    assert!(
+        parse_errors.is_empty(),
+        "parsing device_helper_chain.cu produced problems: {:?}",
+        parse_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    let sema_diags = basalt_sema::check(&tu);
+    assert!(
+        sema_diags.is_empty(),
+        "type-checking device_helper_chain.cu produced diagnostics: {:?}",
+        sema_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let (module, lower_diags) = basalt_sema::lower(&tu);
+    assert!(
+        lower_diags.is_empty(),
+        "lowering device_helper_chain.cu produced diagnostics: {:?}",
+        lower_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    assert_eq!(X86Oracle.supports(&module), Support::Supported);
+    let artifact = X86Oracle
+        .emit(&module, &EmitOpts::default())
+        .expect("oracle emit succeeds for device_helper_chain.cu");
+    let bytes = artifact.as_bytes().expect("oracle emits an object payload");
+
+    let pid = std::process::id();
+    let obj = std::env::temp_dir().join(format!("basalt_device_helper_chain_{pid}.o"));
+    write_object(bytes, &obj);
+
+    compile_link_and_run(
+        &root,
+        "examples/cpu_launch_device_helper_chain.c",
+        &obj,
+        "device_helper_chain",
     );
 
     let _ = std::fs::remove_file(&obj);

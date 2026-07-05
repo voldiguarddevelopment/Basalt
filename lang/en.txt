@@ -9,8 +9,8 @@ E090 = backend does not support this operation
 E091 = backend does not support this type
 E092 = backend does not support this address space
 E093 = backend does not support this hardware feature
-E094 = recursive call not supported: {0}
-E095 = call from one device function to another is not supported: {0}
+E094 = recursive call not supported (direct or indirect call-graph cycle): {0}
+E095 = device helper is unreachable from the kernel through any call chain: {0}
 E099 = rank-2 tile requested on a backend without a matrix path
 
 E100 = unknown flag: {0}

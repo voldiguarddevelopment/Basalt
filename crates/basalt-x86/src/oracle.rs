@@ -148,19 +148,42 @@
 // dynamic parallelism is out of scope, and this backend has no call machinery for a kernel to
 // use one from inside its own per-thread loop.
 //
-// # `Op::Call`: a `__global__` kernel calling `__device__` helpers (P13-T-calls-i)
+// # `Op::Call`: a `__global__` kernel calling `__device__` helpers (P13-T-calls-i/ii)
 //
 // A second, independent multi-function shape alongside "host + kernel-launch" above: exactly
 // one kernel (`is_kernel == true`), plus one or more non-kernel `__device__` helper functions,
-// where every helper is named by at least one of the kernel's own `Op::Call` instructions and
-// nothing else in the module launches a kernel or calls a helper from anywhere but that one
-// kernel (`check_kernel_with_helpers_shape`) — a host function calling a device helper, two
-// kernels sharing helpers, and a helper calling another helper are all out of scope and refuse
-// cleanly (`E093`/`E094`/`E095`), same "refuse rather than guess" discipline as every other
-// shape restriction in this file. Combining this shape with a host-launches-kernels module in
-// the same object is also out of scope (`E093`) — nothing about this first slice needed it, and
-// mixing them raises real questions (does the kernel's own per-thread loop reach a helper the
-// same way a host's `call` does?) this task did not need to answer.
+// where every helper is reachable from the kernel through some chain of `Op::Call`s and nothing
+// else in the module launches a kernel (`check_kernel_with_helpers_shape`) — a host function
+// calling a device helper and two kernels sharing helpers are both out of scope and refuse
+// cleanly (`E093`), same "refuse rather than guess" discipline as every other shape restriction
+// in this file. Combining this shape with a host-launches-kernels module in the same object is
+// also out of scope (`E093`) — nothing about this task needed it, and mixing them raises real
+// questions (does the kernel's own per-thread loop reach a helper the same way a host's `call`
+// does?) this task did not need to answer.
+//
+// P13-T-calls-i's first slice only let the kernel itself call helpers, one level deep, so a
+// trivial "does the kernel's own `Op::Call` list cover every helper" check was enough.
+// P13-T-calls-ii generalizes this to a real call graph: a helper may call another same-module
+// helper, at any depth (helper calls helper calls helper, ...), so `check_kernel_with_helpers_
+// shape` now builds the actual caller -> callees edge list for the whole module (kernel plus
+// every helper) and validates two real graph properties, in this order (a cycle takes priority
+// over an unreachable-helper diagnosis, since a cyclic subgraph disconnected from the kernel is
+// still a cycle first and foremost):
+//   1. **Acyclic** (`E094`): no function, kernel or helper, may reach itself again through any
+//      chain of calls — direct self-recursion is the depth-1 case of this, not a separate check.
+//      Detected with a standard three-color (white/gray/black) DFS over the whole graph, walking
+//      every function once so a cycle among two helpers neither the kernel nor anything it calls
+//      ever reaches is still caught, not just cycles the kernel happens to walk into.
+//   2. **Reachable** (`E095`): every declared helper must be reachable from the one kernel
+//      through *some* chain of calls (not necessarily called by the kernel directly anymore) —
+//      a helper nothing ever calls, or one only called by another helper that is itself
+//      unreachable, is dead code in the call graph and refused the same way "kernel present but
+//      never launched" already is in the host-launches-kernels shape.
+// A call naming the kernel itself (from the kernel or from any helper) is always `E093`
+// regardless of depth — kernels are launched via `kernel.launch`, never called — checked before
+// either graph property above, so a kernel's own direct self-call is still `E094` (it is
+// self-recursion first) while a helper calling back into the kernel is `E093` (P13-T-calls-i's
+// original restriction, unchanged).
 //
 // A device helper's own codegen shape is `emit_function_body`'s existing `is_host = true` path
 // (plain, single-execution, real epilogue, real non-void return in `rax`/`xmm0`) — exactly what
@@ -169,7 +192,11 @@
 // `Op::KernelLaunch`/the CUDA Runtime API ops are legal): a helper gets the *host's codegen
 // shape* but *never* that legality — dynamic parallelism from inside a helper is exactly as out
 // of scope as from inside a kernel, so `check_function` is always called with `is_host = false`
-// for a helper, independent of which shape `emit_function_body` gives it.
+// for a helper, independent of which shape `emit_function_body` gives it. Each function (kernel
+// or helper) is lowered with its own real `callees` list — the functions *that specific
+// function's own body* calls directly, from the same edge list `check_kernel_with_helpers_shape`
+// already validated (`call_graph_edges`) — never one shared list, since a helper two calls deep
+// may have entirely different callees than the kernel or its immediate callee do.
 //
 // `Op::Call` itself lowers exactly like `Op::KernelLaunch` minus the flattened-`nthreads`
 // bookkeeping: each argument reloads into the callee's own SysV-classified registers (the
@@ -178,15 +205,22 @@
 // relocation needed, exactly like a kernel launch, since both functions already live in the
 // same emitted blob. The return value (if any) is read back out of `rax`/`xmm0` straight into
 // the call instruction's own result slot, the same `store_result`/`store_result_xmm` every
-// other value-producing op already uses.
+// other value-producing op already uses. This lowering needed no changes at all for chained
+// calls: since every function, kernel or helper, already gets its own real prologue/epilogue and
+// its own stack frame (`Frame::build` sizes and homes every function independently), a helper
+// calling another helper two or three deep just means more of the same real `call`/`ret` pairs
+// nested at runtime — verified directly with a real 3-level device-to-device call chain in
+// `crates/basalt-x86/tests/link_and_run.rs`, not merely assumed correct.
 //
-// Two restrictions enforced here, not in `basalt-sema`: direct self-recursion (`E094`) and a
-// helper calling another helper (`E095`, "device-to-device"). Both are scope limits of *this
-// backend's* call-graph handling specifically — BIR's own `Op::Call` has no such restriction,
-// and `basalt-rv`'s existing `jal`/`ret` machinery may accept a broader shape once it grows a
-// real `Op::Call` lowering of its own (see `PLAN.md`'s P13-T-calls-ii+) — so they belong at the
-// oracle-shape-validation layer, the same layer `Op::KernelLaunch`'s own "non-default
-// shared/stream" restriction already lives at, not baked into BIR or the generic lowering pass.
+// Both restrictions above are scope limits of *this backend's* call-graph handling specifically
+// — BIR's own `Op::Call` has no such restriction, and `basalt-rv`'s existing `jal`/`ret`
+// machinery may accept a broader shape once it grows a real `Op::Call` lowering of its own (see
+// `PLAN.md`'s P13-T-calls-iii+) — so they belong at the oracle-shape-validation layer, the same
+// layer `Op::KernelLaunch`'s own "non-default shared/stream" restriction already lives at, not
+// baked into BIR or the generic lowering pass. A real recursion story (self-referential call
+// graphs, tail calls, a real growable stack) remains out of scope entirely, not just refused —
+// this backend's stack-everything model has no way to bound frame reuse across a genuine
+// recursive call, so an acyclic call graph is a hard requirement, not merely today's limit.
 // Struct/array-by-value arguments or a struct/array return are not a backend-level restriction
 // at all: BIR's own `Ty` has no aggregate value type, so `basalt-sema`'s lowering pass already
 // never produces an `Op::Call` with one — nothing for this backend to separately check.
@@ -212,7 +246,7 @@
 // widened first (`movsx` for integers, `cvtss2sd` for the one legal float widening, `f32` ->
 // `f64`) so the running sum is never computed at less precision than the type BIR asked for.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use basalt_backend::{
     write_elf_object, Architecture, Artifact, ArtifactKind, Backend, ElfObjectSpec, ElfRelocation,
@@ -369,10 +403,122 @@ fn check_module(module: &Module) -> Result<ModuleShape<'_>, Diag> {
     Ok(ModuleShape::HostAndKernels { host, kernels })
 }
 
-/// The `ModuleShape::KernelWithHelpers` path: exactly one `__global__` kernel calling one or
-/// more same-module `__device__` helper functions via `Op::Call`, and nothing else — see the
-/// module header's own `# Op::Call` section for the full rationale. Only reached once
-/// `check_module` has already established the module contains at least one `Op::Call`.
+/// The direct `Op::Call` edges within a `KernelWithHelpers` module: `f.name -> the functions
+/// f's own body calls directly`, in call-instruction order, deduplicated by name. One shared
+/// builder for `check_kernel_with_helpers_shape` (call-graph validation) and
+/// `emit_kernel_with_helpers` (each function's own real `callees` list at codegen time) so the
+/// two can never disagree about what a given function actually calls. Every `Op::Call` here is
+/// assumed already validated to name a real, non-kernel, same-module function — true for every
+/// caller of this function, since `check_kernel_with_helpers_shape` itself validates that before
+/// ever building the graph, and `emit_kernel_with_helpers` only ever runs after `check_module`
+/// has already succeeded.
+fn call_graph_edges<'a>(
+    kernel: &'a Function,
+    helpers: &[&'a Function],
+) -> HashMap<&'a str, Vec<&'a Function>> {
+    let mut all: Vec<&'a Function> = vec![kernel];
+    all.extend(helpers.iter().copied());
+    let by_name: HashMap<&str, &Function> = all.iter().map(|f| (f.name.as_str(), *f)).collect();
+
+    let mut edges: HashMap<&str, Vec<&Function>> = HashMap::new();
+    for f in &all {
+        let mut callees: Vec<&Function> = Vec::new();
+        for inst in &f.insts {
+            if let Op::Call { func, .. } = &inst.op {
+                if let Some(&target) = by_name.get(func.as_str()) {
+                    if !callees.iter().any(|c| c.name == target.name) {
+                        callees.push(target);
+                    }
+                }
+            }
+        }
+        edges.insert(f.name.as_str(), callees);
+    }
+    edges
+}
+
+/// A standard three-color (white/gray/black) DFS cycle check over `edges`, walking `order` (so
+/// the diagnostic is deterministic — `module.funcs` order, not hash-iteration order) to make
+/// sure every node is visited even if it is not reachable from the first one. Returns the first
+/// cycle found as the closed chain of names that forms it (`["a", "b", "a"]` for `a -> b -> a`).
+fn find_call_cycle<'a>(
+    order: &[&'a str],
+    edges: &HashMap<&'a str, Vec<&'a str>>,
+) -> Option<Vec<&'a str>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        White,
+        Gray,
+        Black,
+    }
+
+    fn visit<'a>(
+        node: &'a str,
+        edges: &HashMap<&'a str, Vec<&'a str>>,
+        state: &mut HashMap<&'a str, State>,
+        stack: &mut Vec<&'a str>,
+    ) -> Option<Vec<&'a str>> {
+        state.insert(node, State::Gray);
+        stack.push(node);
+        for &next in edges.get(node).into_iter().flatten() {
+            match state.get(next).copied().unwrap_or(State::White) {
+                State::White => {
+                    if let Some(cycle) = visit(next, edges, state, stack) {
+                        return Some(cycle);
+                    }
+                }
+                State::Gray => {
+                    let start = stack
+                        .iter()
+                        .position(|&n| n == next)
+                        .expect("gray node is always on the stack");
+                    let mut cycle: Vec<&str> = stack[start..].to_vec();
+                    cycle.push(next);
+                    return Some(cycle);
+                }
+                State::Black => {}
+            }
+        }
+        stack.pop();
+        state.insert(node, State::Black);
+        None
+    }
+
+    let mut state: HashMap<&str, State> = order.iter().map(|&n| (n, State::White)).collect();
+    let mut stack: Vec<&str> = Vec::new();
+    for &n in order {
+        if state[n] == State::White {
+            if let Some(cycle) = visit(n, edges, &mut state, &mut stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
+/// Every node reachable from `root` by following `edges` forward, `root` included — a plain
+/// DFS, used to confirm every declared helper is actually reachable from the one kernel through
+/// some chain of calls (not necessarily called by the kernel directly).
+fn reachable_from<'a>(root: &'a str, edges: &HashMap<&'a str, Vec<&'a str>>) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if seen.insert(n) {
+            for &next in edges.get(n).into_iter().flatten() {
+                if !seen.contains(next) {
+                    stack.push(next);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// The `ModuleShape::KernelWithHelpers` path: exactly one `__global__` kernel, plus one or more
+/// same-module `__device__` helper functions each reachable from it through some chain of
+/// `Op::Call`s, and nothing else — see the module header's own `# Op::Call` section for the
+/// full rationale. Only reached once `check_module` has already established the module contains
+/// at least one `Op::Call`.
 fn check_kernel_with_helpers_shape(module: &Module) -> Result<ModuleShape<'_>, Diag> {
     if module.funcs.iter().any(|f| {
         f.insts
@@ -394,50 +540,61 @@ fn check_kernel_with_helpers_shape(module: &Module) -> Result<ModuleShape<'_>, D
     };
     let kernel = *kernel;
 
+    // Validate every `Op::Call` in the module — the kernel's own, and every helper's own — one
+    // caller at a time, independent of the whole-graph properties (acyclic, reachable) checked
+    // next. A literal self-call (`func == f.name`) is direct recursion (`E094`) even before the
+    // general cycle check ever runs, so a kernel calling itself is diagnosed as recursion, not
+    // as "names a kernel", below.
+    let mut all: Vec<&Function> = vec![kernel];
+    all.extend(helpers.iter().copied());
+    for f in &all {
+        for inst in &f.insts {
+            if let Op::Call { func, .. } = &inst.op {
+                if func == &f.name {
+                    return Err(Diag::new(ECode::RecursiveCallUnsupported)
+                        .with_arg(format!("'{func}' calls itself directly")));
+                }
+                if kernels.iter().any(|k| &k.name == func) {
+                    return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                        "call target names a __global__ kernel; kernels are launched via \
+                         kernel.launch, not called",
+                    ));
+                }
+                if !helpers.iter().any(|h| &h.name == func) {
+                    return Err(Diag::new(ECode::UnsupportedFeature)
+                        .with_arg("call target names a function not present in this module"));
+                }
+            }
+        }
+    }
+
+    let edges = call_graph_edges(kernel, &helpers);
+    let order: Vec<&str> = all.iter().map(|f| f.name.as_str()).collect();
+    let name_edges: HashMap<&str, Vec<&str>> = edges
+        .iter()
+        .map(|(&name, callees)| (name, callees.iter().map(|c| c.name.as_str()).collect()))
+        .collect();
+
+    if let Some(cycle) = find_call_cycle(&order, &name_edges) {
+        return Err(Diag::new(ECode::RecursiveCallUnsupported)
+            .with_arg(format!("call cycle: {}", cycle.join(" -> "))));
+    }
+
+    let reachable = reachable_from(kernel.name.as_str(), &name_edges);
     for h in &helpers {
-        if h.insts.iter().any(|i| matches!(i.op, Op::Call { .. })) {
+        if !reachable.contains(h.name.as_str()) {
             return Err(
                 Diag::new(ECode::NestedDeviceCallUnsupported).with_arg(format!(
-                    "'{}' calls another function; only a __global__ kernel calling a __device__ \
-                 helper is supported in this backend's first slice, not device-to-device calls",
-                    h.name
+                    "'{}' is never reachable from kernel '{}' through any chain of calls",
+                    h.name, kernel.name
                 )),
             );
         }
     }
 
-    let mut called: Vec<&str> = Vec::new();
-    for inst in &kernel.insts {
-        if let Op::Call { func, .. } = &inst.op {
-            called.push(func.as_str());
-        }
-    }
-    for name in &called {
-        if *name == kernel.name {
-            return Err(Diag::new(ECode::RecursiveCallUnsupported)
-                .with_arg(format!("'{}' calls itself directly", kernel.name)));
-        }
-        if kernels.iter().any(|k| k.name == *name) {
-            return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
-                "call target names a __global__ kernel; kernels are launched via kernel.launch, \
-                 not called",
-            ));
-        }
-        if !helpers.iter().any(|h| h.name == *name) {
-            return Err(Diag::new(ECode::UnsupportedFeature)
-                .with_arg("call target names a function not present in this module"));
-        }
-    }
+    check_function(kernel, false, &edges[kernel.name.as_str()])?;
     for h in &helpers {
-        if !called.contains(&h.name.as_str()) {
-            return Err(Diag::new(ECode::UnsupportedFeature)
-                .with_arg("device helper function present but never called by the kernel"));
-        }
-    }
-
-    check_function(kernel, false, &helpers)?;
-    for h in &helpers {
-        check_function(h, false, &[])?;
+        check_function(h, false, &edges[h.name.as_str()])?;
     }
 
     Ok(ModuleShape::KernelWithHelpers { kernel, helpers })
@@ -457,9 +614,10 @@ fn launch_operand_is_default(f: &Function, v: ValRef) -> bool {
 /// The per-function checks shared by every function this backend ever lowers: a kernel, a
 /// host function, or a `__device__` helper. `is_host` and `callees` (the functions visible to
 /// this one's own `Op::KernelLaunch`/`Op::Call` instructions — the kernels a host function may
-/// launch, or the helpers a kernel may call; always empty for a kernel with no helpers or a
-/// leaf helper) select the one place function bodies are actually allowed to differ: which of
-/// the five kernel-launch/CUDA-Runtime-API ops are real here versus still refused, and which
+/// launch, or *this specific function's own* direct call targets, kernel or helper alike;
+/// empty for a leaf helper that calls nothing) select the one place function bodies are
+/// actually allowed to differ: which of the five kernel-launch/CUDA-Runtime-API ops are real
+/// here versus still refused, and which
 /// names an `Op::Call` may resolve against.
 fn check_function(f: &Function, is_host: bool, callees: &[&Function]) -> Result<(), Diag> {
     if matches!(f.ret, Ty::Vec(..)) {
@@ -556,16 +714,13 @@ fn check_function(f: &Function, is_host: bool, callees: &[&Function]) -> Result<
                 ));
             }
             Op::Call { func, args } => {
-                if func == &f.name {
-                    return Err(Diag::new(ECode::RecursiveCallUnsupported)
-                        .with_arg(format!("'{func}' calls itself directly")));
-                }
-                // Not found among `callees` covers two distinct shapes: a genuinely undefined
-                // callee (`E093`, same code/wording `Op::KernelLaunch`'s own "not present"
-                // case already uses), and a call from a function this backend never gives any
-                // legal callees at all (a lone kernel, or a device helper — the real
-                // device-to-device detection lives in `check_kernel_with_helpers_shape`, which
-                // already refuses that shape with `E095` before this ever runs on a helper).
+                // `check_kernel_with_helpers_shape` has already validated, for every function's
+                // own calls (kernel or helper), that the target exists, is not a kernel, and
+                // that the whole call graph is acyclic and reachable from the kernel, before
+                // ever calling `check_function` — so `target` below is always found and never a
+                // kernel in practice. The lookup and both branches stay real (not `.expect()`)
+                // as a genuine second check, the same defense-in-depth every other value in
+                // `callees` already gets here, rather than trusting the caller silently.
                 let target = callees.iter().find(|c| &c.name == func).ok_or_else(|| {
                     Diag::new(ECode::UnsupportedFeature)
                         .with_arg("call target names a function not present in this module")
@@ -1052,27 +1207,31 @@ fn emit_host_and_kernels(
 }
 
 /// The `ModuleShape::KernelWithHelpers` path: the kernel followed by every `__device__` helper
-/// it calls, all lowered into one shared `Enc` so the kernel's own `call`s can reach them (see
-/// the module header's `# Op::Call` section). Each helper is lowered with `is_host = true`
-/// (the plain, single-execution, real-return-value shape) but `check_function`'s own,
-/// independent `is_host = false` (no CUDA Runtime API legality) — see `emit_function_body`'s
-/// own doc comment on why these are two different axes.
+/// reachable from it, all lowered into one shared `Enc` so any function's own `call`s can reach
+/// any other (see the module header's `# Op::Call` section). Each helper is lowered with
+/// `is_host = true` (the plain, single-execution, real-return-value shape) but `check_function`'s
+/// own, independent `is_host = false` (no CUDA Runtime API legality) — see
+/// `emit_function_body`'s own doc comment on why these are two different axes. Every function
+/// gets its own real `callees` list here — `call_graph_edges` re-derived from the same edges
+/// `check_kernel_with_helpers_shape` already validated, not one shared list reused everywhere —
+/// so a helper's own `Op::Call` resolves against the functions *it* actually calls, however deep
+/// in the chain it sits.
 fn emit_kernel_with_helpers(
     kernel: &Function,
     helpers: &[&Function],
 ) -> Result<HostAndKernelsText, Diag> {
-    let call_targets: Vec<KernelSig> = helpers
-        .iter()
-        .map(|h| KernelSig {
-            name: h.name.clone(),
-            params: h.params.clone(),
-        })
-        .collect();
+    let edges = call_graph_edges(kernel, helpers);
+    let sig_of = |f: &Function| KernelSig {
+        name: f.name.clone(),
+        params: f.params.clone(),
+    };
+    let callees_of =
+        |name: &str| -> Vec<KernelSig> { edges[name].iter().map(|&c| sig_of(c)).collect() };
 
     let mut enc = Enc::new();
-    emit_function_body(kernel, false, call_targets, &mut enc)?;
+    emit_function_body(kernel, false, callees_of(kernel.name.as_str()), &mut enc)?;
     for h in helpers {
-        emit_function_body(h, true, Vec::new(), &mut enc)?;
+        emit_function_body(h, true, callees_of(h.name.as_str()), &mut enc)?;
     }
 
     let mut names: Vec<&str> = vec![kernel.name.as_str()];
@@ -3190,7 +3349,7 @@ mod tests {
         assert_eq!(err.code, ECode::UnsupportedType);
     }
 
-    // ---- kernel calling a __device__ helper (P13-T-calls-i) ------------------------------
+    // ---- kernel calling a __device__ helper (P13-T-calls-i/ii) ---------------------------
 
     /// `func @square(i32) -> i32 { bb0: %0 = mul i32 %arg0, %arg0; ret %0 }`, a `__device__`
     /// helper (`is_kernel == false`).
@@ -3245,6 +3404,49 @@ mod tests {
         }
     }
 
+    /// A `__device__` helper `func @name(i32) -> i32 { bb0: %0 = call i32 @target [%arg0]; ret
+    /// %0 }` — a single relay hop, used below to build multi-level chains and cycles among
+    /// helpers without a fresh fixture per shape.
+    fn func_helper_calls(name: &str, target: &str) -> Function {
+        Function {
+            is_kernel: false,
+            name: name.into(),
+            params: vec![Ty::Scalar(Scalar::I32)],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::Call {
+                    func: target.into(),
+                    args: vec![ValRef::Param(0)],
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+            }],
+        }
+    }
+
+    /// `func_kernel_calls_square` with its own `Op::Call` retargeted at `target` instead of
+    /// `square` — used to route the kernel into a helper chain/cycle fixture built from
+    /// `func_helper_calls`.
+    fn func_kernel_calls(target: &str) -> Function {
+        let mut kernel = func_kernel_calls_square();
+        kernel.insts[0].op = Op::Call {
+            func: target.into(),
+            args: vec![ValRef::Param(0)],
+        };
+        kernel
+    }
+
+    /// `func_square_helper` under a different name — a leaf `__device__` helper with no
+    /// `Op::Call` of its own, used as the innermost link of a chain/cycle fixture.
+    fn func_square_helper_named(name: &str) -> Function {
+        let mut h = func_square_helper();
+        h.name = name.into();
+        h
+    }
+
     #[test]
     fn supports_and_emits_kernel_calling_a_device_helper() {
         let module =
@@ -3275,7 +3477,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_helper_present_but_never_called_with_e093() {
+    fn refuses_helper_unreachable_from_kernel_with_e095() {
         let mut extra = func_square_helper();
         extra.name = "unused_helper".into();
         let module = kernel_with_helpers_module(
@@ -3284,7 +3486,27 @@ mod tests {
         );
         assert_eq!(
             X86Oracle.supports(&module),
-            Support::Unsupported(ECode::UnsupportedFeature)
+            Support::Unsupported(ECode::NestedDeviceCallUnsupported)
+        );
+    }
+
+    #[test]
+    fn refuses_helper_only_reachable_through_another_unreachable_helper_with_e095() {
+        // `square` is called by the kernel and reachable; `dead` calls `also_dead` but neither
+        // is ever reached from the kernel — unreachable even though `dead` itself has an
+        // outgoing call, confirming this is a real reachability check, not just "never called
+        // by name anywhere".
+        let module = kernel_with_helpers_module(
+            func_kernel_calls_square(),
+            vec![
+                func_square_helper(),
+                func_helper_calls("dead", "also_dead"),
+                func_square_helper_named("also_dead"),
+            ],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::NestedDeviceCallUnsupported)
         );
     }
 
@@ -3327,7 +3549,10 @@ mod tests {
     }
 
     #[test]
-    fn refuses_device_to_device_call_with_e095() {
+    fn supports_and_emits_device_helper_calling_another_device_helper() {
+        // kernel -> square -> inner: a real 2-level device-to-device chain, legal since
+        // P13-T-calls-ii — `square` no longer needs to be a leaf, only reachable from the
+        // kernel, directly or transitively.
         let mut inner_helper = func_square_helper();
         inner_helper.name = "inner".into();
         let mut outer_helper = func_square_helper();
@@ -3340,9 +3565,79 @@ mod tests {
             func_kernel_calls_square(),
             vec![outer_helper, inner_helper],
         );
+        assert_eq!(X86Oracle.supports(&module), Support::Supported);
+
+        let artifact = X86Oracle
+            .emit(&module, &EmitOpts::default())
+            .expect("emit succeeds for a helper calling another helper");
+        let bytes = artifact.as_bytes().unwrap();
+        let file = object::read::File::parse(bytes).expect("parses as an object file");
+        for name in ["uses_square", "square", "inner"] {
+            let sym = file
+                .symbols()
+                .find(|s| s.name() == Ok(name))
+                .unwrap_or_else(|| panic!("symbol `{name}` present"));
+            assert!(sym.size() > 0, "symbol `{name}` has a non-empty body");
+        }
+    }
+
+    #[test]
+    fn refuses_direct_self_call_from_a_helper_with_e094() {
+        // A helper calling itself is exactly as much a cycle (length 1) as a kernel doing so.
+        let module = kernel_with_helpers_module(
+            func_kernel_calls("square"),
+            vec![func_helper_calls("square", "square")],
+        );
         assert_eq!(
             X86Oracle.supports(&module),
-            Support::Unsupported(ECode::NestedDeviceCallUnsupported)
+            Support::Unsupported(ECode::RecursiveCallUnsupported)
+        );
+    }
+
+    #[test]
+    fn refuses_indirect_two_cycle_with_e094() {
+        // a -> b -> a: no direct self-call anywhere, only reachable via the whole-graph check.
+        let module = kernel_with_helpers_module(
+            func_kernel_calls("a"),
+            vec![func_helper_calls("a", "b"), func_helper_calls("b", "a")],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::RecursiveCallUnsupported)
+        );
+    }
+
+    #[test]
+    fn refuses_indirect_three_cycle_with_e094() {
+        // a -> b -> c -> a.
+        let module = kernel_with_helpers_module(
+            func_kernel_calls("a"),
+            vec![
+                func_helper_calls("a", "b"),
+                func_helper_calls("b", "c"),
+                func_helper_calls("c", "a"),
+            ],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::RecursiveCallUnsupported)
+        );
+    }
+
+    #[test]
+    fn refuses_helper_calling_the_kernel_back_with_e093() {
+        // square -> uses_square (the kernel): still refused, still E093, whether the caller is
+        // the kernel itself or, as here, a helper two hops removed from it.
+        let mut square_calls_kernel = func_square_helper();
+        square_calls_kernel.insts[0].op = Op::Call {
+            func: "uses_square".into(),
+            args: vec![ValRef::Param(0)],
+        };
+        let module =
+            kernel_with_helpers_module(func_kernel_calls_square(), vec![square_calls_kernel]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
         );
     }
 

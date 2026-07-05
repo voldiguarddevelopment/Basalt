@@ -31,14 +31,16 @@ pub enum ECode {
     /// Reserved for a rank-2 tile requested on a GPU backend without the matrix
     /// (`mma`) path.
     MatrixPathUnsupported,
-    /// A backend's own call-graph handling refuses direct recursion: an `Op::Call` naming the
-    /// very function it appears in. A backend-level scope limit (BIR's own `Op::Call` carries
-    /// no such restriction), not a sema-level one — see `basalt-x86::oracle`'s module header.
+    /// A backend's own call-graph handling refuses any cycle among a kernel and its
+    /// `__device__` helpers — direct self-recursion (an `Op::Call` naming the very function it
+    /// appears in), or an indirect cycle through any number of intermediate calls (`a` calls
+    /// `b` calls `a`, or longer). A backend-level scope limit (BIR's own `Op::Call` carries no
+    /// such restriction), not a sema-level one — see `basalt-x86::oracle`'s module header.
     RecursiveCallUnsupported,
-    /// A backend's own call-graph handling refuses a call from one non-kernel (`__device__`)
-    /// function into another: only a `__global__` kernel calling a same-module `__device__`
-    /// helper is supported in this backend's first slice. A backend-level scope limit, not a
-    /// sema-level one — see `basalt-x86::oracle`'s module header.
+    /// A backend's own call-graph handling refuses a `__device__` helper that is never
+    /// reachable, directly or transitively, from the module's one `__global__` kernel through
+    /// any chain of `Op::Call`s — dead code in the call graph. A backend-level scope limit, not
+    /// a sema-level one — see `basalt-x86::oracle`'s module header.
     NestedDeviceCallUnsupported,
 
     /// CLI flag not recognized.
