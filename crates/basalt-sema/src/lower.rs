@@ -80,11 +80,16 @@
 //
 // # Other discovered BIR gaps
 //
-// - No call instruction at all: every `Expr::Call` reports `E304` and yields a placeholder
-//   (arguments — and the callee, if not a plain named function — are still lowered for their
-//   side effects first, matching real evaluation order as far as it goes). A narrower
-//   same-translation-unit-only call was considered and rejected: without a real `call` op there
-//   is nothing sound to lower it to.
+// - A call to a plain, resolvable same-module function lowers to a real `Op::Call`
+//   (P13-T-calls-i) instead of the `E304` this pass used to raise unconditionally. A whole
+//   struct/union/array argument or return value still has nothing to lower to (no aggregate
+//   BIR value, same as everywhere else in this pass) and still reports `E304`. Everything else
+//   about which *call graph shapes* an actual backend accepts — recursion, `__device__`-to-
+//   `__device__` calls, cross-translation-unit calls — is deliberately not this pass's problem:
+//   BIR's own `Op::Call` carries no such restriction, so this pass emits it generically for any
+//   resolved same-module callee and leaves shape validation to whichever backend claims to
+//   lower it (see `basalt-x86::oracle`'s module header for the first one that does, and its own
+//   documented scope for this first slice).
 // - `BinOp::Div`/`BinOp::Rem` do not distinguish signed from unsigned (unlike `icmp`, which has
 //   separate signed/unsigned predicates, and `ashr`/`lshr`). A backend lowering a bare `div` has
 //   no way to recover the operand's signedness from BIR alone; this pass always emits the one
@@ -432,6 +437,10 @@ fn remap_op(op: BOp, remap: &[u32]) -> BOp {
         BOp::VoteAll(a) => BOp::VoteAll(rv(a)),
         BOp::Atomic(a, ptr, v, space) => BOp::Atomic(a, rv(ptr), rv(v), space),
         BOp::AtomicCas(ptr, cmp, new, space) => BOp::AtomicCas(rv(ptr), rv(cmp), rv(new), space),
+        BOp::Call { func, args } => BOp::Call {
+            func,
+            args: args.into_iter().map(rv).collect(),
+        },
         other => other,
     }
 }
@@ -2454,14 +2463,18 @@ impl Lowerer {
         (phi, result_ty)
     }
 
-    /// BIR has no call instruction (see the module header). The callee (if not a plain named
-    /// function) and every argument are still lowered for their side effects, matching real
-    /// evaluation order as far as it goes, then a diagnostic plus a zeroed placeholder of the
-    /// statically-known return type (if resolvable) stand in for the call itself.
+    /// GPU intrinsic calls (`__syncthreads`, shuffle/vote/atomic builtins, the CUDA Runtime
+    /// API) each have a dedicated BIR op, so they are special-cased by callee name below rather
+    /// than falling through to the generic path.
     ///
-    /// GPU intrinsic calls (`__syncthreads`, shuffle/vote/atomic builtins) are the exception:
-    /// each has a dedicated BIR op, so they are special-cased by callee name here rather than
-    /// falling through to the generic no-call-instruction gap below.
+    /// The generic path (see the module header) resolves a plain named callee against
+    /// `ValueSym::Func` and, so long as neither its return type nor any argument's type is a
+    /// whole struct/union/array (BIR has no aggregate value type — the same `E304` every other
+    /// whole-aggregate-value use in this pass already reports), emits a real `Op::Call`. An
+    /// unresolvable callee (not a plain identifier, or not a known function — the checker
+    /// already reported the latter) still lowers every argument for its own side effects,
+    /// matching real evaluation order as far as it goes, and stands in a zeroed placeholder of
+    /// the statically-known return type in place of the call itself.
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], span: FSpan) -> (ValRef, Ty) {
         if let Expr::Ident { name, .. } = callee {
             let name = name.as_str();
@@ -2493,23 +2506,57 @@ impl Lowerer {
                 return self.lower_cuda_device_synchronize_call(args);
             }
         }
-        let ret_ty = if let Expr::Ident { name, .. } = callee {
+        let resolved = if let Expr::Ident { name, .. } = callee {
             match self.scopes.lookup_value(name).cloned() {
-                Some(ValueSym::Func(sig)) => sig.ret,
-                _ => Ty::Unknown,
+                Some(ValueSym::Func(sig)) => Some((name.clone(), sig.ret)),
+                _ => None,
             }
         } else {
             self.lower_expr(callee);
-            Ty::Unknown
+            None
         };
-        for a in args {
-            self.lower_expr(a);
+
+        let arg_vals = self.lower_call_args(args);
+
+        let Some((name, ret_ty)) = resolved else {
+            return self.placeholder();
+        };
+
+        if is_aggregate(&ret_ty) || arg_vals.iter().any(|(_, t)| is_aggregate(t)) {
+            self.diag_unsupported(
+                span,
+                "function call",
+                "a whole struct/union/array argument or return value has no BIR value to lower to",
+            );
+            return if ret_ty.is_unknown() || is_aggregate(&ret_ty) {
+                self.placeholder()
+            } else {
+                let v = self.zero_of(&ret_ty);
+                (v, ret_ty)
+            };
         }
-        self.diag_unsupported(span, "function call", "BIR has no call instruction");
-        if ret_ty.is_unknown() || is_aggregate(&ret_ty) {
-            self.placeholder()
+        if ret_ty.is_unknown() {
+            // Only reachable for a callee the checker already flagged (undefined symbol, or a
+            // non-function value called); nothing sound to lower to.
+            return self.placeholder();
+        }
+
+        let bargs: Vec<ValRef> = arg_vals.into_iter().map(|(v, _)| v).collect();
+        if matches!(ret_ty, Ty::Scalar(ScalarKind::Void)) {
+            self.push_void(BOp::Call {
+                func: name,
+                args: bargs,
+            });
+            (self.zero_of(&ret_ty), ret_ty)
         } else {
-            let v = self.zero_of(&ret_ty);
+            let bty = to_bir_ty(&ret_ty);
+            let v = self.push(
+                bty,
+                BOp::Call {
+                    func: name,
+                    args: bargs,
+                },
+            );
             (v, ret_ty)
         }
     }
@@ -3015,7 +3062,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_call_reports_diag_without_panicking() {
+    fn plain_function_call_lowers_to_a_real_call_op() {
+        // P13-T-calls-i: a same-module call to a resolvable named function now lowers to a
+        // real `Op::Call` instead of unconditionally reporting `E304` — which *call graph
+        // shapes* an actual backend accepts (this one is two plain functions, neither
+        // `__global__` nor `__device__`) is validated at the backend layer, not here (see the
+        // module header's own note on this).
         let tu = checked(
             r#"
             int g(int x) {
@@ -3023,6 +3075,50 @@ mod tests {
             }
             int f() {
                 return g(1);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = basalt_bir::print(&m);
+        assert!(text.contains("call i32 @g ["), "{text}");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn call_with_aggregate_argument_reports_diag() {
+        let tu = checked(
+            r#"
+            struct Point { int x; int y; };
+            int consume(struct Point p) {
+                return p.x;
+            }
+            void f(struct Point p) {
+                consume(p);
+            }
+            "#,
+        );
+        let (m, diags) = lower(&tu);
+        assert!(
+            codes(&diags).contains(&ECode::LoweringUnsupported),
+            "{diags:?}"
+        );
+        assert_eq!(m.funcs.len(), 2);
+    }
+
+    #[test]
+    fn call_with_aggregate_return_reports_diag() {
+        let tu = checked(
+            r#"
+            struct Point { int x; int y; };
+            struct Point make(void) {
+                struct Point p;
+                p.x = 1;
+                p.y = 2;
+                return p;
+            }
+            void f(void) {
+                make();
             }
             "#,
         );

@@ -168,6 +168,11 @@ fn classify_rule(op: &Op) -> Rule {
         | Op::CudaMemcpy { .. }
         | Op::CudaFree { .. }
         | Op::CudaDeviceSynchronize => Rule::Fixed(Divergence::Uniform),
+        // No interprocedural analysis exists here: a called `__device__` helper may read a
+        // Divergent source (`tid.x`, ...) internally regardless of whether its own arguments
+        // are Uniform, so `FromOperands` would be unsound. `Divergent` is the safe
+        // over-approximation, same reasoning as the cross-lane ops above.
+        Op::Call { .. } => Rule::Fixed(Divergence::Divergent),
     }
 }
 

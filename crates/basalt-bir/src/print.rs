@@ -247,6 +247,16 @@ fn print_op(out: &mut String, inst: &Inst) {
             let _ = write!(out, "cuda.free {}", val(*ptr));
         }
         Op::CudaDeviceSynchronize => out.push_str("cuda.device_sync"),
+        Op::Call { func, args } => {
+            let _ = write!(out, "call {ty} @{func} [");
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&val(*a));
+            }
+            out.push(']');
+        }
         other => {
             // Zero-operand GPU index intrinsics (tid.x, bid.y, ...).
             let mnemonic = other

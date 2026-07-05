@@ -283,6 +283,10 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
                      story for them yet",
                 ));
             }
+            Op::Call { .. } => {
+                return Err(Diag::new(ECode::UnsupportedOp)
+                    .with_arg("function calls have no lowering in this backend yet"));
+            }
             _ => {}
         }
     }
@@ -803,6 +807,9 @@ impl<'a> CodeGen<'a> {
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses these before codegen starts")
+            }
+            Op::Call { .. } => {
+                unreachable!("check_module refuses function calls before codegen starts")
             }
         }
     }
@@ -1902,6 +1909,33 @@ mod tests {
             blocks: vec![Block {
                 insts: vec![InstId(0)],
                 term: Term::Ret(None),
+            }],
+        };
+        assert_eq!(
+            Rv32.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedOp)
+        );
+    }
+
+    /// `Op::Call` (P13-T-calls-i) has no lowering in this backend yet — refuse cleanly rather
+    /// than falling through to the scalar per-op emitters, which have no case for it.
+    #[test]
+    fn refuses_function_call_with_e090() {
+        let f = Function {
+            is_kernel: true,
+            name: "caller".into(),
+            params: vec![Ty::Scalar(Scalar::I32)],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::Call {
+                    func: "callee".into(),
+                    args: vec![ValRef::Param(0)],
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
             }],
         };
         assert_eq!(

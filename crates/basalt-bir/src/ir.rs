@@ -480,6 +480,25 @@ pub enum Op {
     /// `cudaDeviceSynchronize(void)`. No operands. The x86 oracle lowers this to a real `nop`
     /// inside a host function (P13-T1c-i); every other backend still refuses it with `E090`.
     CudaDeviceSynchronize,
+    /// An ordinary same-module function call: `func(args...)`. `func` names the callee's own
+    /// `Function::name`, spelled `@name` in textual BIR exactly like `Op::KernelLaunch::kernel`
+    /// — a genuine function *reference*, not a declaration, and printed/parsed with the same
+    /// "plain `String`, nothing resolved against `Module::funcs` at parse time" convention (see
+    /// `KernelLaunch`'s own doc comment above; a call may name a function defined earlier or
+    /// later in the same module). The call's own result type lives on the owning `Inst::ty`
+    /// exactly like every other value-producing op, `Ty::Void` for a void-returning callee.
+    ///
+    /// Which call *shapes* an actual backend accepts (whether a caller may itself be called,
+    /// direct recursion, cross-module calls, ...) is not a BIR-level restriction — BIR has no
+    /// call graph of its own to validate — it is entirely up to whatever backend claims to
+    /// lower this op (`basalt-sema`'s own lowering pass, and each backend's `check_module`/
+    /// `check_function`, document their own restrictions; see `basalt-x86::oracle`'s module
+    /// header for the first backend that actually does this, P13-T-calls-i). Every other
+    /// backend refuses this op outright with `E090`.
+    Call {
+        func: String,
+        args: Vec<ValRef>,
+    },
 }
 
 /// One arena-resident instruction: its result type (`Ty::Void` if it produces no value)

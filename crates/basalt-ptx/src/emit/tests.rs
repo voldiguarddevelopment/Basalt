@@ -708,6 +708,33 @@ fn kernel_launch_and_cuda_runtime_api_ops_are_refused_not_guessed() {
     assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
 }
 
+/// `Op::Call` (P13-T-calls-i) has no lowering in this backend yet — refuse cleanly rather
+/// than falling through to the scalar per-op emitters, which have no case for it.
+#[test]
+fn function_call_is_refused_not_guessed() {
+    let f = simple_fn(
+        "caller",
+        vec![Ty::Scalar(Scalar::I32)],
+        vec![Inst {
+            ty: Ty::Scalar(Scalar::I32),
+            op: Op::Call {
+                func: "callee".to_string(),
+                args: vec![ValRef::Param(0)],
+            },
+        }],
+        Term::Ret(Some(ValRef::Val(InstId(0)))),
+    );
+    let module = wrap(f);
+    assert_eq!(
+        Ptx.supports(&module),
+        Support::Unsupported(basalt_diag::ECode::UnsupportedOp)
+    );
+    let err = Ptx
+        .emit(&module, &EmitOpts::default())
+        .expect_err("emit must refuse what supports() refuses, not guess");
+    assert_eq!(err.code, basalt_diag::ECode::UnsupportedOp);
+}
+
 #[test]
 fn non_kernel_function_is_refused_not_silently_emitted_as_a_kernel() {
     // The live gap this test guards: every function in a module is emitted as its own

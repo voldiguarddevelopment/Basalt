@@ -281,6 +281,10 @@ fn check_inst(inst: &Inst) -> Result<(), Diag> {
                  Op::KernelLaunch's own doc comment); this backend has no lowering for them yet",
             ));
         }
+        Op::Call { .. } => {
+            return Err(Diag::new(ECode::UnsupportedOp)
+                .with_arg("function calls have no lowering in this backend yet"));
+        }
         _ => {}
     }
     Ok(())
@@ -861,6 +865,9 @@ fn lower_inst(
         | Op::CudaFree { .. }
         | Op::CudaDeviceSynchronize => {
             unreachable!("check_module refuses this op before codegen starts")
+        }
+        Op::Call { .. } => {
+            unreachable!("check_module refuses function calls before codegen starts")
         }
     }
 }

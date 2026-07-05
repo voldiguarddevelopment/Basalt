@@ -102,6 +102,11 @@ pub(crate) fn flatten_to_native_cpu_loop(module: &Module) -> Result<Module, Diag
                  today (see Op::KernelLaunch's own doc comment)",
             ));
         }
+        if matches!(inst.op, Op::Call { .. }) {
+            return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                "cpu-loop flattening: function calls have no lowering in this lane yet",
+            ));
+        }
     }
 
     Ok(Module {
@@ -250,6 +255,9 @@ fn remap_op(op: &Op, inst_offset: u32, block_offset: u32) -> Op {
             "flatten_to_native_cpu_loop refuses kernel launch / CUDA Runtime API calls before \
              this point"
         ),
+        Op::Call { .. } => {
+            unreachable!("flatten_to_native_cpu_loop refuses function calls before this point")
+        }
     }
 }
 

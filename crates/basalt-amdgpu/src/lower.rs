@@ -588,6 +588,7 @@ fn op_operands(op: &Op) -> Vec<ValRef> {
         } => vec![*dst, *src, *count, *kind],
         Op::CudaFree { ptr } => vec![*ptr],
         Op::CudaDeviceSynchronize => vec![],
+        Op::Call { args, .. } => args.clone(),
     }
 }
 
@@ -1279,6 +1280,7 @@ fn check_function(f: &Function) -> Result<(), Diag> {
             | Op::CudaMemcpy { .. }
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => return Err(e_feature()),
+            Op::Call { .. } => return Err(e_feature()),
         }
     }
     for block in &f.blocks {
@@ -1683,6 +1685,9 @@ impl<'a> CodeGen<'a> {
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses this construct before codegen starts")
+            }
+            Op::Call { .. } => {
+                unreachable!("check_module refuses function calls before codegen starts")
             }
         }
     }
@@ -3131,6 +3136,33 @@ mod tests {
             blocks: vec![Block {
                 insts: vec![InstId(0)],
                 term: Term::Ret(None),
+            }],
+        };
+        assert_eq!(
+            Amdgcn.supports(&wrap(f)),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    /// `Op::Call` (P13-T-calls-i) has no lowering in this backend yet — refuse cleanly rather
+    /// than falling through to the scalar per-op emitters, which have no case for it.
+    #[test]
+    fn refuses_function_call_with_e093() {
+        let f = Function {
+            is_kernel: true,
+            name: "caller".into(),
+            params: vec![Ty::Scalar(Scalar::I32)],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::Call {
+                    func: "callee".into(),
+                    args: vec![ValRef::Param(0)],
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
             }],
         };
         assert_eq!(

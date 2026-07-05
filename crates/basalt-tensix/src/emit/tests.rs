@@ -326,6 +326,27 @@ fn kernel_launch_and_cuda_runtime_api_ops_refuse() {
     assert_eq!(unsupported_code(&wrap(f)), ECode::UnsupportedOp);
 }
 
+/// `Op::Call` (P13-T-calls-i) has no lowering in this backend yet — refuse cleanly rather
+/// than falling through to the scalar per-op emitters, which have no case for it.
+#[test]
+fn function_call_refuses() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let insts = vec![Inst {
+        ty: i32t,
+        op: Op::Call {
+            func: "callee".to_string(),
+            args: vec![ValRef::Param(0)],
+        },
+    }];
+    let f = simple_fn(
+        "caller",
+        vec![i32t],
+        insts,
+        Term::Ret(Some(ValRef::Val(InstId(0)))),
+    );
+    assert_eq!(unsupported_code(&wrap(f)), ECode::UnsupportedOp);
+}
+
 #[test]
 fn warp_collective_ops_refuse() {
     let i32t = Ty::Scalar(Scalar::I32);

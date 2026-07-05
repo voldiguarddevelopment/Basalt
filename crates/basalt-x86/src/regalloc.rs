@@ -194,6 +194,11 @@ fn check_module(module: &Module) -> Result<&Function, Diag> {
                      exist in this backend yet",
                 ));
             }
+            Op::Call { .. } => {
+                return Err(Diag::new(ECode::UnsupportedOp).with_arg(
+                    "function calls have no lowering in the regalloc-based x86-64 backend yet",
+                ));
+            }
             _ => {}
         }
     }
@@ -784,6 +789,9 @@ impl<'a> CodeGen<'a> {
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses these before codegen starts")
+            }
+            Op::Call { .. } => {
+                unreachable!("check_module refuses function calls before codegen starts")
             }
         }
     }

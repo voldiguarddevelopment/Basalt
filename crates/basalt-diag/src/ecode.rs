@@ -31,6 +31,15 @@ pub enum ECode {
     /// Reserved for a rank-2 tile requested on a GPU backend without the matrix
     /// (`mma`) path.
     MatrixPathUnsupported,
+    /// A backend's own call-graph handling refuses direct recursion: an `Op::Call` naming the
+    /// very function it appears in. A backend-level scope limit (BIR's own `Op::Call` carries
+    /// no such restriction), not a sema-level one — see `basalt-x86::oracle`'s module header.
+    RecursiveCallUnsupported,
+    /// A backend's own call-graph handling refuses a call from one non-kernel (`__device__`)
+    /// function into another: only a `__global__` kernel calling a same-module `__device__`
+    /// helper is supported in this backend's first slice. A backend-level scope limit, not a
+    /// sema-level one — see `basalt-x86::oracle`'s module header.
+    NestedDeviceCallUnsupported,
 
     /// CLI flag not recognized.
     CliUnknownFlag,
@@ -106,6 +115,8 @@ impl ECode {
         ECode::UnsupportedAddressSpace,
         ECode::UnsupportedFeature,
         ECode::MatrixPathUnsupported,
+        ECode::RecursiveCallUnsupported,
+        ECode::NestedDeviceCallUnsupported,
         ECode::CliUnknownFlag,
         ECode::CliMissingArgument,
         ECode::CliInvalidArgument,
@@ -139,6 +150,8 @@ impl ECode {
             ECode::UnsupportedAddressSpace => "E092",
             ECode::UnsupportedFeature => "E093",
             ECode::MatrixPathUnsupported => "E099",
+            ECode::RecursiveCallUnsupported => "E094",
+            ECode::NestedDeviceCallUnsupported => "E095",
             ECode::CliUnknownFlag => "E100",
             ECode::CliMissingArgument => "E101",
             ECode::CliInvalidArgument => "E102",

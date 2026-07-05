@@ -1122,6 +1122,11 @@ fn lower_inst<'c, 'a>(
                  Op::KernelLaunch's own doc comment); this lane has no lowering for them yet",
             ))
         }
+        Op::Call { .. } => {
+            return Err(unsupported_op(
+                "function calls have no lowering in this lane yet",
+            ))
+        }
     }))
 }
 
@@ -1297,6 +1302,11 @@ fn check_unsupported_ops(f: &Function) -> Result<(), Diag> {
                 return Err(unsupported_op(
                     "kernel launch / CUDA Runtime API calls are sema-only today (see \
                      Op::KernelLaunch's own doc comment); this lane has no lowering for them yet",
+                ))
+            }
+            Op::Call { .. } => {
+                return Err(unsupported_op(
+                    "function calls have no lowering in this lane yet",
                 ))
             }
             _ => {}

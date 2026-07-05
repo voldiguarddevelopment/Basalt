@@ -172,6 +172,7 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         } => vec![*dst, *src, *count, *kind],
         Op::CudaFree { ptr } => vec![*ptr],
         Op::CudaDeviceSynchronize => Vec::new(),
+        Op::Call { args, .. } => args.clone(),
     }
 }
 
@@ -286,6 +287,10 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
         },
         Op::CudaFree { ptr } => Op::CudaFree { ptr: f(*ptr) },
         Op::CudaDeviceSynchronize => Op::CudaDeviceSynchronize,
+        Op::Call { func, args } => Op::Call {
+            func: func.clone(),
+            args: args.iter().map(|&v| f(v)).collect(),
+        },
     }
 }
 

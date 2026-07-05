@@ -130,6 +130,7 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         } => vec![*dst, *src, *count, *kind],
         Op::CudaFree { ptr } => vec![*ptr],
         Op::CudaDeviceSynchronize => Vec::new(),
+        Op::Call { args, .. } => args.clone(),
     }
 }
 
@@ -260,6 +261,10 @@ fn map_op(op: &Op, mut f: impl FnMut(ValRef) -> ValRef) -> Op {
         },
         Op::CudaFree { ptr } => Op::CudaFree { ptr: f(*ptr) },
         Op::CudaDeviceSynchronize => Op::CudaDeviceSynchronize,
+        Op::Call { func, args } => Op::Call {
+            func: func.clone(),
+            args: args.iter().map(|&v| f(v)).collect(),
+        },
     }
 }
 
@@ -277,7 +282,11 @@ fn is_root(op: &Op) -> bool {
         | Op::CudaMalloc { .. }
         | Op::CudaMemcpy { .. }
         | Op::CudaFree { .. }
-        | Op::CudaDeviceSynchronize => true,
+        | Op::CudaDeviceSynchronize
+        // A call may write through a pointer argument or otherwise affect memory the callee
+        // can reach; this pass has no interprocedural knowledge of the callee's body, so a
+        // call is conservatively always live, same as `mma`/the CUDA Runtime API ops above.
+        | Op::Call { .. } => true,
         Op::Load { volatile, .. } => *volatile,
         _ => false,
     }

@@ -495,6 +495,19 @@ fn check_no_host_ops(inst: &Inst) -> Result<(), Diag> {
     Ok(())
 }
 
+/// `Op::Call` has no lowering in this backend yet. PTX does have a real `call.uni` ISA
+/// primitive, but this backend's own `.func` parameter-passing ABI against it is unverified
+/// against real `ptxas` — left for whichever later task picks up this target (see PLAN.md's
+/// P13-T-calls-ii+), not guessed at here. Refuse cleanly rather than falling through to the
+/// scalar per-op emitters below, which have no case for it.
+fn check_no_call(inst: &Inst) -> Result<(), Diag> {
+    if matches!(&inst.op, Op::Call { .. }) {
+        return Err(Diag::new(ECode::UnsupportedOp)
+            .with_arg("function calls have no lowering in this backend yet"));
+    }
+    Ok(())
+}
+
 /// Single source of truth for what this backend refuses, shared verbatim by `supports()` and
 /// `emit()`. Run once, on the module as originally handed in — `construct_ssa` never introduces
 /// an op/type shape this pass didn't already see, so re-checking after it would be redundant.
@@ -526,6 +539,7 @@ fn check_module(module: &Module) -> Result<(), Diag> {
             check_no_pred_shuffle(inst)?;
             check_no_mma(inst)?;
             check_no_host_ops(inst)?;
+            check_no_call(inst)?;
         }
     }
     Ok(())
@@ -892,6 +906,9 @@ impl<'a> CodeGen<'a> {
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses kernel launch / CUDA Runtime API ops before codegen starts")
+            }
+            Op::Call { .. } => {
+                unreachable!("check_module refuses function calls before codegen starts")
             }
         }
     }

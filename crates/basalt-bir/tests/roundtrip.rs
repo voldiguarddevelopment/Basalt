@@ -524,6 +524,56 @@ fn roundtrip_cuda_runtime_calls() {
 }
 
 #[test]
+fn roundtrip_call() {
+    let i32t = Ty::Scalar(Scalar::I32);
+
+    let mut hb = FnB::new();
+    let arg0 = ValRef::Param(0);
+    let sq = hb.push(i32t, Op::Bin(BinOp::Mul, arg0, arg0));
+    hb.end_block(Term::Ret(Some(sq)));
+    let mut helper = hb.finish("square", vec![i32t], i32t);
+    helper.is_kernel = false;
+
+    let mut b = FnB::new();
+    let arg0 = ValRef::Param(0);
+    let doubled = b.push(
+        i32t,
+        Op::Call {
+            func: "square".to_string(),
+            args: vec![arg0],
+        },
+    );
+    b.end_block(Term::Ret(Some(doubled)));
+    let kernel = b.finish("uses_square", vec![i32t], i32t);
+
+    assert_roundtrip(&module_of(vec![kernel, helper]));
+}
+
+#[test]
+fn roundtrip_call_forward_reference() {
+    let i32t = Ty::Scalar(Scalar::I32);
+    let void_t = Ty::Void;
+
+    let mut b = FnB::new();
+    let arg0 = ValRef::Param(0);
+    b.push_void(Op::Call {
+        func: "helper".to_string(),
+        args: vec![arg0],
+    });
+    b.end_block(Term::Ret(None));
+    let kernel = b.finish("uses_helper", vec![i32t], void_t);
+
+    // `helper` is a real `__device__` function, printed second — after the call that names
+    // it — mirroring `roundtrip_kernel_launch_forward_reference`'s own forward-reference shape.
+    let mut hb = FnB::new();
+    hb.end_block(Term::Ret(None));
+    let mut helper = hb.finish("helper", vec![i32t], void_t);
+    helper.is_kernel = false;
+
+    assert_roundtrip(&module_of(vec![kernel, helper]));
+}
+
+#[test]
 fn roundtrip_vector_types_and_bitcast() {
     let v2i32 = Ty::Vec(Scalar::I32, 2);
     let v3f32 = Ty::Vec(Scalar::F32, 3);

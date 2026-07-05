@@ -1219,6 +1219,10 @@ fn lower_inst<'ctx>(
                 "kernel launch / CUDA Runtime API calls have no LLVM IR lowering in this lane yet",
             ));
         }
+        Op::Call { .. } => {
+            return Err(Diag::new(ECode::UnsupportedOp)
+                .with_arg("function calls have no LLVM IR lowering in this lane yet"));
+        }
     };
     Ok(val)
 }

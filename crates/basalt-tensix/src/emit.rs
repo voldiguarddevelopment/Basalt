@@ -444,6 +444,10 @@ fn check_inst(inst: &Inst) -> Result<(), Diag> {
                  story for them yet",
             ));
         }
+        Op::Call { .. } => {
+            return Err(Diag::new(ECode::UnsupportedOp)
+                .with_arg("function calls have no lowering in this backend yet"));
+        }
         _ => {}
     }
     Ok(())
@@ -867,6 +871,9 @@ impl<'a> CodeGen<'a> {
             | Op::CudaFree { .. }
             | Op::CudaDeviceSynchronize => {
                 unreachable!("check_module refuses these before codegen starts")
+            }
+            Op::Call { .. } => {
+                unreachable!("check_module refuses function calls before codegen starts")
             }
         }
         Ok(())

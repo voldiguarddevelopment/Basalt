@@ -148,6 +148,49 @@
 // dynamic parallelism is out of scope, and this backend has no call machinery for a kernel to
 // use one from inside its own per-thread loop.
 //
+// # `Op::Call`: a `__global__` kernel calling `__device__` helpers (P13-T-calls-i)
+//
+// A second, independent multi-function shape alongside "host + kernel-launch" above: exactly
+// one kernel (`is_kernel == true`), plus one or more non-kernel `__device__` helper functions,
+// where every helper is named by at least one of the kernel's own `Op::Call` instructions and
+// nothing else in the module launches a kernel or calls a helper from anywhere but that one
+// kernel (`check_kernel_with_helpers_shape`) — a host function calling a device helper, two
+// kernels sharing helpers, and a helper calling another helper are all out of scope and refuse
+// cleanly (`E093`/`E094`/`E095`), same "refuse rather than guess" discipline as every other
+// shape restriction in this file. Combining this shape with a host-launches-kernels module in
+// the same object is also out of scope (`E093`) — nothing about this first slice needed it, and
+// mixing them raises real questions (does the kernel's own per-thread loop reach a helper the
+// same way a host's `call` does?) this task did not need to answer.
+//
+// A device helper's own codegen shape is `emit_function_body`'s existing `is_host = true` path
+// (plain, single-execution, real epilogue, real non-void return in `rax`/`xmm0`) — exactly what
+// P13-T1c-i built for the one host function, just invoked for a different kind of function here.
+// This is a genuinely different axis from `check_function`'s own `is_host` (which gates whether
+// `Op::KernelLaunch`/the CUDA Runtime API ops are legal): a helper gets the *host's codegen
+// shape* but *never* that legality — dynamic parallelism from inside a helper is exactly as out
+// of scope as from inside a kernel, so `check_function` is always called with `is_host = false`
+// for a helper, independent of which shape `emit_function_body` gives it.
+//
+// `Op::Call` itself lowers exactly like `Op::KernelLaunch` minus the flattened-`nthreads`
+// bookkeeping: each argument reloads into the callee's own SysV-classified registers (the
+// callee's own declared parameter types, via the same `classify_params`/`ArgLoc` machinery),
+// then a genuine intra-object `call rel32` (`Enc::call`) to the helper's own label — no
+// relocation needed, exactly like a kernel launch, since both functions already live in the
+// same emitted blob. The return value (if any) is read back out of `rax`/`xmm0` straight into
+// the call instruction's own result slot, the same `store_result`/`store_result_xmm` every
+// other value-producing op already uses.
+//
+// Two restrictions enforced here, not in `basalt-sema`: direct self-recursion (`E094`) and a
+// helper calling another helper (`E095`, "device-to-device"). Both are scope limits of *this
+// backend's* call-graph handling specifically — BIR's own `Op::Call` has no such restriction,
+// and `basalt-rv`'s existing `jal`/`ret` machinery may accept a broader shape once it grows a
+// real `Op::Call` lowering of its own (see `PLAN.md`'s P13-T-calls-ii+) — so they belong at the
+// oracle-shape-validation layer, the same layer `Op::KernelLaunch`'s own "non-default
+// shared/stream" restriction already lives at, not baked into BIR or the generic lowering pass.
+// Struct/array-by-value arguments or a struct/array return are not a backend-level restriction
+// at all: BIR's own `Ty` has no aggregate value type, so `basalt-sema`'s lowering pass already
+// never produces an `Op::Call` with one — nothing for this backend to separately check.
+//
 // # `mma`
 //
 // Lowered as a genuine triple-nested runtime loop (`for i in 0..m { for j in 0..n { for k in
@@ -221,6 +264,9 @@ impl Backend for X86Oracle {
                 )
             }
             ModuleShape::HostAndKernels { host, kernels } => emit_host_and_kernels(host, &kernels)?,
+            ModuleShape::KernelWithHelpers { kernel, helpers } => {
+                emit_kernel_with_helpers(kernel, &helpers)?
+            }
         };
         let spec =
             ElfObjectSpec::new_multi(Architecture::X86_64, Endianness::Little, symbols, text)
@@ -231,13 +277,18 @@ impl Backend for X86Oracle {
 }
 
 /// The exact module shapes this backend accepts, returned by `check_module` on success: the
-/// original single-kernel-only shape, or "one host function plus the kernel(s) it actually
-/// launches" (see the module header's own section on this).
+/// original single-kernel-only shape, "one host function plus the kernel(s) it actually
+/// launches", or "one kernel plus the `__device__` helper(s) it calls" (see the module header's
+/// own sections on the latter two).
 enum ModuleShape<'a> {
     SingleKernel(&'a Function),
     HostAndKernels {
         host: &'a Function,
         kernels: Vec<&'a Function>,
+    },
+    KernelWithHelpers {
+        kernel: &'a Function,
+        helpers: Vec<&'a Function>,
     },
 }
 
@@ -253,6 +304,18 @@ fn check_module(module: &Module) -> Result<ModuleShape<'_>, Diag> {
         return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
             "host/non-kernel function compilation needs at least one kernel it launches",
         ));
+    }
+
+    // "Host launches kernels" and "kernel calls device helpers" are mutually exclusive shapes
+    // in this backend (see the module header's `# Op::Call` section) — the presence of any
+    // `Op::Call` anywhere in the module picks the latter unconditionally, so the two shapes'
+    // own validation never has to guess which one a given module was even attempting.
+    let has_any_call = module
+        .funcs
+        .iter()
+        .any(|f| f.insts.iter().any(|i| matches!(i.op, Op::Call { .. })));
+    if has_any_call {
+        return check_kernel_with_helpers_shape(module);
     }
 
     let hosts: Vec<&Function> = module.funcs.iter().filter(|f| !f.is_kernel).collect();
@@ -306,6 +369,80 @@ fn check_module(module: &Module) -> Result<ModuleShape<'_>, Diag> {
     Ok(ModuleShape::HostAndKernels { host, kernels })
 }
 
+/// The `ModuleShape::KernelWithHelpers` path: exactly one `__global__` kernel calling one or
+/// more same-module `__device__` helper functions via `Op::Call`, and nothing else — see the
+/// module header's own `# Op::Call` section for the full rationale. Only reached once
+/// `check_module` has already established the module contains at least one `Op::Call`.
+fn check_kernel_with_helpers_shape(module: &Module) -> Result<ModuleShape<'_>, Diag> {
+    if module.funcs.iter().any(|f| {
+        f.insts
+            .iter()
+            .any(|i| matches!(i.op, Op::KernelLaunch { .. }))
+    }) {
+        return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+            "a module combining kernel launches and device-helper calls is out of scope",
+        ));
+    }
+
+    let kernels: Vec<&Function> = module.funcs.iter().filter(|f| f.is_kernel).collect();
+    let helpers: Vec<&Function> = module.funcs.iter().filter(|f| !f.is_kernel).collect();
+    let [kernel] = kernels.as_slice() else {
+        return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+            "device-helper calls are only supported from exactly one __global__ kernel per \
+             module",
+        ));
+    };
+    let kernel = *kernel;
+
+    for h in &helpers {
+        if h.insts.iter().any(|i| matches!(i.op, Op::Call { .. })) {
+            return Err(
+                Diag::new(ECode::NestedDeviceCallUnsupported).with_arg(format!(
+                    "'{}' calls another function; only a __global__ kernel calling a __device__ \
+                 helper is supported in this backend's first slice, not device-to-device calls",
+                    h.name
+                )),
+            );
+        }
+    }
+
+    let mut called: Vec<&str> = Vec::new();
+    for inst in &kernel.insts {
+        if let Op::Call { func, .. } = &inst.op {
+            called.push(func.as_str());
+        }
+    }
+    for name in &called {
+        if *name == kernel.name {
+            return Err(Diag::new(ECode::RecursiveCallUnsupported)
+                .with_arg(format!("'{}' calls itself directly", kernel.name)));
+        }
+        if kernels.iter().any(|k| k.name == *name) {
+            return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                "call target names a __global__ kernel; kernels are launched via kernel.launch, \
+                 not called",
+            ));
+        }
+        if !helpers.iter().any(|h| h.name == *name) {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("call target names a function not present in this module"));
+        }
+    }
+    for h in &helpers {
+        if !called.contains(&h.name.as_str()) {
+            return Err(Diag::new(ECode::UnsupportedFeature)
+                .with_arg("device helper function present but never called by the kernel"));
+        }
+    }
+
+    check_function(kernel, false, &helpers)?;
+    for h in &helpers {
+        check_function(h, false, &[])?;
+    }
+
+    Ok(ModuleShape::KernelWithHelpers { kernel, helpers })
+}
+
 /// Whether `v` is the launch's own documented default for `shared`/`stream` (a literal
 /// `Op::ConstInt(0)` — the exact materialization `basalt-sema`'s own lowering produces for a
 /// source launch that names neither, see `Op::KernelLaunch`'s doc comment) — the only shape
@@ -317,12 +454,14 @@ fn launch_operand_is_default(f: &Function, v: ValRef) -> bool {
     }
 }
 
-/// The per-function checks shared by every function this backend ever lowers, kernel or
-/// host. `is_host` and `launch_targets` (the kernels visible for a host function's own
-/// `Op::KernelLaunch` calls, empty for a kernel) select the one place kernel and host
-/// bodies are actually allowed to differ: which of the five kernel-launch/CUDA-Runtime-API
-/// ops are real here versus still refused.
-fn check_function(f: &Function, is_host: bool, launch_targets: &[&Function]) -> Result<(), Diag> {
+/// The per-function checks shared by every function this backend ever lowers: a kernel, a
+/// host function, or a `__device__` helper. `is_host` and `callees` (the functions visible to
+/// this one's own `Op::KernelLaunch`/`Op::Call` instructions — the kernels a host function may
+/// launch, or the helpers a kernel may call; always empty for a kernel with no helpers or a
+/// leaf helper) select the one place function bodies are actually allowed to differ: which of
+/// the five kernel-launch/CUDA-Runtime-API ops are real here versus still refused, and which
+/// names an `Op::Call` may resolve against.
+fn check_function(f: &Function, is_host: bool, callees: &[&Function]) -> Result<(), Diag> {
     if matches!(f.ret, Ty::Vec(..)) {
         return Err(Diag::new(ECode::UnsupportedType).with_arg("vector-typed return value"));
     }
@@ -379,11 +518,11 @@ fn check_function(f: &Function, is_host: bool, launch_targets: &[&Function]) -> 
                 args,
                 ..
             } if is_host => {
-                if !launch_targets.iter().any(|k| &k.name == kernel) {
+                if !callees.iter().any(|k| &k.name == kernel) {
                     return Err(Diag::new(ECode::UnsupportedFeature)
                         .with_arg("kernel launch names a function not present in this module"));
                 }
-                let target = launch_targets
+                let target = callees
                     .iter()
                     .find(|k| &k.name == kernel)
                     .expect("just checked above");
@@ -415,6 +554,33 @@ fn check_function(f: &Function, is_host: bool, launch_targets: &[&Function]) -> 
                     "kernel launch / CUDA Runtime API calls inside a kernel (dynamic \
                      parallelism) are out of scope for this backend",
                 ));
+            }
+            Op::Call { func, args } => {
+                if func == &f.name {
+                    return Err(Diag::new(ECode::RecursiveCallUnsupported)
+                        .with_arg(format!("'{func}' calls itself directly")));
+                }
+                // Not found among `callees` covers two distinct shapes: a genuinely undefined
+                // callee (`E093`, same code/wording `Op::KernelLaunch`'s own "not present"
+                // case already uses), and a call from a function this backend never gives any
+                // legal callees at all (a lone kernel, or a device helper — the real
+                // device-to-device detection lives in `check_kernel_with_helpers_shape`, which
+                // already refuses that shape with `E095` before this ever runs on a helper).
+                let target = callees.iter().find(|c| &c.name == func).ok_or_else(|| {
+                    Diag::new(ECode::UnsupportedFeature)
+                        .with_arg("call target names a function not present in this module")
+                })?;
+                if target.is_kernel {
+                    return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                        "call target names a __global__ kernel; kernels are launched via \
+                         kernel.launch, not called",
+                    ));
+                }
+                if args.len() != target.params.len() {
+                    return Err(Diag::new(ECode::UnsupportedFeature).with_arg(
+                        "call argument count does not match the called function's own signature",
+                    ));
+                }
             }
             _ => {}
         }
@@ -511,10 +677,11 @@ enum ArgLoc {
     Sse(u8),
 }
 
-/// The one slice of a launched kernel's own signature `lower_kernel_launch` needs to
-/// classify the call's own argument registers exactly like that kernel's own entry point
-/// does. An owned copy (not a borrow of the kernel `Function` itself) so `CodeGen` needs no
-/// extra lifetime parameter beyond the one already tying it to the function it is currently
+/// The one slice of a callee's own signature `lower_kernel_launch`/`lower_call` needs to
+/// classify the call's own argument registers exactly like that callee's own entry point
+/// does — a launched kernel for `Op::KernelLaunch`, a `__device__` helper for `Op::Call`. An
+/// owned copy (not a borrow of the callee `Function` itself) so `CodeGen` needs no extra
+/// lifetime parameter beyond the one already tying it to the function it is currently
 /// lowering.
 struct KernelSig {
     name: String,
@@ -672,21 +839,26 @@ struct CodeGen<'a, 'e> {
     /// kernel keeps running the next thread), or a host function's own epilogue (an
     /// ordinary function just returns).
     ret_target: String,
-    /// The kernel(s) a host function's own `Op::KernelLaunch` instructions may call. Always
-    /// empty for a kernel body (`check_module` refuses `Op::KernelLaunch` there).
-    launch_targets: Vec<KernelSig>,
+    /// The functions this function's own `Op::KernelLaunch`/`Op::Call` instructions may
+    /// target: the kernel(s) a host function may launch, or the `__device__` helper(s) a
+    /// kernel may call. Always empty for a kernel body with no helpers or a leaf helper
+    /// (`check_module` refuses either instruction anywhere else).
+    callees: Vec<KernelSig>,
 }
 
 /// Lowers one function's full body — prologue, params, blocks, epilogue — into `enc`,
 /// starting with a label at `f.name` naming its own entry point (a `call` target for a
-/// host's own launches, and this function's own `ElfSymbol` name in the multi-function
-/// case). A kernel (`is_host = false`) keeps the existing per-thread-loop wrapper unchanged;
-/// a host function (`is_host = true`) is lowered as an ordinary function that runs once, no
-/// loop, no synthesized trailing `nthreads` parameter.
+/// host's own launches or a kernel's own calls, and this function's own `ElfSymbol` name in
+/// the multi-function case). A kernel (`is_host = false`) keeps the existing per-thread-loop
+/// wrapper unchanged; a host function or `__device__` helper (`is_host = true`) is lowered as
+/// an ordinary function that runs once, no loop, no synthesized trailing `nthreads`
+/// parameter — the same codegen shape serves both (see the module header's `# Op::Call`
+/// section on why a helper gets this shape without also gaining a host's own CUDA-Runtime-API
+/// legality, which is `check_function`'s own, independent `is_host`).
 fn emit_function_body(
     f: &Function,
     is_host: bool,
-    launch_targets: Vec<KernelSig>,
+    callees: Vec<KernelSig>,
     enc: &mut Enc,
 ) -> Result<(), Diag> {
     let (param_locs, nthreads_loc) =
@@ -702,7 +874,7 @@ fn emit_function_body(
         phi_copies,
         label_prefix: format!("{}$", f.name),
         ret_target: String::new(),
-        launch_targets,
+        callees,
     };
 
     cg.enc.label(&f.name);
@@ -803,37 +975,16 @@ fn emit_function(f: &Function) -> Result<Vec<u8>, Diag> {
 }
 
 /// `.text` bytes, one `ElfSymbol` per function, one `ElfRelocation` per external call — what
-/// `emit_host_and_kernels` hands back to `emit()`.
+/// `emit_host_and_kernels`/`emit_kernel_with_helpers` hand back to `emit()`.
 type HostAndKernelsText = (Vec<u8>, Vec<ElfSymbol>, Vec<ElfRelocation>);
 
-/// The `ModuleShape::HostAndKernels` path: the host function followed by every kernel it
-/// launches, all lowered into one shared `Enc` so the host's own `call`s can reach them (see
-/// the module header). Returns the combined `.text` bytes, one `ElfSymbol` per function
-/// (each sized by the gap to the next function's own entry point, or to the end of the
-/// buffer for whichever function was laid out last), and one `ElfRelocation` per
-/// `Enc::call_external` fixup the host recorded (a `cudaMalloc`/`cudaMemcpy`/`cudaFree` call
-/// against libc) — read out of `enc` before `finish` consumes it, exactly like the symbol
-/// offsets above.
-fn emit_host_and_kernels(
-    host: &Function,
-    kernels: &[&Function],
-) -> Result<HostAndKernelsText, Diag> {
-    let launch_targets: Vec<KernelSig> = kernels
-        .iter()
-        .map(|k| KernelSig {
-            name: k.name.clone(),
-            params: k.params.clone(),
-        })
-        .collect();
-
-    let mut enc = Enc::new();
-    emit_function_body(host, true, launch_targets, &mut enc)?;
-    for k in kernels {
-        emit_function_body(k, false, Vec::new(), &mut enc)?;
-    }
-
-    let mut names: Vec<&str> = vec![host.name.as_str()];
-    names.extend(kernels.iter().map(|k| k.name.as_str()));
+/// The common tail both multi-function shapes reduce to once every function sharing `enc` has
+/// been lowered: one `ElfSymbol` per name in `names` (each sized by the gap to the next
+/// function's own entry point, or to the end of the buffer for whichever function was laid
+/// out last), and one `ElfRelocation` per `Enc::call_external` fixup recorded along the way (a
+/// `cudaMalloc`/`cudaMemcpy`/`cudaFree` call against libc — read out of `enc` before `finish`
+/// consumes it, exactly like the symbol offsets).
+fn finish_multi_function_text(enc: Enc, names: &[&str]) -> HostAndKernelsText {
     let mut offsets: Vec<(String, u64)> = names
         .iter()
         .map(|name| {
@@ -844,11 +995,9 @@ fn emit_host_and_kernels(
         })
         .collect();
     let total = enc.pos() as u64;
-    // `Enc::call_external`'s own doc comment: `finish` knows nothing about `externs`, so this
-    // must be read out before `finish` consumes `enc`. Every `call rel32` this backend emits
-    // has its addend fixed at `-4` (the disp32 field's own byte width, per the module
-    // header's `# Op::CudaMalloc/CudaMemcpy/CudaFree` section) regardless of which external
-    // symbol it targets.
+    // Every `call rel32` this backend emits against an external symbol has its addend fixed
+    // at `-4` (the disp32 field's own byte width, per the module header's
+    // `# Op::CudaMalloc/CudaMemcpy/CudaFree` section) regardless of which one it targets.
     let relocations: Vec<ElfRelocation> = enc
         .externs()
         .iter()
@@ -873,7 +1022,62 @@ fn emit_host_and_kernels(
             }
         })
         .collect();
-    Ok((bytes, symbols, relocations))
+    (bytes, symbols, relocations)
+}
+
+/// The `ModuleShape::HostAndKernels` path: the host function followed by every kernel it
+/// launches, all lowered into one shared `Enc` so the host's own `call`s can reach them (see
+/// the module header).
+fn emit_host_and_kernels(
+    host: &Function,
+    kernels: &[&Function],
+) -> Result<HostAndKernelsText, Diag> {
+    let launch_targets: Vec<KernelSig> = kernels
+        .iter()
+        .map(|k| KernelSig {
+            name: k.name.clone(),
+            params: k.params.clone(),
+        })
+        .collect();
+
+    let mut enc = Enc::new();
+    emit_function_body(host, true, launch_targets, &mut enc)?;
+    for k in kernels {
+        emit_function_body(k, false, Vec::new(), &mut enc)?;
+    }
+
+    let mut names: Vec<&str> = vec![host.name.as_str()];
+    names.extend(kernels.iter().map(|k| k.name.as_str()));
+    Ok(finish_multi_function_text(enc, &names))
+}
+
+/// The `ModuleShape::KernelWithHelpers` path: the kernel followed by every `__device__` helper
+/// it calls, all lowered into one shared `Enc` so the kernel's own `call`s can reach them (see
+/// the module header's `# Op::Call` section). Each helper is lowered with `is_host = true`
+/// (the plain, single-execution, real-return-value shape) but `check_function`'s own,
+/// independent `is_host = false` (no CUDA Runtime API legality) — see `emit_function_body`'s
+/// own doc comment on why these are two different axes.
+fn emit_kernel_with_helpers(
+    kernel: &Function,
+    helpers: &[&Function],
+) -> Result<HostAndKernelsText, Diag> {
+    let call_targets: Vec<KernelSig> = helpers
+        .iter()
+        .map(|h| KernelSig {
+            name: h.name.clone(),
+            params: h.params.clone(),
+        })
+        .collect();
+
+    let mut enc = Enc::new();
+    emit_function_body(kernel, false, call_targets, &mut enc)?;
+    for h in helpers {
+        emit_function_body(h, true, Vec::new(), &mut enc)?;
+    }
+
+    let mut names: Vec<&str> = vec![kernel.name.as_str()];
+    names.extend(helpers.iter().map(|h| h.name.as_str()));
+    Ok(finish_multi_function_text(enc, &names))
 }
 
 impl<'a, 'e> CodeGen<'a, 'e> {
@@ -1147,6 +1351,10 @@ impl<'a, 'e> CodeGen<'a, 'e> {
                 self.reload_gpr(src, INT_ARG_REGS[1], W::B8);
                 self.reload_gpr(count, INT_ARG_REGS[2], W::B8);
                 self.enc.call_external("memcpy");
+            }
+            Op::Call { func, args } => {
+                let (func, args) = (func.clone(), args.clone());
+                self.lower_call(id, &func, &args, ty);
             }
         }
     }
@@ -1681,11 +1889,11 @@ impl<'a, 'e> CodeGen<'a, 'e> {
         let _ = (shared, stream);
 
         let target_idx = self
-            .launch_targets
+            .callees
             .iter()
             .position(|k| k.name == kernel)
             .expect("check_function already validated every launch names a real kernel");
-        let target_params = self.launch_targets[target_idx].params.clone();
+        let target_params = self.callees[target_idx].params.clone();
         let (param_locs, nthreads_loc) = classify_params(&target_params)
             .expect("check_function already validated the launched kernel's own signature");
         debug_assert_eq!(args.len(), param_locs.len());
@@ -1709,6 +1917,42 @@ impl<'a, 'e> CodeGen<'a, 'e> {
         }
 
         self.enc.call(kernel);
+    }
+
+    /// `Op::Call`: an intra-object `call rel32` to a same-module `__device__` helper (see the
+    /// module header's `# Op::Call` section). Structurally `lower_kernel_launch` minus the
+    /// flattened-`nthreads` bookkeeping — a plain function call has no per-thread loop to size
+    /// — plus reading the callee's own return value (if any) back into this instruction's own
+    /// result slot, exactly like `Op::CudaMalloc`'s `rax` already does for `malloc`.
+    fn lower_call(&mut self, id: InstId, func: &str, args: &[ValRef], ret_ty: Ty) {
+        let target_idx = self
+            .callees
+            .iter()
+            .position(|c| c.name == func)
+            .expect("check_function already validated every call names a real callee");
+        let target_params = self.callees[target_idx].params.clone();
+        let (param_locs, _) = classify_params(&target_params)
+            .expect("check_function already validated the called function's own signature");
+        debug_assert_eq!(args.len(), param_locs.len());
+
+        for (i, loc) in param_locs.iter().enumerate() {
+            let arg = args[i];
+            let ty = target_params[i];
+            match *loc {
+                ArgLoc::Int(r) => self.reload_gpr(arg, r, width_of(ty)),
+                ArgLoc::Sse(r) => self.reload_xmm(arg, r, is_f64(ty)),
+            }
+        }
+
+        self.enc.call(func);
+
+        if !matches!(ret_ty, Ty::Void) {
+            if is_float(ret_ty) {
+                self.store_result_xmm(id, 0, is_f64(ret_ty));
+            } else {
+                self.store_result(id, RAX, width_of(ret_ty));
+            }
+        }
     }
 
     /// `dst := [rbp + base_disp] + (row*leading_dim + col) * elem_bytes`, the address of one
@@ -2944,6 +3188,195 @@ mod tests {
             .emit(&wrap(f), &EmitOpts::default())
             .expect_err("must refuse, not guess");
         assert_eq!(err.code, ECode::UnsupportedType);
+    }
+
+    // ---- kernel calling a __device__ helper (P13-T-calls-i) ------------------------------
+
+    /// `func @square(i32) -> i32 { bb0: %0 = mul i32 %arg0, %arg0; ret %0 }`, a `__device__`
+    /// helper (`is_kernel == false`).
+    fn func_square_helper() -> Function {
+        Function {
+            is_kernel: false,
+            name: "square".into(),
+            params: vec![Ty::Scalar(Scalar::I32)],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::Bin(BinOp::Mul, ValRef::Param(0), ValRef::Param(0)),
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+            }],
+        }
+    }
+
+    /// `func @uses_square(i32) -> i32 { bb0: %0 = call i32 @square [%arg0]; ret %0 }`, a
+    /// `__global__` kernel (`is_kernel == true`) calling `func_square_helper` via a real
+    /// `Op::Call`.
+    fn func_kernel_calls_square() -> Function {
+        Function {
+            is_kernel: true,
+            name: "uses_square".into(),
+            params: vec![Ty::Scalar(Scalar::I32)],
+            ret: Ty::Scalar(Scalar::I32),
+            insts: vec![Inst {
+                ty: Ty::Scalar(Scalar::I32),
+                op: Op::Call {
+                    func: "square".into(),
+                    args: vec![ValRef::Param(0)],
+                },
+            }],
+            blocks: vec![Block {
+                insts: vec![InstId(0)],
+                term: Term::Ret(Some(ValRef::Val(InstId(0)))),
+            }],
+        }
+    }
+
+    fn kernel_with_helpers_module(kernel: Function, helpers: Vec<Function>) -> Module {
+        let mut funcs = vec![kernel];
+        funcs.extend(helpers);
+        Module {
+            funcs,
+            launch_bounds: None,
+            shared_mem_bytes: 0,
+            target_dtypes: vec![],
+        }
+    }
+
+    #[test]
+    fn supports_and_emits_kernel_calling_a_device_helper() {
+        let module =
+            kernel_with_helpers_module(func_kernel_calls_square(), vec![func_square_helper()]);
+        assert_eq!(X86Oracle.supports(&module), Support::Supported);
+
+        let artifact = X86Oracle
+            .emit(&module, &EmitOpts::default())
+            .expect("emit succeeds for a kernel calling a real __device__ helper");
+        let bytes = artifact.as_bytes().unwrap();
+        let file = object::read::File::parse(bytes).expect("parses as an object file");
+        let text = file.section_by_name(".text").expect(".text present");
+        let text_len = text.data().unwrap().len() as u64;
+
+        let kernel_sym = file
+            .symbols()
+            .find(|s| s.name() == Ok("uses_square"))
+            .expect("kernel symbol present");
+        let helper_sym = file
+            .symbols()
+            .find(|s| s.name() == Ok("square"))
+            .expect("helper symbol present");
+        assert_ne!(kernel_sym.address(), helper_sym.address());
+        assert!(kernel_sym.size() > 0);
+        assert!(helper_sym.size() > 0);
+        assert!(kernel_sym.address() + kernel_sym.size() <= text_len);
+        assert!(helper_sym.address() + helper_sym.size() <= text_len);
+    }
+
+    #[test]
+    fn refuses_helper_present_but_never_called_with_e093() {
+        let mut extra = func_square_helper();
+        extra.name = "unused_helper".into();
+        let module = kernel_with_helpers_module(
+            func_kernel_calls_square(),
+            vec![func_square_helper(), extra],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_call_naming_a_function_not_in_the_module_with_e093() {
+        let module = kernel_with_helpers_module(func_kernel_calls_square(), vec![]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_call_naming_a_kernel_with_e093() {
+        let mut caller = func_kernel_calls_square();
+        caller.name = "caller".into();
+        let mut callee_kernel = func_square_helper();
+        callee_kernel.is_kernel = true;
+        callee_kernel.name = "square".into();
+        let module = kernel_with_helpers_module(caller, vec![callee_kernel]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_direct_recursion_with_e094() {
+        let mut kernel = func_kernel_calls_square();
+        // Point the call at the kernel's own name instead of a real helper.
+        kernel.insts[0].op = Op::Call {
+            func: "uses_square".into(),
+            args: vec![ValRef::Param(0)],
+        };
+        let module = kernel_with_helpers_module(kernel, vec![func_square_helper()]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::RecursiveCallUnsupported)
+        );
+    }
+
+    #[test]
+    fn refuses_device_to_device_call_with_e095() {
+        let mut inner_helper = func_square_helper();
+        inner_helper.name = "inner".into();
+        let mut outer_helper = func_square_helper();
+        outer_helper.name = "square".into();
+        outer_helper.insts[0].op = Op::Call {
+            func: "inner".into(),
+            args: vec![ValRef::Param(0)],
+        };
+        let module = kernel_with_helpers_module(
+            func_kernel_calls_square(),
+            vec![outer_helper, inner_helper],
+        );
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::NestedDeviceCallUnsupported)
+        );
+    }
+
+    #[test]
+    fn refuses_mixing_kernel_launch_and_device_helper_call_with_e093() {
+        let module = Module {
+            funcs: vec![
+                func_kernel_calls_square(),
+                func_square_helper(),
+                func_host_launches_add_i32(),
+                func_add_i32(),
+            ],
+            launch_bounds: None,
+            shared_mem_bytes: 0,
+            target_dtypes: vec![],
+        };
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn refuses_call_argument_count_mismatch_with_e093() {
+        let mut kernel = func_kernel_calls_square();
+        kernel.insts[0].op = Op::Call {
+            func: "square".into(),
+            args: vec![ValRef::Param(0), ValRef::Param(0)],
+        };
+        let module = kernel_with_helpers_module(kernel, vec![func_square_helper()]);
+        assert_eq!(
+            X86Oracle.supports(&module),
+            Support::Unsupported(ECode::UnsupportedFeature)
+        );
     }
 
     #[test]

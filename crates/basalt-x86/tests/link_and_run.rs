@@ -23,6 +23,13 @@
 //     libc-relocation proof: a genuine `.cu` host function that allocates its own device
 //     buffers via real `cudaMalloc`/`cudaMemcpy`/`cudaFree` calls against libc (this
 //     project's first ever real ELF relocation), through the same whole pipeline.
+//   - `device_helper_call_links_and_runs_via_full_pipeline` (P13-T-calls-i) is the real
+//     device-helper-call proof: a genuine `.cu` file (`tests/kernels/device_helper_square.cu`)
+//     where a `__global__` kernel calls a real `__device__` helper function via a genuine
+//     `Op::Call`, through the whole frontend/sema/lower/oracle pipeline — the kernel itself is
+//     this object's own callable entry point (the `ModuleShape::KernelWithHelpers` shape has no
+//     separate host function), so the C shim calls it directly, the same calling convention as
+//     `vector_add_links_and_runs_via_full_pipeline`'s plain kernel.
 //
 // All three scalar-calling-convention proofs read the exact calling convention off
 // `oracle.rs`'s own module header and its `INT_ARG_REGS`/`SSE_ARG_REGS` classification, not off
@@ -613,6 +620,85 @@ fn cuda_malloc_memcpy_free_links_and_runs_via_full_pipeline() {
         "examples/cpu_launch_vadd_malloc.c",
         &obj,
         "vadd_malloc",
+    );
+
+    let _ = std::fs::remove_file(&obj);
+}
+
+/// The real end-to-end proof (P13-T-calls-i): a genuine `.cu` file where a `__global__`
+/// kernel calls a real `__device__` helper function via a genuine `Op::Call`, closing the gap
+/// `basalt_sema::lower.rs`'s own module header used to document ("BIR has no call instruction
+/// at all") — see `tests/kernels/device_helper_square.cu`. `square_vector` is this object's own
+/// callable entry point (`ModuleShape::KernelWithHelpers` has no separate host function, unlike
+/// the `cuda_kernel_launch_*`/`cuda_malloc_*` tests above), so if the intra-object `call rel32`
+/// to `square`, its argument marshaling, or its return-value handling were wrong, this would
+/// either fail to link (a bad `call` target) or produce a value mismatch the C shim's own
+/// per-element check below catches, not a silent pass.
+#[test]
+fn device_helper_call_links_and_runs_via_full_pipeline() {
+    if !cc_available() {
+        eprintln!("skipping device_helper_call_links_and_runs_via_full_pipeline: `cc` not found");
+        return;
+    }
+
+    let root = workspace_root();
+    let src_path = root.join("tests/kernels/device_helper_square.cu");
+    let src = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", src_path.display()));
+
+    let opts = PpOpts {
+        include_dirs: vec![],
+        defines: vec![],
+        base_dir: src_path.parent().map(Path::to_path_buf),
+    };
+    let (tokens, pp_errors) = basalt_frontend_c::preprocess(&src, &opts);
+    assert!(
+        pp_errors.is_empty(),
+        "preprocessing device_helper_square.cu produced problems: {:?}",
+        pp_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    let (tu, parse_errors) = basalt_frontend_c::parse(&tokens);
+    assert!(
+        parse_errors.is_empty(),
+        "parsing device_helper_square.cu produced problems: {:?}",
+        parse_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    let sema_diags = basalt_sema::check(&tu);
+    assert!(
+        sema_diags.is_empty(),
+        "type-checking device_helper_square.cu produced diagnostics: {:?}",
+        sema_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let (module, lower_diags) = basalt_sema::lower(&tu);
+    assert!(
+        lower_diags.is_empty(),
+        "lowering device_helper_square.cu produced diagnostics: {:?}",
+        lower_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    assert_eq!(X86Oracle.supports(&module), Support::Supported);
+    let artifact = X86Oracle
+        .emit(&module, &EmitOpts::default())
+        .expect("oracle emit succeeds for device_helper_square.cu");
+    let bytes = artifact.as_bytes().expect("oracle emits an object payload");
+
+    let pid = std::process::id();
+    let obj = std::env::temp_dir().join(format!("basalt_device_helper_square_{pid}.o"));
+    write_object(bytes, &obj);
+
+    compile_link_and_run(
+        &root,
+        "examples/cpu_launch_device_helper_square.c",
+        &obj,
+        "device_helper_square",
     );
 
     let _ = std::fs::remove_file(&obj);

@@ -194,6 +194,7 @@ fn operand_refs(op: &Op) -> Vec<ValRef> {
         } => vec![*dst, *src, *count, *kind],
         Op::CudaFree { ptr } => vec![*ptr],
         Op::CudaDeviceSynchronize => Vec::new(),
+        Op::Call { args, .. } => args.clone(),
     }
 }
 
